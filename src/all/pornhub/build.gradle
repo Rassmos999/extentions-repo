@@ -1,13 +1,12 @@
 ext {
     extName = 'PornHub'
     extClass = '.PornHub'
-    extVersionCode = 60
+    extVersionCode = 61
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
-    implementation(project(':lib:cookieinterceptor'))
     implementation(project(':lib:playlistutils'))
 }
