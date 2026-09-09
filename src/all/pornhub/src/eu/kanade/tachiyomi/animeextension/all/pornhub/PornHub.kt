@@ -15,8 +15,8 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.lib.cookieinterceptor.CookieInterceptor
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.getPreferencesLazy
-import keiyoushi.utils.parseAs
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
@@ -61,26 +61,35 @@ class PornHub :
         .build()
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
+        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
         .set("Referer", "$baseUrl/")
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        coerceInputValues = true
+    }
 
     // ============================== Popular ===============================
 
     override fun popularAnimeRequest(page: Int): Request = GET(browseUrl(page, sort = "ht"), headers)
 
     override fun popularAnimeSelector(): String = "li.pcVideoListItem:not(.mockNsfwThumb), " +
-        "li.videoBox:not(.noVideo), ul#videoCategory li.videoblock, ul#videoSearchResult li.videoblock"
+        "li.videoBox:not(.noVideo), ul#videoCategory li.videoblock, ul#videoSearchResult li.videoblock, " +
+        "li.videoWrapper:not(.noVideo), div.positionRelative.singleVideo, li[data-video-id]"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
-        val link = element.selectFirst("div.phimage a, a.linkVideoThumb, a.thumbnailTitle, a[href*=view_video]")
+        val link = element.selectFirst("div.phimage a, a.linkVideoThumb, a.thumbnailTitle, a.imageLink, a.js-videoPreview, a[href*=view_video]")
         val href = link?.attr("abs:href")
             ?: element.selectFirst("a[href*=view_video]")?.attr("abs:href")
             ?: ""
         setUrlWithoutDomain(href)
         val rawTitle = link?.attr("title")?.ifBlank { null }
-            ?: element.selectFirst("span.title a, a.thumbnailTitle")?.attr("title")?.ifBlank { null }
-            ?: element.selectFirst("span.title a, a.thumbnailTitle")?.text().orEmpty()
+            ?: element.selectFirst("span.title a, div.title a, a.thumbnailTitle")?.attr("title")?.ifBlank { null }
+            ?: element.selectFirst("span.title a, div.title a, a.thumbnailTitle")?.text()?.ifBlank { null }
+            ?: element.text().orEmpty()
         val duration = element.selectFirst("span.duration, var.duration, .duration, span.video-duration, var.duration")?.text()?.trim().orEmpty()
         title = if (duration.isNotBlank() && !rawTitle.contains(duration)) {
             "[$duration] $rawTitle"
@@ -543,7 +552,7 @@ class PornHub :
             ?: extractJsonArray(html, "mediaDefinitions")
             ?: return emptyList()
         return try {
-            mediaJson.parseAs<List<MediaDefinition>>()
+            json.decodeFromString<List<MediaDefinition>>(mediaJson)
         } catch (_: Exception) {
             emptyList()
         }
@@ -615,7 +624,7 @@ class PornHub :
                 if (!resp.isSuccessful) return emptyList()
                 val body = resp.body.string().trim()
                 if (!body.startsWith("[")) return emptyList()
-                body.parseAs<List<MediaDefinition>>()
+                json.decodeFromString<List<MediaDefinition>>(body)
             }
         } catch (_: Exception) {
             emptyList()

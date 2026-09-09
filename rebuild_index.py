@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from zipfile import ZipFile
 
-AAPT = Path(r"C:\Users\Administrator\AppData\Local\Android\Sdk\build-tools\37.0.0\aapt.exe")
+AAPT = Path("/home/omar/Android/Sdk/build-tools/34.0.0/aapt")
 ROOT = Path(__file__).resolve().parent
 APK_DIR = ROOT / "apk"
 ICON_DIR = ROOT / "icon"
