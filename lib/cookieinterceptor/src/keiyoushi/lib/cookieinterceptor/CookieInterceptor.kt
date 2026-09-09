@@ -50,11 +50,11 @@ class CookieInterceptor(
         return chain.proceed(newRequest)
     }
 
-    private val cookieManager by lazy { CookieManager.getInstance() }
+    private val cookieManager by lazy { runCatching { CookieManager.getInstance() }.getOrNull() }
 
     private fun setCookie(url: String, value: String) {
         try {
-            cookieManager.setCookie(url, value)
-        } catch (_: Exception) { }
+            cookieManager?.setCookie(url, value)
+        } catch (_: Throwable) { }
     }
 }

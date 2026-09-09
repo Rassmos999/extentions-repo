@@ -24,6 +24,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -43,22 +44,24 @@ class PornHub :
 
     private val preferences by getPreferencesLazy()
 
-    override val client = network.client.newBuilder()
-        .addInterceptor(
-            CookieInterceptor(
-                "pornhub.com",
-                listOf(
-                    // Site JS may set accessAgeDisclaimerPH=2; both values satisfy the gate.
-                    "accessAgeDisclaimerPH" to "1",
-                    "accessAgeDisclaimerUK" to "1",
-                    "age_verified" to "1",
-                    "accessPH" to "1",
-                    "platform" to "pc",
-                    "cookieConsent" to "3",
+    override val client: OkHttpClient by lazy {
+        network.client.newBuilder()
+            .addInterceptor(
+                CookieInterceptor(
+                    "pornhub.com",
+                    listOf(
+                        // Site JS may set accessAgeDisclaimerPH=2; both values satisfy the gate.
+                        "accessAgeDisclaimerPH" to "1",
+                        "accessAgeDisclaimerUK" to "1",
+                        "age_verified" to "1",
+                        "accessPH" to "1",
+                        "platform" to "pc",
+                        "cookieConsent" to "3",
+                    ),
                 ),
-            ),
-        )
-        .build()
+            )
+            .build()
+    }
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
@@ -66,10 +69,12 @@ class PornHub :
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
 
-    private val json = Json {
-        ignoreUnknownKeys = true
-        isLenient = true
-        coerceInputValues = true
+    private val json by lazy {
+        Json {
+            ignoreUnknownKeys = true
+            isLenient = true
+            coerceInputValues = true
+        }
     }
 
     // ============================== Popular ===============================
