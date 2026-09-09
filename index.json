@@ -331,10 +331,10 @@
   {
     "name": "Aniyomi: PornHub",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.pornhub",
-    "apk": "aniyomi-all.pornhub-v14.61.apk",
+    "apk": "aniyomi-all.pornhub-v14.62.apk",
     "lang": "all",
-    "code": 61,
-    "version": "14.61",
+    "code": 62,
+    "version": "14.62",
     "nsfw": 1,
     "sources": [
       {

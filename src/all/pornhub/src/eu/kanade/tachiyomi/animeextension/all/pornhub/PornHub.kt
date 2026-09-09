@@ -43,7 +43,7 @@ class PornHub :
 
     private val preferences by getPreferencesLazy()
 
-    override val client: OkHttpClient = network.client
+    override val client: OkHttpClient = network.cloudflareClient
 
     override fun headersBuilder(): Headers.Builder = Headers.Builder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -71,10 +71,16 @@ class PornHub :
             ?: element.selectFirst("a[href*=/view_video]")?.attr("abs:href")
             ?: ""
         setUrlWithoutDomain(href)
-        title = link?.attr("title")?.ifBlank { null }
+        val rawTitle = link?.attr("title")?.ifBlank { null }
             ?: element.selectFirst("span.title a, div.title a, a.thumbnailTitle")?.attr("title")?.ifBlank { null }
             ?: element.selectFirst("span.title a, div.title a, a.thumbnailTitle")?.text()?.ifBlank { null }
             ?: element.text().orEmpty()
+        val duration = element.selectFirst("span.duration, var.duration, .duration, span.video-duration")?.text()?.trim().orEmpty()
+        title = if (duration.isNotBlank() && !rawTitle.contains(duration)) {
+            "[$duration] $rawTitle"
+        } else {
+            rawTitle
+        }
         thumbnail_url = element.selectFirst("div.phimage img, img")?.let { img ->
             img.attr("data-image").ifBlank { null }
                 ?: img.attr("data-highres").ifBlank { null }
@@ -216,9 +222,10 @@ class PornHub :
         val pageUrl = response.request.url.toString()
         val html = response.body.string()
         val videoList = mutableListOf<Video>()
-        val videoHeaders = headers.newBuilder()
-            .set("Referer", "$baseUrl/")
-            .set("Origin", baseUrl)
+        val videoHeaders = Headers.Builder()
+            .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .add("Referer", "$baseUrl/")
+            .add("Origin", baseUrl)
             .build()
 
         // Extract flashvars JSON: search script tags for "mediaDefinitions"
@@ -332,6 +339,30 @@ class PornHub :
 
         if (mediaDefinitions != null) {
             processDefinitions(mediaDefinitions)
+        }
+
+        // Fallback: fetch lightweight embed page if videoList is still empty
+        if (videoList.isEmpty()) {
+            val viewkey = Regex("(?<=viewkey=)[^&]+").find(pageUrl)?.value
+            if (viewkey != null) {
+                try {
+                    val embedUrl = "$baseUrl/embed/$viewkey"
+                    client.newCall(GET(embedUrl, headers)).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val embedHtml = resp.body.string()
+                            val embedFlashvars = extractFlashvars(embedHtml)
+                            val embedDefs = try {
+                                embedFlashvars?.let { json.parseToJsonElement(it).jsonObject["mediaDefinitions"]?.jsonArray }
+                            } catch (_: Exception) {
+                                null
+                            }
+                            if (embedDefs != null) {
+                                processDefinitions(embedDefs)
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
         }
 
         // Fallback: search html for master.m3u8 URLs.
