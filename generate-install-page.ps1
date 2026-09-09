@@ -4,7 +4,7 @@
 #   .\generate-install-page.ps1 -BaseUrl "https://raw.githubusercontent.com/user/repo/main"
 
 param(
-    [string]$BaseUrl = "https://raw.githubusercontent.com/omarallsharkawy/extentions-repo/main"
+    [string]$BaseUrl = "https://raw.githubusercontent.com/Rassmos999/extentions-repo/main"
 )
 
 $ErrorActionPreference = "Stop"

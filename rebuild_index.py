@@ -124,8 +124,8 @@ def main():
         json.dumps(
             {
                 "meta": {
-                    "name": "Omar AR+EN+ALL (14.x)",
-                    "website": "https://github.com/omarallsharkawy/extentions-repo",
+                    "name": "Rassmos AR+EN+ALL (14.x)",
+                    "website": "https://github.com/Rassmos999/extentions-repo",
                     "signingKeyFingerprint": "84300648046b4e4d24e940d892207fc94d6c723c120fddb5450b222c4e8d3a4d",
                 }
             },

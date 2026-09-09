@@ -1,79 +1,121 @@
-# Omar Extensions
+# Rassmos Extensions (Aniyomi / Tadami)
 
-A maintained **Aniyomi-compatible anime extension repository** for AR, EN, and language-independent sources. Extension API: **14.x**.
+<p align="center">
+  <b>A curated, maintained Aniyomi-compatible anime extension repository.</b><br/>
+  Supports Arabic (AR), English (EN), and Multi/Language-independent (ALL) video sources.<br/>
+  Compatible with <b>Aniyomi</b>, <b>Tadami</b>, and forks running Extension API <b>14.x</b>.
+</p>
 
-## Add the repository
+<p align="center">
+  <a href="https://github.com/Rassmos999/extentions-repo"><img src="https://img.shields.io/badge/Extensions-100%2B-blue?style=flat-square" alt="Extensions Count"></a>
+  <a href="https://github.com/Rassmos999/extentions-repo"><img src="https://img.shields.io/badge/API-14.x-orange?style=flat-square" alt="API Version"></a>
+  <a href="https://github.com/Rassmos999/extentions-repo"><img src="https://img.shields.io/badge/Status-Maintained-brightgreen?style=flat-square" alt="Status"></a>
+</p>
 
-### One tap on Android
+---
 
-[Open the repository in Aniyomi / Tadami](aniyomi://add-repo?url=https%3A%2F%2Fraw.githubusercontent.com%2FRassmos999%2Fextentions-repo%2Fmain%2Findex.min.json)
+## 🚀 إضافة المستودع للتطبيق (Quick Add)
 
-The link opens the app's own confirmation screen. It does not silently install extensions, grant trust, or bypass Android permission prompts.
+### 1. الإضافة بضغطة واحدة على أندرويد (One-Tap Add)
 
-### Manual URL
+اضغط على الرابط التالي مباشرة من هاتفك لفتح التطبيق وإضافة المستودع تلقائياً:
 
-Copy this URL into the app's **Anime extension repositories** setting:
+👉 **[إضافة المستودع إلى Aniyomi / Tadami](aniyomi://add-repo?url=https%3A%2F%2Fraw.githubusercontent.com%2FRassmos999%2Fextentions-repo%2Fmain%2Findex.min.json)** 👈
+
+> **ملاحظة:** الرابط يفتح نافذة التأكيد الرسمية داخل التطبيق، ولا يقوم بتخطي أذونات نظام أندرويد أو التثبيت التلقائي الصامت.
+
+---
+
+### 2. الإضافة اليدوية (Manual Setup)
+
+انسخ الرابط التالي:
 
 ```text
-https://raw.githubusercontent.com/omarallsharkawy/extentions-repo/main/index.min.json
+https://raw.githubusercontent.com/Rassmos999/extentions-repo/main/index.min.json
 ```
 
-- Aniyomi: **Settings → Browse → Anime extension repos**
-- Tadami: **More → Settings → Browse → Extension Stores (Anime)**
+ثم توجه داخل التطبيق إلى:
+- **تطبيق Aniyomi:**  
+  `الإعدادات (Settings) ➔ التصفح (Browse) ➔ مستودعات إضافات الأنمي (Anime extension repos)`  
+  اضغط على زر `+` وألصق الرابط.
+- **تطبيق Tadami:**  
+  `المزيد (More) ➔ الإعدادات (Settings) ➔ التصفح (Browse) ➔ متجر الإضافات (Extension Stores - Anime)`  
+  وألصق الرابط.
 
-Then open **Browse → Anime Extensions**, install the source you want, and approve the Android installation prompt.
+بعد الإضافة، توجه إلى **التصفح ➔ إضافات الأنمي (Browse ➔ Anime Extensions)** وستظهر جميع الإضافات المحدثة جاهزة للتثبيت فوراً.
 
-## Browse before installing
+---
 
-The repository includes a searchable, mobile-first install page in [`index.html`](./index.html). When GitHub Pages or another static HTTPS host is enabled, it provides the same app link, a copyable fallback URL, filters, extension metadata, and direct APK downloads.
+## 🌐 تصفح الإضافات عبر المتصفح (Web Catalog)
 
-## Signing and updates
+يحتوي المستودع على صفحة ويب متجاوبة وسريعة في [`index.html`](./index.html) تتيح:
+- البحث المباشر في جميع الإضافات المتاحة.
+- الفلترة حسب اللغة (`Arabic`, `English`, `All / Multi`).
+- تنزيل ملفات الـ APK الموقعة مباشرة دون الحاجة لفتح التطبيق.
 
-Published APKs use this signing-key fingerprint:
+---
+
+## 🔑 التوقيع والتحديثات (Signing & Updates)
+
+كافة ملفات الـ APK المنشورة في المستودع موقعة رقمياً بالبصمة التالية:
 
 ```text
 SHA-256: 84300648046b4e4d24e940d892207fc94d6c723c120fddb5450b222c4e8d3a4d
 ```
 
-Android cannot update an extension signed by a different key. If an existing extension appears as **Local** or reports a signature conflict, uninstall that APK once and reinstall it from this repository.
+> ⚠️ **ملاحظة أمان:** نظام أندرويد لا يسمح بتحديث أي إضافة موقعة بمفتاح مختلف. إذا واجهت رسالة تعارض توقيع (Signature conflict) أو ظهرت الإضافة كـ **Local**، قم بإلغاء تثبيت النسخة القديمة مرة واحدة ثم أعد تثبيتها من هذا المستودع.
 
-## Repository layout
+---
+
+## 📂 هيكلية المستودع (Repository Structure)
 
 ```text
-index.json       Human-readable extension index
-index.min.json   Index URL added to the app
-repo.json        Repository identity and signing fingerprint
-apk/*.apk        The only published APK location
-icon/*.png       Package icons used by the app and catalog
-src/             Extension source code maintained in this repository
-index.html       Static install and download page
-styles.css       Install-page styles
+├── apk/            # مجلد ملفات الـ APK الرسمية والموقعة فقط
+├── icon/           # أيقونات الإضافات المعتمدة
+├── src/            # الكود المصدري لكافة الإضافات (Kotlin)
+│   ├── all/        # مصادر عامة ودولية (PornHub, Jable, Stremio, etc.)
+│   ├── ar/         # مصادر عربية (Witanime, Anime4up, Arabseed, etc.)
+│   └── en/         # مصادر إنجليزية
+├── core/           # المكتبة المركزية (الأدوات المساعدة ومستخرجات الفيديو)
+├── lib/            # مستخرجات الفيديو المساعدة (Dood, Streamtape, Okru, etc.)
+├── index.json      # فهرس الإضافات الكامل بصيغة مقروءة
+├── index.min.json  # الفهرس المصغر الموجه للتطبيق
+├── repo.json       # هوية المستودع وبصمة التوقيع
+├── rebuild_index.py# سكربت فحص وتحديث الفهرس واستخراج بيانات الـ APK
+└── index.html      # صفحة الويب لتصفح وتنزيل الإضافات
 ```
 
-Root-level APK copies and nested `apk/apk` mirrors are intentionally excluded. The app reads the APK basename from the index and resolves it under `/apk/`.
+---
 
-## Maintainer workflow
+## 🛠️ دليل المطورين (Maintainer Workflow)
 
-Build a source with the Gradle wrapper:
+### بناء إضافة معينة (Build an Extension):
 
-```powershell
-.\gradlew.bat :src:all:sextb:assembleRelease
+- **على أنظمة Linux / macOS:**
+  ```bash
+  ./gradlew :src:all:pornhub:assembleRelease --no-daemon
+  ```
+
+- **على أنظمة Windows:**
+  ```powershell
+  .\gradlew.bat :src:all:pornhub:assembleRelease --no-daemon
+  ```
+
+### تحديث الفهرس بعد التجميع (Rebuild Index):
+بعد نقل ملفات الـ APK الناتجة إلى مجلد `apk/`:
+```bash
+python3 rebuild_index.py
 ```
 
-After placing signed builds in `apk/`, regenerate and validate the catalog:
-
-```powershell
-python .\rebuild_index.py
+### معاينة صفحة الويب محلياً:
+```bash
+python3 -m http.server 8080
 ```
+ثم افتح الرابط `http://127.0.0.1:8080/` في المتصفح.
 
-Preview the install page locally:
+---
 
-```powershell
-python -m http.server 8080
-```
+## ⚖️ إخلاء مسؤولية (Disclaimer)
 
-Then open `http://127.0.0.1:8080/`.
+هذا المستودع مستقل تماماً ولا يتبع رسمياً لفريق تطوير تطبيق Aniyomi أو Tadami أو أي جهة استضافة محتوى خارجية. كافة الإضافات مقدمة لأغراض برمجية ومفتوحة المصدر، والمستخدم مسؤول عن استخدامه وفقاً للقوانين المعمول بها.
 
-## Disclaimer
-
-This is an independent repository and is not affiliated with Aniyomi, Tadami, or any content host. Users are responsible for lawful use of third-party sources.
