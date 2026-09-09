@@ -6,7 +6,7 @@ A maintained **Aniyomi-compatible anime extension repository** for AR, EN, and l
 
 ### One tap on Android
 
-[Open the repository in Aniyomi / Tadami](aniyomi://add-repo?url=https%3A%2F%2Fraw.githubusercontent.com%2Fomarallsharkawy%2Fextentions-repo%2Fmain%2Findex.min.json)
+[Open the repository in Aniyomi / Tadami](aniyomi://add-repo?url=https%3A%2F%2Fraw.githubusercontent.com%2FRassmos999%2Fextentions-repo%2Fmain%2Findex.min.json)
 
 The link opens the app's own confirmation screen. It does not silently install extensions, grant trust, or bypass Android permission prompts.
 
