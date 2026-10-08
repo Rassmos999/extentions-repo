@@ -587,10 +587,10 @@
   {
     "name": "Aniyomi: Aflamk1",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.aflamk1",
-    "apk": "aniyomi-ar.aflamk1-v14.8.apk",
+    "apk": "aniyomi-ar.aflamk1-v14.11.apk",
     "lang": "ar",
-    "code": 8,
-    "version": "14.8",
+    "code": 11,
+    "version": "14.11",
     "nsfw": 1,
     "sources": [
       {
@@ -723,10 +723,10 @@
   {
     "name": "Aniyomi: ArabsHentai",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.arabshentai",
-    "apk": "aniyomi-ar.arabshentai-v14.28.apk",
+    "apk": "aniyomi-ar.arabshentai-v14.31.apk",
     "lang": "ar",
-    "code": 28,
-    "version": "14.28",
+    "code": 31,
+    "version": "14.31",
     "nsfw": 1,
     "sources": [
       {
@@ -859,10 +859,10 @@
   {
     "name": "Aniyomi: NxxHentai",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.nxxhentai",
-    "apk": "aniyomi-ar.nxxhentai-v14.27.apk",
+    "apk": "aniyomi-ar.nxxhentai-v14.32.apk",
     "lang": "ar",
-    "code": 27,
-    "version": "14.27",
+    "code": 34,
+    "version": "14.34",
     "nsfw": 1,
     "sources": [
       {
@@ -893,10 +893,10 @@
   {
     "name": "Aniyomi: SexAlArab",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.sexalarab",
-    "apk": "aniyomi-ar.sexalarab-v14.15.apk",
+    "apk": "aniyomi-ar.sexalarab-v14.18.apk",
     "lang": "ar",
-    "code": 15,
-    "version": "14.15",
+    "code": 18,
+    "version": "14.18",
     "nsfw": 1,
     "sources": [
       {
@@ -910,10 +910,10 @@
   {
     "name": "Aniyomi: SexMahali",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.sexmahali",
-    "apk": "aniyomi-ar.sexmahali-v14.15.apk",
+    "apk": "aniyomi-ar.sexmahali-v14.17.apk",
     "lang": "ar",
-    "code": 15,
-    "version": "14.15",
+    "code": 17,
+    "version": "14.17",
     "nsfw": 1,
     "sources": [
       {

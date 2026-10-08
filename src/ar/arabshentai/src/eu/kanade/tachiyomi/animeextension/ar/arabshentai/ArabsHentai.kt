@@ -64,8 +64,8 @@ class ArabsHentai :
     }
 
     /** Catalog cards: series (tvshows) + movies + generic items. */
-    private fun catalogSelector() = "article.item.tvshows div.poster, article.item.movies div.poster, " +
-        "article.item div.poster, div.content article div.poster, div.items article div.poster"
+    private fun catalogSelector() = "article.thumb-block, article.item.tvshows div.poster, article.item.movies div.poster, " +
+        "article.item div.poster, div.content article div.poster, div.items article div.poster, article.item, article"
 
     override fun popularAnimeSelector() = catalogSelector()
 
@@ -81,8 +81,11 @@ class ArabsHentai :
         val href = link.absUrl("href").ifBlank { link.attr("href") }
         setUrlWithoutDomain(href)
         val img = element.selectFirst("img")
-        title = img?.attr("alt")?.takeIf { it.isNotBlank() }
-            ?: element.parent()?.selectFirst(".data h3 a, .data h3, h3")?.text().orEmpty()
+        title = link.attr("title").ifBlank {
+            img?.attr("alt").orEmpty().ifBlank {
+                element.selectFirst(".cat-title, .entry-header span, .data h3 a, .data h3, h3, h2")?.text().orEmpty()
+            }
+        }.trim()
         thumbnail_url = img?.getImageUrl()
     }
 
@@ -264,6 +267,23 @@ class ArabsHentai :
 
         if (byUrl.isNotEmpty()) {
             return byUrl.values.sortedByDescending { it.episode_number }
+        }
+
+        val episodesFromCategory = doc.select("article.thumb-block, article.post, div.thumb-block").mapNotNull { el ->
+            val a = el.selectFirst("a[href]") ?: return@mapNotNull null
+            val href = a.absUrl("href").ifBlank { a.attr("href") }
+            if (href.isBlank() || "/category/" in href) return@mapNotNull null
+            val title = a.attr("title").ifBlank { el.selectFirst(".cat-title, .entry-title, h2, h3")?.text().orEmpty() }
+            val epNum = Regex("""\b(\d+)\b""").findAll(title).lastOrNull()?.groupValues?.get(1)?.toFloatOrNull() ?: 1f
+            SEpisode.create().apply {
+                setUrlWithoutDomain(href)
+                name = title.ifBlank { "Episode $epNum" }
+                episode_number = epNum
+            }
+        }.distinctBy { it.url }
+
+        if (episodesFromCategory.isNotEmpty()) {
+            return episodesFromCategory.reversed()
         }
 
         val seasonList = doc.select(seasonListSelector)

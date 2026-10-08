@@ -324,17 +324,30 @@ class SexMahali :
         // Cloudflare / JS-only shells won't expose media URLs
         if ("Just a moment" in body || "cf-browser-verification" in body) return emptyList()
 
-        val unpacked = JsUnpacker.unpackAndCombine(body).orEmpty()
-        val combined = "$body\n$unpacked"
+        val atobB64 = Regex("""atob\(\s*["']([^"']+)["']\s*\)""").find(body)?.groupValues?.get(1)
+        val decoded = atobB64?.let { b64 ->
+            runCatching {
+                String(android.util.Base64.decode(b64, android.util.Base64.DEFAULT), Charsets.UTF_8)
+            }.getOrNull()
+        }.orEmpty()
 
-        val playlistUrl = DATA_HASH_REGEX.find(combined)?.groupValues?.get(1)
+        val unpacked = JsUnpacker.unpackAndCombine(body).orEmpty()
+        val combined = "$body\n$unpacked\n$decoded"
+
+        val playlistUrl = Regex("""https?://[^"'\\\s<>]+master\.m3u8[^"'\\\s<>]*""").find(decoded)?.value
+            ?: Regex("""https?://[^"'\\\s<>]+\.m3u8[^"'\\\s<>]*""").find(decoded)?.value
+            ?: DATA_HASH_REGEX.find(combined)?.groupValues?.get(1)
             ?: URLPLAY_REGEX.find(combined)?.groupValues?.get(1)
             ?: M3U8_REGEX.find(combined)?.value
 
         if (playlistUrl != null && runCatching { playlistUrl.toHttpUrl() }.isSuccess) {
+            val streamReferer = when {
+                embedUrl.contains("hentaized") -> "https://hentaized.com/"
+                else -> embedUrl
+            }
             return playlistUtils.extractFromHls(
                 playlistUrl,
-                referer = embedUrl,
+                referer = streamReferer,
                 videoNameGen = { "$label - $it" },
             ).distinctBy { it.videoUrl }
         }

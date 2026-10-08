@@ -49,10 +49,10 @@ class SexAlArab :
 
     override fun popularAnimeRequest(page: Int): Request = GET(pagedPath("most-popular", page), headers)
 
-    override fun popularAnimeSelector(): String = "div.list-videos div.item:not(.private) > a"
+    override fun popularAnimeSelector(): String = "div.list-videos div.item > a, div.item > a"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
-        setUrlWithoutDomain(element.attr("abs:href"))
+        setUrlWithoutDomain(cleanUrl(element.attr("abs:href")))
         val rawTitle = element.attr("title").ifBlank {
             element.selectFirst("strong.title")?.text().orEmpty()
         }.trim()
@@ -214,8 +214,14 @@ class SexAlArab :
     override fun episodeListRequest(anime: SAnime): Request = GET(cleanUrl(anime.url), headers)
 
     private fun cleanUrl(url: String): String {
-        val full = if (url.startsWith("http")) url else "$baseUrl$url"
-        return runCatching { full.toHttpUrl().toString() }.getOrDefault(full)
+        val raw = if (url.startsWith("http")) url else "$baseUrl/$url"
+        val path = raw.removePrefix(baseUrl).trim('/')
+        if (path.isEmpty()) return baseUrl
+        val builder = baseUrl.toHttpUrl().newBuilder()
+        path.split('/').filter { it.isNotEmpty() }.forEach {
+            builder.addPathSegment(it)
+        }
+        return builder.build().toString()
     }
 
     // ============================== Episodes ==============================
@@ -237,7 +243,7 @@ class SexAlArab :
 
     override fun videoListParse(response: Response): List<Video> {
         val html = response.body.string()
-        val pageUrl = response.request.url.toString()
+        val pageUrl = "$baseUrl/"
         val license = LICENSE_CODE.find(html)?.groupValues?.get(1)
         val videoHeaders = headersBuilder()
             .set("Referer", pageUrl)

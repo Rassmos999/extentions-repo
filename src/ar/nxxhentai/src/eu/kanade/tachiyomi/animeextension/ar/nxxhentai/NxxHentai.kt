@@ -512,11 +512,16 @@ class NxxHentai :
         }
     }
 
-    private fun resolveRedirect(url: String): String {
+    private fun resolveRedirect(url: String, customReferer: String? = null): String {
+        val referer = customReferer ?: if (url.contains("player.nxxhentai.net")) {
+            url.substringBeforeLast("/")
+        } else {
+            "$baseUrl/"
+        }
         val req = GET(
             url,
             headers.newBuilder()
-                .set("Referer", "$baseUrl/")
+                .set("Referer", referer)
                 .build(),
         )
         return runCatching {
@@ -652,12 +657,13 @@ class NxxHentai :
     }
 
     private suspend fun extractFromPlayerPage(url: String, label: String): List<Video> {
+        val pageReferer = if (url.contains("player.nxxhentai.net")) url else "$baseUrl/"
         val doc = runCatching {
             client.newCall(
                 GET(
                     url,
                     headers.newBuilder()
-                        .set("Referer", "$baseUrl/")
+                        .set("Referer", pageReferer)
                         .build(),
                 ),
             ).execute().asJsoup()
@@ -678,7 +684,7 @@ class NxxHentai :
                 val q = a.text().trim().ifBlank {
                     QUALITY_IN_URL.find(href)?.value ?: "MP4"
                 }
-                val resolved = resolveRedirect(href)
+                val resolved = resolveRedirect(href, customReferer = url)
                 if (resolved.startsWith("http") && isMediaUrl(resolved)) {
                     nested += streamFromUrl(resolved, "$label $q")
                 }
@@ -716,13 +722,13 @@ class NxxHentai :
     private fun streamFromUrl(url: String, quality: String): List<Video> {
         val clean = url.replace("\\/", "/").replace("&amp;", "&").trim()
         if (!clean.startsWith("http")) return emptyList()
-        val vHeaders = videoHeaders()
+        val vHeaders = videoHeaders(clean)
         return when {
             clean.contains(".m3u8", ignoreCase = true) -> {
                 runCatching {
                     playlistUtils.extractFromHls(
                         clean,
-                        referer = "$baseUrl/",
+                        referer = if (clean.contains("b-cdn.net") || clean.contains("player.nxxhentai.net")) "https://player.nxxhentai.net/" else "$baseUrl/",
                         videoNameGen = { q -> "$quality - $q" },
                     )
                 }.getOrElse { listOf(Video(clean, quality, clean, headers = vHeaders)) }
@@ -732,16 +738,24 @@ class NxxHentai :
         }
     }
 
-    private fun videoHeaders() = headers.newBuilder()
-        .set(
-            "User-Agent",
-            headers["User-Agent"]
-                ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-        )
-        .set("Referer", "$baseUrl/")
-        .set("Origin", baseUrl)
-        .set("Accept", "*/*")
-        .build()
+    private fun videoHeaders(url: String = ""): okhttp3.Headers {
+        val referer = when {
+            url.contains("b-cdn.net") || url.contains("player.nxxhentai.net") -> "https://player.nxxhentai.net/"
+            else -> "$baseUrl/"
+        }
+        val builder = headers.newBuilder()
+            .set(
+                "User-Agent",
+                headers["User-Agent"]
+                    ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+            )
+            .set("Referer", referer)
+            .set("Accept", "*/*")
+        if (!url.contains("b-cdn.net")) {
+            builder.set("Origin", baseUrl)
+        }
+        return builder.build()
+    }
 
     // ============================== Filters ===============================
     // Search tab + empty query → filters apply. Popular tab ignores filters.
