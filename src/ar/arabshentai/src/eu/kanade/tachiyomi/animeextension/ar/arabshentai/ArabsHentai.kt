@@ -292,12 +292,12 @@ class ArabsHentai :
         }
 
         // Single movie / episode page opened as "anime"
-        if (doc.selectFirst("ul#playeroptionsul, li.dooplay_player_option, video source, iframe.metaframe") != null) {
+        if (doc.selectFirst("video, video source, .responsive-player, iframe, ul#playeroptionsul, li.dooplay_player_option, iframe.metaframe") != null) {
             return listOf(
                 SEpisode.create().apply {
                     setUrlWithoutDomain(doc.location())
                     episode_number = 1F
-                    name = doc.selectFirst("h1")?.text() ?: episodeMovieText
+                    name = doc.selectFirst("h1.entry-title, h1")?.text() ?: episodeMovieText
                 },
             )
         }

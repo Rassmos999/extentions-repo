@@ -525,7 +525,12 @@ class NxxHentai :
                 .build(),
         )
         return runCatching {
-            client.newCall(req).execute().use { resp ->
+            val noRedirectClient = client.newBuilder().followRedirects(false).build()
+            noRedirectClient.newCall(req).execute().use { resp ->
+                val loc = resp.header("Location")
+                if (!loc.isNullOrBlank()) {
+                    return@use loc
+                }
                 val final = resp.request.url.toString()
                 if (final != url && final.startsWith("http") && "/links/" !in final) {
                     return@use final

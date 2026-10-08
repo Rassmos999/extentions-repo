@@ -214,12 +214,20 @@ class SexAlArab :
     override fun episodeListRequest(anime: SAnime): Request = GET(cleanUrl(anime.url), headers)
 
     private fun cleanUrl(url: String): String {
-        val raw = if (url.startsWith("http")) url else "$baseUrl/$url"
+        val clean = url.trim()
+        if (clean.startsWith("http://") || clean.startsWith("https://")) {
+            return clean
+        }
+        val raw = "$baseUrl/$clean"
         val path = raw.removePrefix(baseUrl).trim('/')
         if (path.isEmpty()) return baseUrl
         val builder = baseUrl.toHttpUrl().newBuilder()
-        path.split('/').filter { it.isNotEmpty() }.forEach {
-            builder.addPathSegment(it)
+        path.split('/').filter { it.isNotEmpty() }.forEach { segment ->
+            if (segment.contains("%")) {
+                builder.addEncodedPathSegment(segment)
+            } else {
+                builder.addPathSegment(segment)
+            }
         }
         return builder.build().toString()
     }
