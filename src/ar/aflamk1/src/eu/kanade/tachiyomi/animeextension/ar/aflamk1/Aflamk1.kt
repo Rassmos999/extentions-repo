@@ -187,6 +187,15 @@ class Aflamk1 :
         status = SAnime.COMPLETED
     }
 
+    override fun animeDetailsRequest(anime: SAnime): Request = GET(cleanUrl(anime.url), headers)
+
+    override fun episodeListRequest(anime: SAnime): Request = GET(cleanUrl(anime.url), headers)
+
+    private fun cleanUrl(url: String): String {
+        val full = if (url.startsWith("http")) url else "$baseUrl$url"
+        return runCatching { full.toHttpUrl().toString() }.getOrDefault(full)
+    }
+
     // ============================== Episodes ==============================
 
     override fun episodeListParse(response: Response): List<SEpisode> = listOf(
@@ -366,7 +375,7 @@ class Aflamk1 :
             hash = n.toString()
         }
         parts[7] = hash + nonConvert
-        return parts.drop(2).joinToString("/")
+        return parts.drop(2).joinToString("/").replaceFirst(":///", "://")
     }
 
     private fun calcSeed(licenseCode: String, hashRange: Int): String {

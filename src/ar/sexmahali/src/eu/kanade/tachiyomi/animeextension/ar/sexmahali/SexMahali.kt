@@ -15,6 +15,7 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.lib.jsunpacker.JsUnpacker
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.getPreferencesLazy
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -323,9 +324,12 @@ class SexMahali :
         // Cloudflare / JS-only shells won't expose media URLs
         if ("Just a moment" in body || "cf-browser-verification" in body) return emptyList()
 
-        val playlistUrl = DATA_HASH_REGEX.find(body)?.groupValues?.get(1)
-            ?: URLPLAY_REGEX.find(body)?.groupValues?.get(1)
-            ?: M3U8_REGEX.find(body)?.value
+        val unpacked = JsUnpacker.unpackAndCombine(body).orEmpty()
+        val combined = "$body\n$unpacked"
+
+        val playlistUrl = DATA_HASH_REGEX.find(combined)?.groupValues?.get(1)
+            ?: URLPLAY_REGEX.find(combined)?.groupValues?.get(1)
+            ?: M3U8_REGEX.find(combined)?.value
 
         if (playlistUrl != null && runCatching { playlistUrl.toHttpUrl() }.isSuccess) {
             return playlistUtils.extractFromHls(
@@ -335,7 +339,7 @@ class SexMahali :
             ).distinctBy { it.videoUrl }
         }
 
-        val mp4 = MP4_REGEX.find(body)?.value ?: return emptyList()
+        val mp4 = MP4_REGEX.find(combined)?.value ?: return emptyList()
         val videoHeaders = headers.newBuilder()
             .set("Referer", embedUrl)
             .build()
@@ -356,6 +360,8 @@ class SexMahali :
         host.contains("turbovid") || host.contains("turboviplay") -> "TurboVid"
 
         host.contains("hgcloud") -> "HGCloud"
+
+        host.contains("hentaized") -> "Hentaized"
 
         host.contains("abyss") -> "Abyss"
 

@@ -39,13 +39,13 @@ class ArabXN :
         .set("Referer", "$baseUrl/")
 
     // ============================== Popular ===============================
-    // Catalog: /video/ (all videos). Page 2+ → /video/{n}
+    // Catalog: /video/ (all videos). Page 2+ → /video/page/{n}
     override fun popularAnimeRequest(page: Int): Request {
-        val url = if (page <= 1) "$baseUrl/video/" else "$baseUrl/video/$page"
+        val url = if (page <= 1) "$baseUrl/video/" else "$baseUrl/video/page/$page"
         return GET(url, headers)
     }
 
-    override fun popularAnimeSelector(): String = "article.rowvideo"
+    override fun popularAnimeSelector(): String = "article.video-card, article.rowvideo, article"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
         val link = element.selectFirst("a[href*=/watch-]")
@@ -53,7 +53,7 @@ class ArabXN :
         val href = link?.attr("abs:href").orEmpty()
         setUrlWithoutDomain(href)
         val rawTitle = link?.attr("title")?.ifBlank { null }
-            ?: element.selectFirst("strong.title, .row_titleVideo .title, .title")?.text()?.trim()
+            ?: element.selectFirst("h2, h3, strong.title, .row_titleVideo .title, .title")?.text()?.trim()
             ?: link?.text()?.trim().orEmpty()
         val duration = element.selectFirst(
             "div.timevideo1, div.timevideo, div.duration, span.duration, span.time, span.clock, time",
@@ -63,10 +63,10 @@ class ArabXN :
         } else {
             rawTitle
         }
-        thumbnail_url = element.selectFirst("img")?.getImageUrl()
+        thumbnail_url = element.selectFirst("img.video-card-poster, img")?.getImageUrl()
     }
 
-    override fun popularAnimeNextPageSelector(): String = "link[rel=next], div.pagination span.current-page ~ a[href], div.pagination .current ~ a[href], div.pagination a.next, a[rel=next]"
+    override fun popularAnimeNextPageSelector(): String = "nav.catalog-pagination a[href], nav.pagination a[href], .catalog-pagination a[href], link[rel=next], div.pagination span.current-page ~ a[href], div.pagination .current ~ a[href], div.pagination a.next, a[rel=next]"
 
     override fun popularAnimeParse(response: Response): AnimesPage {
         val document = response.asJsoup()

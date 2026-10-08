@@ -29,7 +29,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 /**
- * ArabsHentai — https://arabshentai.com/anime/
+ * ArabsHentai — https://arabshentai.net/anime/
  *
  * DooPlay theme (same family as NxxHentai). Cloudflare is handled by the **app**
  * NetworkHelper client (default UA + AndroidCookieJar WebView solver).
@@ -40,7 +40,7 @@ class ArabsHentai :
     DooPlay(
         "ar",
         "ArabsHentai",
-        "https://arabshentai.com",
+        "https://arabshentai.net",
     ) {
 
     override fun headersBuilder() = super.headersBuilder()

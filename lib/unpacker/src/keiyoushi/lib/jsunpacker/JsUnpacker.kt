@@ -18,7 +18,7 @@ object JsUnpacker {
      * Regex to get and group the packed javascript.
      * Needed to get information and unpack the code.
      */
-    private val packedExtractRegex by lazy { Regex("""\}\s*\('(.*)',\s*(\d+),\s*(\d+),\s*'(.*?)'\.split\('\|'\)""", setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE)) }
+    private val packedExtractRegex by lazy { Regex("""\}\s*\('(.*?)',\s*(\d+),\s*(\d+),\s*'(.*?)'\.split\('\|'\)""", setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE, RegexOption.DOT_MATCHES_ALL)) }
 
     /**
      * Matches function names and variables to de-obfuscate the code.
@@ -131,7 +131,7 @@ object JsUnpacker {
             } else {
                 payload.replace(unpackReplaceRegex) { match ->
                     val word = match.value
-                    val unbased = symtab.getOrNull(unbaser.unbase(word)) ?: ""
+                    val unbased = symtab.getOrNull(unbaser.unbase(word)).orEmpty()
                     unbased.ifEmpty { word }
                 }
             }

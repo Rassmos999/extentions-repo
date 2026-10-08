@@ -599,6 +599,12 @@ class NxxHentai :
             lower.contains("upns") ->
                 extractUpns(clean, label)
 
+            lower.contains("player.nxxhentai.net/player/") -> {
+                val dl = clean.replace("/player/", "/download/")
+                val dlVideos = extractFromPlayerPage(dl, label)
+                if (dlVideos.isNotEmpty()) dlVideos else extractFromPlayerPage(clean, label)
+            }
+
             lower.contains("rubyvidhub") || lower.contains("playmogo") ||
                 lower.contains("vidhub") ->
                 extractFromPlayerPage(clean, label)
@@ -664,6 +670,18 @@ class NxxHentai :
             val src = el.absUrl("src").ifBlank { el.attr("src") }
             if (src.startsWith("http") && isMediaUrl(src)) {
                 nested += streamFromUrl(src, label)
+            }
+        }
+        doc.select("a[href*='/file'], a[href*='/download/']").forEach { a ->
+            val href = a.absUrl("href").ifBlank { a.attr("href") }
+            if (href.startsWith("http") && href != url && "/file" in href) {
+                val q = a.text().trim().ifBlank {
+                    QUALITY_IN_URL.find(href)?.value ?: "MP4"
+                }
+                val resolved = resolveRedirect(href)
+                if (resolved.startsWith("http") && isMediaUrl(resolved)) {
+                    nested += streamFromUrl(resolved, "$label $q")
+                }
             }
         }
         MP4_OR_M3U8.findAll(body).map { it.value.replace("\\/", "/") }.distinct().forEach {
