@@ -155,21 +155,22 @@ class Rule34Video :
     override fun animeDetailsParse(document: Document) = SAnime.create().apply {
         title = document.selectFirst("h1.title_video")?.text().toString()
 
-        val infoRow = document.selectFirst("div.info.row")
+        // The redesigned player page keeps upload date / views / duration in "div.vp-meta > span.item_info".
+        val infoItems = document.select("div.vp-meta .item_info > span, div.info.row div.item_info > span")
         val detailRows = document.select("div.row")
 
         val artistElement = detailRows.select("div.col:has(div.label:contains(Artist)) a.item span.name").firstOrNull()
         author = artistElement?.text().orEmpty()
 
         description = buildString {
-            detailRows.select("div.row:has(div.label > em) > div.label > em").html()
+            (document.selectFirst("div.vp-desc")?.let { it.selectFirst("em") ?: it }?.html() ?: detailRows.select("div.row:has(div.label > em) > div.label > em").html())
                 .replace("<br>", "\n") // Ensure single <br> tags are followed by a newline
                 .let { text ->
                     append(text)
                 }
             append("\n\n") // Add extra spacing
 
-            infoRow?.selectFirst("div.item_info:nth-child(1) > span")?.text()?.let {
+            infoItems.getOrNull(0)?.text()?.let {
                 append("Uploaded: $it\n")
             }
 
@@ -192,18 +193,18 @@ class Rule34Video :
                 append("Uploader: $uploader\n")
             }
 
-            infoRow?.select("div.item_info:nth-child(2) > span")?.text()?.let {
+            infoItems.getOrNull(1)?.text()?.let {
                 val views = it.substringBefore(" ").replace(",", "")
                 append("Views: $views\n")
             }
-            infoRow?.select("div.item_info:nth-child(3) > span")?.text()?.let { append("Duration: $it\n") }
-            document.select("div.row:has(div.label:contains(Download)) a.tag_item")
-                .eachText()
-                .joinToString { it.substringAfter(" ") }
+            infoItems.getOrNull(2)?.text()?.let { append("Duration: $it\n") }
+            document.select(DOWNLOAD_LINK_SELECTOR)
+                .mapNotNull { QUALITY_REGEX.find(it.text())?.value }
+                .joinToString()
                 .also { append("Quality: $it") }
         }
 
-        genre = document.select("div.row_spacer:has(div.label:contains(Tags)) a.tag_item:not(:contains(Suggest))")
+        genre = document.select("div:has(> div.label:contains(Tags)) a.tag_item:not(:contains(Suggest))")
             .eachText()
             .joinToString()
 
@@ -246,7 +247,7 @@ class Rule34Video :
 
         val document = response.asJsoup()
 
-        return document.select("div.label:contains(Download) ~ a.tag_item")
+        return document.select(DOWNLOAD_LINK_SELECTOR)
             .parallelMapNotNullBlocking { element ->
                 val originalUrl = element.attr("href")
                 // We need to do that because this url returns a http 403 error
@@ -256,7 +257,8 @@ class Rule34Video :
                 val url = noRedirectClient.newCall(GET(originalUrl, headers)).execute()
                     .use { it.headers["location"] }
                     ?: return@parallelMapNotNullBlocking null
-                val quality = element.text().substringAfter(" ")
+                // Link text is e.g. "MP4 1080p37 MB"
+                val quality = QUALITY_REGEX.find(element.text())?.value ?: element.text().substringAfter(" ")
                 Video(url, quality, url, headers)
             }
     }
@@ -375,6 +377,9 @@ class Rule34Video :
 
     companion object {
         const val PREFIX_SEARCH = "slug:"
+
+        private const val DOWNLOAD_LINK_SELECTOR = "a.tag_item_download[href*=get_file], div.label:contains(Download) ~ a.tag_item"
+        private val QUALITY_REGEX = Regex("""\d{3,4}p""")
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_TITLE = "Preferred quality"

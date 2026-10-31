@@ -1,6 +1,12 @@
 package aniyomi.lib.m3u8server
 
 import android.util.Log
+import fi.iki.elonen.NanoHTTPD
+import fi.iki.elonen.NanoHTTPD.IHTTPSession
+import fi.iki.elonen.NanoHTTPD.Response
+import fi.iki.elonen.NanoHTTPD.Response.Status
+import fi.iki.elonen.NanoHTTPD.newChunkedResponse
+import fi.iki.elonen.NanoHTTPD.newFixedLengthResponse
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -8,12 +14,6 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.nanohttpd.protocols.http.IHTTPSession
-import org.nanohttpd.protocols.http.NanoHTTPD
-import org.nanohttpd.protocols.http.response.Response
-import org.nanohttpd.protocols.http.response.Response.newChunkedResponse
-import org.nanohttpd.protocols.http.response.Response.newFixedLengthResponse
-import org.nanohttpd.protocols.http.response.Status
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -72,7 +72,7 @@ class M3u8HttpServer(
 
     fun isRunning(): Boolean = isRunning
 
-    override fun handle(session: IHTTPSession): Response {
+    override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
         val method = session.method
 
@@ -80,8 +80,11 @@ class M3u8HttpServer(
 
         val response = when {
             uri.startsWith("/m3u8") -> handleM3u8Request(session)
+
             uri.startsWith("/segment") -> handleSegmentRequest(session)
+
             uri.startsWith("/health") -> handleHealthRequest()
+
             else -> {
                 Log.w(tag, "Unknown endpoint: $uri")
                 newFixedLengthResponse(Status.NOT_FOUND, MIME_PLAINTEXT, "Not Found")
@@ -298,7 +301,10 @@ class M3u8HttpServer(
             } else {
                 rawSegment
             }
-            val stripped = stripInterleavedJunk(plaintext)
+            val unwrapped = PngContainer.extractPayload(plaintext)?.also {
+                Log.d(tag, "Unwrapped PNG-container segment: ${plaintext.size} → ${it.size} bytes")
+            } ?: plaintext
+            val stripped = stripInterleavedJunk(unwrapped)
             Log.d(tag, "Segment processing completed, final size: ${stripped.size} bytes")
             stripped
         } catch (e: UpstreamStatusException) {
@@ -407,7 +413,7 @@ class M3u8HttpServer(
                     throw UpstreamStatusException(response.code, url, "Failed to fetch m3u8")
                 }
 
-                val content = response.body.string()
+                val content = decodePlaylistBody(response.body.bytes())
                 if (content.isBlank()) {
                     Log.e(tag, "Empty M3U8 response body")
                     throw UpstreamStatusException(502, url, "Empty response body")
@@ -433,7 +439,7 @@ class M3u8HttpServer(
                         Log.e(tag, "Fallback also failed for M3U8, HTTP code: ${response.code}")
                         throw UpstreamStatusException(response.code, url, "Fallback failed: ${primary.message}", primary)
                     }
-                    val content = response.body.string()
+                    val content = decodePlaylistBody(response.body.bytes())
                     if (content.isBlank()) {
                         throw UpstreamStatusException(502, url, "Empty fallback body", primary)
                     }
@@ -448,6 +454,9 @@ class M3u8HttpServer(
             }
         }
     }
+
+    /** Playlists may also arrive wrapped in a PNG container (see [PngContainer]). */
+    private fun decodePlaylistBody(bytes: ByteArray): String = (PngContainer.extractPayload(bytes) ?: bytes).toString(Charsets.UTF_8)
 
     private fun copyRegion(src: ByteArray, off: Int, len: Int): ByteArray {
         if (off == 0 && len == src.size) return src
@@ -508,6 +517,7 @@ class M3u8HttpServer(
                     segmentSequence = mediaSequence
                     modifiedLines.add(line)
                 }
+
                 line.startsWith("#EXT-X-KEY:") -> {
                     val attributes = parseHlsAttributes(line)
                     when (attributes["METHOD"]?.uppercase()) {
@@ -526,19 +536,23 @@ class M3u8HttpServer(
                                 Log.d(tag, "AES-128 detected, intercepting key at proxy: $resolvedKeyUrl (iv=${currentKey!!.iv})")
                             }
                         }
+
                         "NONE" -> {
                             currentKey = null
                             modifiedLines.add(line)
                         }
+
                         else -> {
                             currentKey = null
                             modifiedLines.add(line)
                         }
                     }
                 }
+
                 line.startsWith("#") || line.isBlank() -> {
                     modifiedLines.add(line)
                 }
+
                 else -> {
                     val resolvedUrl = resolveHlsUrl(baseHttpUrl, line)
                     if (resolvedUrl.contains(".m3u8", ignoreCase = true)) {

@@ -73,7 +73,8 @@ class SexTB : ParsedAnimeHttpSource() {
         sort = "viewed",
     )
 
-    override fun popularAnimeSelector(): String = "div.tray-content > div.tray-item, div.tray-item"
+    // Every listing page now opens with an "ad-card" tray-item linking to /advertise.
+    override fun popularAnimeSelector(): String = "div.tray-item:not(.ad-card):has(a[href])"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
         val link = element.selectFirst("a[href]") ?: element
@@ -327,7 +328,7 @@ class SexTB : ParsedAnimeHttpSource() {
 
             val label = normalizeServerLabel(button.text())
             extractPlayerUrls(decrypted, referer).forEach { url ->
-                resolvedPlayers += PlayerTarget(label, url, referer)
+                resolvedPlayers += PlayerTarget(label, url.redirectHgLink(), referer)
             }
         }
 
@@ -449,6 +450,16 @@ class SexTB : ParsedAnimeHttpSource() {
             .firstOrNull { it.startsWith("http", true) && ".m3u8" in it.lowercase() }
             ?: return emptyList()
         return listOf(Video(playlist, "US - HLS", playlist, headers = playerHeaders))
+    }
+
+    /**
+     * hglink.to / hgcloud.to only serve an obfuscated JS loader that bounces to a
+     * StreamWish mirror; the mirrors serve the packed player for the same /e/ id.
+     */
+    private fun String.redirectHgLink(): String {
+        val host = toHttpUrlOrNull()?.host ?: return this
+        if (HG_LINK_HOSTS.none { host.endsWith(it) }) return this
+        return replaceFirst(host, HG_LINK_MIRRORS.random())
     }
 
     private fun normalizePlayerUrl(rawUrl: String, pageUrl: String): String? {
@@ -803,6 +814,8 @@ class SexTB : ParsedAnimeHttpSource() {
         private val M3U8_URL_REGEX =
             Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""", RegexOption.IGNORE_CASE)
         private val UPN_HEX_REGEX = Regex("""[0-9a-fA-F]+""")
+        private val HG_LINK_HOSTS = listOf("hglink.to", "hgcloud.to")
+        private val HG_LINK_MIRRORS = listOf("hanerix.com", "vibuxer.com")
 
         private val CATEGORIES = arrayOf(
             "Censored" to "/jav-censored",

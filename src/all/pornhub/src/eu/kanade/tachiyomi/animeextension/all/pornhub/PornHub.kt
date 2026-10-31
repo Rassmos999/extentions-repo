@@ -23,11 +23,13 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
 
 class PornHub :
     ParsedAnimeHttpSource(),
@@ -43,7 +45,37 @@ class PornHub :
 
     private val preferences by getPreferencesLazy()
 
-    override val client: OkHttpClient = network.cloudflareClient
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addInterceptor(::retryRefusedPages)
+        .build()
+
+    /**
+     * Behind VPNs such as Cloudflare WARP, www.pornhub.com answers some egress IPs with
+     * 403/429 while others pass, so browsing and opening videos fail at random. Retry on
+     * a fresh connection (which may leave through another IP), then fail with a message
+     * that names the cause instead of a bare "HTTP error 403".
+     */
+    private fun retryRefusedPages(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        var response = chain.proceed(request)
+        if (!request.url.host.endsWith("pornhub.com")) return response
+
+        repeat(REFUSED_RETRIES) { attempt ->
+            if (response.code !in REFUSED_CODES) return response
+            response.close()
+            network.cloudflareClient.connectionPool.evictAll()
+            Thread.sleep(REFUSED_BACKOFF_MS * (attempt + 1))
+            response = chain.proceed(request)
+        }
+        if (response.code in REFUSED_CODES) {
+            response.close()
+            throw IOException(
+                "PornHub refused this connection (HTTP ${response.code}). " +
+                    "If a VPN or WARP is on, turn it off (or switch the 1.1.1.1 app to DNS-only mode) and retry.",
+            )
+        }
+        return response
+    }
 
     override fun headersBuilder(): Headers.Builder = Headers.Builder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -660,6 +692,10 @@ class PornHub :
 
     companion object {
         private val QUALITY_REGEX = Regex("""(\d{3,4})""")
+
+        private val REFUSED_CODES = setOf(403, 429)
+        private const val REFUSED_RETRIES = 2
+        private const val REFUSED_BACKOFF_MS = 700L
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_TITLE = "Preferred quality"

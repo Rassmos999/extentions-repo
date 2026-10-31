@@ -91,7 +91,7 @@ class Jable(override val lang: String) : AnimeHttpSource() {
                 title = if (!duration.isNullOrBlank()) "[$duration] $rawTitle" else rawTitle
             }
         }
-        val hasNextPage = items.isNotEmpty() && doc.select(".pagination li.active + li:not(.disabled), .pagination a.next, a[rel=next], .pagination li a[aria-label*=Next], .pagination a:contains(›)").isNotEmpty()
+        val hasNextPage = items.isNotEmpty() && doc.select(".pagination li:has(.active) + li a, .pagination li.active + li:not(.disabled), .pagination a.next, a[rel=next], .pagination li a[aria-label*=Next], .pagination a:contains(›)").isNotEmpty()
         return AnimesPage(items, hasNextPage)
     }
 

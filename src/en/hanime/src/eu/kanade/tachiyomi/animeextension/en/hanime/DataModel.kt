@@ -43,6 +43,11 @@ data class HitsModel(
 )
 
 @Serializable
+data class SearchHvsResponse(
+    val data: List<HitsModel> = emptyList(),
+)
+
+@Serializable
 data class VideoModel(
     @SerialName("player_base_url")
     val playerBaseUrl: String? = null,

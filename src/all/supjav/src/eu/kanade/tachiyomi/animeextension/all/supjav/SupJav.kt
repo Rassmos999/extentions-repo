@@ -5,8 +5,10 @@ import androidx.preference.PreferenceScreen
 import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
+import aniyomi.lib.vidhideextractor.VidHideExtractor
 import aniyomi.lib.voeextractor.VoeExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -14,6 +16,7 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.bodyString
@@ -21,7 +24,9 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parallelCatchingFlatMapBlocking
 import keiyoushi.utils.useAsJsoup
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -102,13 +107,37 @@ class SupJav(override val lang: String = "en") :
         return AnimesPage(listOf(details), false)
     }
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList) = GET("$baseUrl$langPath/?s=$query")
+    // The site paginates search as /page/N?s=, and categories as /category/{slug}/page/N.
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        val category = filters.filterIsInstance<CategoryFilter>().firstOrNull()?.toUriPart().orEmpty()
+        val url = when {
+            query.isNotBlank() -> "$baseUrl$langPath/page/$page/".toHttpUrl().newBuilder()
+                .addQueryParameter("s", query.trim())
+                .build()
+                .toString()
+
+            category.isNotBlank() -> "$baseUrl$langPath/category/$category/page/$page"
+
+            else -> "$baseUrl$langPath/page/$page"
+        }
+        return GET(url, headers)
+    }
 
     override fun searchAnimeSelector() = popularAnimeSelector()
 
     override fun searchAnimeFromElement(element: Element) = popularAnimeFromElement(element)
 
     override fun searchAnimeNextPageSelector() = popularAnimeNextPageSelector()
+
+    // ============================== Filters ===============================
+    override fun getFilterList() = AnimeFilterList(
+        AnimeFilter.Header("Text search ignores the category filter"),
+        CategoryFilter(),
+    )
+
+    private class CategoryFilter : AnimeFilter.Select<String>("Category", CATEGORIES.map { it.first }.toTypedArray()) {
+        fun toUriPart() = CATEGORIES[state].second
+    }
 
     // =========================== Anime Details ============================
     override fun animeDetailsParse(document: Document) = SAnime.create().apply {
@@ -156,6 +185,7 @@ class SupJav(override val lang: String = "en") :
     private val streamtapeExtractor by lazy { StreamTapeExtractor(client) }
     private val streamwishExtractor by lazy { StreamWishExtractor(client, headers) }
     private val voeExtractor by lazy { VoeExtractor(client, headers) }
+    private val vidHideExtractor by lazy { VidHideExtractor(client, headers) }
 
     private val protectorHeaders by lazy {
         super.headersBuilder().set("referer", "$PROTECTOR_URL/").build()
@@ -180,6 +210,11 @@ class SupJav(override val lang: String = "en") :
 
             "FST" -> streamwishExtractor.videosFromUrl(url)
 
+            // EarnVids / LuluStream: packed jwplayer on rotating domains (evsishere.xyz, luminscdn.xyz, ...)
+            "EVS", "LUC" -> vidHideExtractor.videosFromUrl(url, videoNameGen = { "$hoster - $it" })
+
+            "VAS" -> vasVideos(url)
+
             "TV" -> {
                 val body = client.newCall(GET(url)).awaitSuccess().bodyString()
                 val playlistUrl = body.substringAfter("var urlPlay = '", "")
@@ -193,6 +228,28 @@ class SupJav(override val lang: String = "en") :
 
             else -> emptyList()
         }
+    }
+
+    /** VAS (vvaassjjav.xyz/e/{filecode}) serves its HLS master from a JSON API instead of the page. */
+    private suspend fun vasVideos(url: String): List<Video> {
+        val embedUrl = url.toHttpUrl()
+        val filecode = embedUrl.pathSegments.lastOrNull(String::isNotBlank) ?: return emptyList()
+        val origin = "${embedUrl.scheme}://${embedUrl.host}"
+        val apiHeaders = headers.newBuilder()
+            .set("Referer", url.substringBefore("#"))
+            .set("Origin", origin)
+            .build()
+        val body = """{"filecode":"$filecode"}""".toRequestBody("application/json".toMediaType())
+        val response = client.newCall(POST("$origin/api/stream", apiHeaders, body)).awaitSuccess().bodyString()
+        val playlistUrl = VAS_STREAM_REGEX.find(response)?.groupValues?.get(1)
+            ?.replace("\\/", "/")
+            ?: return emptyList()
+
+        return playlistUtils.extractFromHls(
+            playlistUrl,
+            referer = "$origin/",
+            videoNameGen = { "VAS - $it" },
+        )
     }
 
     override fun videoListSelector(): String = throw UnsupportedOperationException()
@@ -227,7 +284,19 @@ class SupJav(override val lang: String = "en") :
 
         private const val PROTECTOR_URL = "https://lk1.supremejav.com"
 
-        private val SUPPORTED_PLAYERS = setOf("TV", "FST", "VOE", "ST")
+        private val SUPPORTED_PLAYERS = setOf("TV", "FST", "VOE", "ST", "EVS", "VAS", "LUC")
+
+        private val VAS_STREAM_REGEX = Regex(""""streaming_url"\s*:\s*"([^"]+)"""")
+
+        private val CATEGORIES = arrayOf(
+            Pair("All", ""),
+            Pair("Censored", "censored-jav"),
+            Pair("Uncensored", "uncensored-jav"),
+            Pair("Amateur", "amateur"),
+            Pair("Reducing Mosaic", "reducing-mosaic"),
+            Pair("English Subtitles", "english-subtitles"),
+            Pair("Chinese Subtitles", "chinese-subtitles"),
+        )
 
         private const val PREF_QUALITY_KEY = "pref_quality"
         private const val PREF_QUALITY_TITLE = "Preferred video quality"

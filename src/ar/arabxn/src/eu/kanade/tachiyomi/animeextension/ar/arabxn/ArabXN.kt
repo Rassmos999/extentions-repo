@@ -332,9 +332,9 @@ class ArabXN :
         if (clean.startsWith("/tag/")) {
             return "$clean/page/$page"
         }
-        // video catalog uses /video/{n}
+        // video catalog uses /video/page/{n} (/video/{n} renders an empty list)
         if (clean == "/video") {
-            return "/video/$page"
+            return "/video/page/$page"
         }
         // section roots like /سكس-عربي or /xnxx use /{n}
         return "$clean/$page"

@@ -19,6 +19,7 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
@@ -28,7 +29,9 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.useAsJsoup
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -440,9 +443,18 @@ class SupJav2(override val lang: String = "en") :
         return runCatching {
             when (hoster) {
                 "TV" -> extractTvVideosBlocking(url, player.pageReferer)
+
                 "ST" -> streamtapeExtractor.videosFromUrl(url)
+
                 "DOOD" -> doodExtractor.videosFromUrl(url)
+
                 "MIXDROP" -> mixdropExtractor.videosFromUrl(url)
+
+                "VOE" -> VoeExtractor(client, embedHeaders(player.pageReferer)).videosFromUrl(url)
+
+                "VAS" -> extractVasBlocking(url)
+
+                // EVS (EarnVids), LUC (LuluStream), FST, ...: packed jwplayer pages
                 else -> extractPackedHlsBlocking(url, player.pageReferer, hoster)
             }
         }.getOrDefault(emptyList())
@@ -546,6 +558,27 @@ class SupJav2(override val lang: String = "en") :
             ?: return emptyList()
         if (!isReachableHlsPlaylist(playlist, url)) return emptyList()
         return listOf(Video(playlist, "$label - HLS", playlist, headers = playbackHeaders(url)))
+    }
+
+    /** VAS (vvaassjjav.xyz/e/{filecode}) serves its HLS master from a JSON API instead of the page. */
+    private fun extractVasBlocking(url: String): List<Video> {
+        val embedUrl = url.toHttpUrlOrNull() ?: return emptyList()
+        val filecode = embedUrl.pathSegments.lastOrNull(String::isNotBlank) ?: return emptyList()
+        val origin = "${embedUrl.scheme}://${embedUrl.host}"
+        val apiHeaders = headers.newBuilder()
+            .set("Referer", url.substringBefore("#"))
+            .set("Origin", origin)
+            .build()
+        val body = """{"filecode":"$filecode"}""".toRequestBody("application/json".toMediaType())
+        val response = client.newCall(POST("$origin/api/stream", apiHeaders, body)).execute().use {
+            if (!it.isSuccessful) return emptyList()
+            it.body.string()
+        }
+        val playlist = VAS_STREAM_REGEX.find(response)?.groupValues?.get(1)
+            ?.replace("\\/", "/")
+            ?: return emptyList()
+        if (!isReachableHlsPlaylist(playlist, "$origin/")) return emptyList()
+        return listOf(Video(playlist, "VAS - HLS", playlist, headers = playbackHeaders("$origin/")))
     }
 
     private fun isReachableHlsPlaylist(playlist: String, referer: String): Boolean = runCatching {
@@ -845,6 +878,8 @@ class SupJav2(override val lang: String = "en") :
             Regex("""\bfile\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
         private val FST_M3U8_REGEX =
             Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""", RegexOption.IGNORE_CASE)
+
+        private val VAS_STREAM_REGEX = Regex(""""streaming_url"\s*:\s*"([^"]+)"""")
 
         private val SUPPORTED_SERVERS = setOf("TV", "FST", "VOE", "ST", "DOOD", "MIXDROP", "UQLOAD", "VIDHIDE")
 

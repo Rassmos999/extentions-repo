@@ -208,20 +208,34 @@ internal object RouVideoDto {
         ) {
             @Serializable
             data class PagePropsObject(
-                val gcAV: List<TagItem>,
-                val madouAV: List<TagItem>,
-                val v91: List<TagItem>,
-                val onlyfans: List<TagItem>,
+                val gcAV: List<TagItem>? = null,
+                val madouAV: List<TagItem>? = null,
+                val v91: List<TagItem>? = null,
+                val onlyfans: List<TagItem>? = null,
+                // TanStack rewrite: categories, genres and sub-tags per category
+                val taxonomy: Taxonomy? = null,
             ) {
-                fun toTagList(): Tags = listOf(
+                fun toTagList(): Tags = listOfNotNull(
                     gcAV,
                     madouAV,
                     v91,
                     onlyfans,
+                    taxonomy?.cats,
+                    taxonomy?.genre,
+                    taxonomy?.byParent?.values?.flatten(),
                 ).flatten()
-                    .map { Pair(it.name, it.name) }
+                    .map { it.name }
+                    .distinct()
+                    .map { Pair(it, it) }
                     .toTypedArray()
             }
+
+            @Serializable
+            data class Taxonomy(
+                val cats: List<TagItem> = emptyList(),
+                val genre: List<TagItem> = emptyList(),
+                val byParent: Map<String, List<TagItem>> = emptyMap(),
+            )
         }
     }
 
@@ -230,8 +244,8 @@ internal object RouVideoDto {
         @SerialName("id")
         val name: String,
         val count: Int,
-        val parent: String,
-        val level: Int, // usually 0
+        val parent: String = "",
+        val level: Int = 0, // usually 0
     )
 
     @Serializable

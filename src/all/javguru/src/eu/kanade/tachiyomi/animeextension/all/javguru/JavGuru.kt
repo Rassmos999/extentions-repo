@@ -8,6 +8,7 @@ import aniyomi.lib.javcoverfetcher.JavCoverFetcher.fetchHDCovers
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
+import aniyomi.lib.voeextractor.VoeExtractor
 import eu.kanade.tachiyomi.animeextension.all.javguru.extractors.EmTurboExtractor
 import eu.kanade.tachiyomi.animeextension.all.javguru.extractors.MaxStreamExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -401,6 +402,7 @@ class JavGuru :
     private val mixDropExtractor by lazy { MixDropExtractor(client) }
     private val maxStreamExtractor by lazy { MaxStreamExtractor(client, headers) }
     private val emTurboExtractor by lazy { EmTurboExtractor(client, headers) }
+    private val voeExtractor by lazy { VoeExtractor(client, headers) }
 
     private suspend fun getVideos(hosterUrl: String): List<Video> = when {
         listOf("javplaya", "javclan").any { it in hosterUrl } -> {
@@ -424,7 +426,8 @@ class JavGuru :
             streamTapeExtractor.videoFromUrl(hosterUrl).let(::listOfNotNull)
         }
 
-        listOf("dood", "ds2play").any { it in hosterUrl } -> {
+        // vide0.net / playmogo are DoodStream mirrors
+        listOf("dood", "ds2play", "vide0", "playmogo").any { it in hosterUrl } -> {
             doodExtractor.videosFromUrl(hosterUrl)
         }
 
@@ -438,6 +441,16 @@ class JavGuru :
 
         hosterUrl.contains("emturbovid") -> {
             emTurboExtractor.getVideos(hosterUrl)
+        }
+
+        // javlesbians.com redirects to rotating VOE mirror domains
+        listOf("voe", "javlesbians").any { it in hosterUrl } -> {
+            voeExtractor.videosFromUrl(hosterUrl)
+        }
+
+        // LuluStream mirror (packed JWPlayer, same layout as StreamWish)
+        listOf("streamhihi", "lulu").any { it in hosterUrl } -> {
+            streamWishExtractor.videosFromUrl(hosterUrl, videoNameGen = { "LuluStream - $it" })
         }
 
         else -> emptyList()

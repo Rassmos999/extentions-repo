@@ -37,7 +37,7 @@ val targetModules = listOf(
     "en:anikage", "en:animeparadise", "en:animetake", "en:hahomoe", "en:hanime", "en:hentaimama", "en:hexawatch",
     "en:hstream", "en:kayoanime", "en:kimoitv", "en:mapple", "en:myanime", "en:onetwothreeanime",
     "en:pinoymoviepedia", "en:rule34video", "en:uniquestream",
-    "all:hentaitorrent", "all:jable", "all:javgg", "all:javguru", "all:missav", "all:nyaatorrent", "all:pornhub", "all:ptorrent",
+    "all:hentaitorrent", "all:jable", "all:javdb", "all:javgg", "all:javguru", "all:missav", "all:nyaatorrent", "all:pornhub", "all:ptorrent",
     "all:rouvideo", "all:sextb", "all:streamingcommunity", "all:supjav", "all:supjav2", "all:xnxx", "all:xvideos"
 )
 

@@ -196,7 +196,12 @@ class Hanime :
                         Log.w(TAG, "fetchSearchHits() — search API returned empty body")
                         emptyList()
                     } else {
-                        jsonLine.parseAs<List<HitsModel>>()
+                        // search_hvs used to return a bare array; it now wraps it as {"data": [...], "ads": {...}}.
+                        if (jsonLine.trimStart().startsWith("{")) {
+                            jsonLine.parseAs<SearchHvsResponse>().data
+                        } else {
+                            jsonLine.parseAs<List<HitsModel>>()
+                        }
                     }
                 }
                 cachedSearchHits = result

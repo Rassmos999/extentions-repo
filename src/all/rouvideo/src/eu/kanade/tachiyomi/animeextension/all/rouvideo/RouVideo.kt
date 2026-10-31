@@ -1,6 +1,6 @@
 package eu.kanade.tachiyomi.animeextension.all.rouvideo
 
-import aniyomi.lib.playlistutils.PlaylistUtils
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoDto.toAnimePage
 import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoFilter.ALL_VIDEOS
 import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoFilter.FEATURED
@@ -8,6 +8,9 @@ import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoFilter.SORT_LATES
 import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoFilter.SORT_LIKE_KEY
 import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoFilter.WATCHING
 import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoFilter.categories
+import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoPageData.decodeVideoUrl
+import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoPageData.loaderData
+import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoPageData.pageData
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -24,6 +27,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
@@ -68,15 +75,7 @@ class RouVideo(
         add("Host", videoUrl.toHttpUrl().host)
     }.build()
 
-    private val videoHeaders by lazy {
-        headers.newBuilder().apply {
-            add("Accept", "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5")
-            add("Host", apiUrl.toHttpUrl().host)
-            add("Referer", "$videoUrl/")
-        }.build()
-    }
-
-    private val playlistUtils by lazy { PlaylistUtils(client) }
+    private val m3u8ServerManager by lazy { M3u8ServerManager(client) }
 
     // ============================== Popular ===============================
 
@@ -96,7 +95,7 @@ class RouVideo(
 
     override fun popularAnimeParse(response: Response): AnimesPage {
         val document = response.asJsoup()
-        val data = document.selectFirst("script#__NEXT_DATA__")?.data()
+        val data = document.pageData()
             ?: return AnimesPage(emptyList(), false)
 
         return json.decodeFromString<RouVideoDto.VideoList>(data)
@@ -127,7 +126,7 @@ class RouVideo(
 
     override fun relatedAnimeListParse(response: Response): List<SAnime> {
         val document = response.asJsoup()
-        val data = document.selectFirst("script#__NEXT_DATA__")?.data()
+        val data = document.pageData()
             ?: return emptyList()
 
         return json.decodeFromString<RouVideoDto.VideoDetails>(data)
@@ -239,7 +238,7 @@ class RouVideo(
         }
     }
 
-    private fun Document.parseFeaturedPage(sortFilter: RouVideoFilter.SortFilter?): AnimesPage = this.selectFirst("script#__NEXT_DATA__")?.data()
+    private fun Document.parseFeaturedPage(sortFilter: RouVideoFilter.SortFilter?): AnimesPage = this.pageData()
         ?.let {
             json.decodeFromString<RouVideoDto.HotVideoList>(it)
                 .props.pageProps.toAnimePage(sortFilter?.toUriPart())
@@ -355,7 +354,7 @@ class RouVideo(
     /**
      * Get the genres from the document.
      */
-    private fun tagsListParse(document: Document): Tags = document.selectFirst("script#__NEXT_DATA__")?.data()
+    private fun tagsListParse(document: Document): Tags = document.pageData()
         ?.let {
             json.decodeFromString<RouVideoDto.TagList>(it)
                 .props.pageProps.toTagList()
@@ -396,7 +395,7 @@ class RouVideo(
         }.onFailure { it.printStackTrace() }
     }
 
-    private fun hotSearchParse(document: Document): Set<String> = document.selectFirst("script#__NEXT_DATA__")?.data()
+    private fun hotSearchParse(document: Document): Set<String> = document.pageData()
         ?.let {
             val hotSearches = json.decodeFromString<RouVideoDto.VideoList>(it)
                 .props.pageProps.hotSearches
@@ -425,7 +424,7 @@ class RouVideo(
 
     private fun parseAnimeDetails(response: Response, resolution: String? = null): SAnime {
         val document = response.asJsoup()
-        val data = document.selectFirst("script#__NEXT_DATA__")?.data() ?: return SAnime.create()
+        val data = document.pageData() ?: return SAnime.create()
         val video = json.decodeFromString<RouVideoDto.VideoDetails>(data).props.pageProps.video
 
         savedTags = savedTags.plus(video.getTagList())
@@ -446,7 +445,7 @@ class RouVideo(
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
-        val data = document.selectFirst("script#__NEXT_DATA__")?.data() ?: return emptyList()
+        val data = document.pageData() ?: return emptyList()
         val video = json.decodeFromString<RouVideoDto.VideoDetails>(data).props.pageProps.video
 
         return listOf(video.toEpisode())
@@ -456,16 +455,26 @@ class RouVideo(
 
     // ============================ Video Links =============================
 
-    override fun videoListRequest(episode: SEpisode) = GET("$apiUrl/$VIDEO_SLUG/${episode.url}", apiHeaders)
+    // /api/v/{id} no longer returns the stream; the page carries it encrypted in the loader data.
+    override fun videoListRequest(episode: SEpisode) = GET("$videoUrl/$VIDEO_SLUG/${episode.url}", docHeaders)
 
     override fun videoListParse(response: Response): List<Video> {
-        val jsonStr = response.body.string()
-        val data = json.decodeFromString<RouVideoDto.VideoData>(jsonStr).video
+        val loaderData = response.asJsoup().loaderData()
+            ?: throw Exception("Video data not found")
+        val path = loaderData.decodeVideoUrl() ?: throw Exception("Video URL not found")
+        val playlistUrl = response.request.url.resolve(path)?.toString() ?: path
+        val resolution = loaderData["video"]?.jsonObject?.get("sources")?.jsonArray
+            ?.mapNotNull { it.jsonObject["resolution"]?.jsonPrimitive?.intOrNull }
+            ?.maxOrNull()
 
-        return playlistUtils.extractFromHls(
-            playlistUrl = data.videoUrl,
-            referer = "$videoUrl/",
-        )
+        // The playlist and every segment are PNG images with the real HLS data in a
+        // private chunk, so they have to be unwrapped by the local m3u8 proxy.
+        if (!m3u8ServerManager.isRunning()) m3u8ServerManager.startServer()
+        val localUrl = m3u8ServerManager.processM3u8Url(playlistUrl, "$videoUrl/", headers["User-Agent"])
+            ?: throw Exception("Local HLS proxy unavailable")
+
+        val quality = resolution?.let { "${it}p" } ?: "HLS"
+        return listOf(Video(localUrl, quality, localUrl))
     }
 
     // Sorts by quality

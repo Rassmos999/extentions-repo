@@ -162,7 +162,7 @@ class HahoMoe :
             ?.let { ": $it" }
             .orEmpty()
         name = episodeNumberString + title
-        date_upload = element.selectFirst("div.date")?.text().orEmpty().toDate()
+        date_upload = element.selectFirst("span.episode-date, div.date")?.text().orEmpty().toDate()
     }
 
     // ============================ Video Links =============================

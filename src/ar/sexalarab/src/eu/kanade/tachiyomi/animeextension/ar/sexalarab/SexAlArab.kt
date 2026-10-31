@@ -43,6 +43,7 @@ class SexAlArab :
     private val preferences by getPreferencesLazy()
 
     override fun headersBuilder() = super.headersBuilder()
+        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
         .set("Referer", "$baseUrl/")
 
     // ============================== Popular ===============================
@@ -138,19 +139,16 @@ class SexAlArab :
             }
 
             category.isNotBlank() -> {
-                if (page <= 1) {
-                    GET("$baseUrl/$category/", headers)
-                } else {
-                    // KVS category pages page via async block (path /2/ 404s on this host)
-                    val url = "$baseUrl/$category/".toHttpUrl().newBuilder()
-                        .addQueryParameter("mode", "async")
-                        .addQueryParameter("function", "get_block")
-                        .addQueryParameter("block_id", "list_videos_common_videos_list")
-                        .addQueryParameter("sort_by", "post_date")
-                        .addQueryParameter("from", page.toString())
-                        .build()
-                    GET(url, headers)
-                }
+                // KVS category pages page via async block (path /2/ 404s on this host).
+                // Page 1 uses the same request so ordering stays consistent across pages.
+                val url = "$baseUrl/$category/".toHttpUrl().newBuilder()
+                    .addQueryParameter("mode", "async")
+                    .addQueryParameter("function", "get_block")
+                    .addQueryParameter("block_id", "list_videos_common_videos_list")
+                    .addQueryParameter("sort_by", "post_date")
+                    .addQueryParameter("from", page.toString())
+                    .build()
+                GET(url, headers)
             }
 
             sort.isNotBlank() -> GET(pagedPath(sort, page), headers)
@@ -254,6 +252,7 @@ class SexAlArab :
         val pageUrl = "$baseUrl/"
         val license = LICENSE_CODE.find(html)?.groupValues?.get(1)
         val videoHeaders = headersBuilder()
+            .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
             .set("Referer", pageUrl)
             .build()
 
