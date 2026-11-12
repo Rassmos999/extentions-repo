@@ -24,7 +24,7 @@ abstract class Source :
 
     open val json: Json by injectLazy()
 
-    val preferences: SharedPreferences by getPreferencesLazy { migration }
+    val preferences: SharedPreferences by getPreferencesLazy { migration() }
 
     protected val handler by lazy { Handler(Looper.getMainLooper()) }
 

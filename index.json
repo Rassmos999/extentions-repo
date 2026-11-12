@@ -246,10 +246,10 @@
   {
     "name": "Aniyomi: Jellyfin",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.jellyfin",
-    "apk": "aniyomi-all.jellyfin-v14.30.apk",
+    "apk": "aniyomi-all.jellyfin-v14.31.apk",
     "lang": "all",
-    "code": 30,
-    "version": "14.30",
+    "code": 31,
+    "version": "14.31",
     "nsfw": 0,
     "sources": [
       {
@@ -314,10 +314,10 @@
   {
     "name": "Aniyomi: Newgrounds",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.newgrounds",
-    "apk": "aniyomi-all.newgrounds-v14.1.apk",
+    "apk": "aniyomi-all.newgrounds-v14.2.apk",
     "lang": "all",
-    "code": 1,
-    "version": "14.1",
+    "code": 2,
+    "version": "14.2",
     "nsfw": 1,
     "sources": [
       {
@@ -468,10 +468,10 @@
   {
     "name": "Aniyomi: Stremio",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.stremio",
-    "apk": "aniyomi-all.stremio-v14.9.apk",
+    "apk": "aniyomi-all.stremio-v14.10.apk",
     "lang": "all",
-    "code": 9,
-    "version": "14.9",
+    "code": 10,
+    "version": "14.10",
     "nsfw": 0,
     "sources": [
       {

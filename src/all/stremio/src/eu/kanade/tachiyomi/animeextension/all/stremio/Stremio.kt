@@ -763,7 +763,10 @@ class Stremio : Source() {
             }
         }
 
-        fun logIn() {
+        fun logIn(
+            email: String = preferences.email,
+            password: String = preferences.password,
+        ) {
             logOutPref.setEnabled(false)
             logOutPref.summary = "Loading..."
             preferences.clearCredentials()
@@ -772,9 +775,9 @@ class Stremio : Source() {
             loginJob = scope.launch {
                 try {
                     val body = buildJsonObject {
-                        put("email", preferences.email)
+                        put("email", email)
                         put("facebook", false)
-                        put("password", preferences.password)
+                        put("password", password)
                         put("type", "Login")
                     }.toJsonRequestBody()
 
@@ -808,8 +811,8 @@ class Stremio : Source() {
             dialogMessage = "Email address",
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
         ) {
-            if (preferences.password.isNotBlank()) {
-                logIn()
+            if (it.isNotBlank() && preferences.password.isNotBlank()) {
+                logIn(email = it)
             }
         }
 
@@ -824,8 +827,8 @@ class Stremio : Source() {
             getSummary = passwordSummary,
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD,
         ) {
-            if (preferences.email.isNotBlank()) {
-                logIn()
+            if (it.isNotBlank() && preferences.email.isNotBlank()) {
+                logIn(password = it)
             }
         }
 

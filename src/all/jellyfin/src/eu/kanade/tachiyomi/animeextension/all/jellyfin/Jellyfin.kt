@@ -222,6 +222,8 @@ class Jellyfin(private val suffix: String) :
 
     // =========================== Anime Details ============================
 
+    override fun getAnimeUrl(anime: SAnime): String = getWebUrl(anime.url)
+
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
         if (!anime.url.startsWith("http")) throw Exception("Migrate from jellyfin to jellyfin")
 
@@ -272,17 +274,17 @@ class Jellyfin(private val suffix: String) :
 
     private fun getEpisodeListUrl(anime: SAnime): HttpUrl {
         val httpUrl = anime.url.toHttpUrl()
-        val itemId = httpUrl.pathSegments[3]
+        val itemId = httpUrl.pathSegments.last()
         val fragment = httpUrl.fragment!!
 
         return when {
             fragment.startsWith("seriesId") -> {
-                httpUrl.newBuilder().apply {
-                    encodedPath("/")
+                val seriesId = fragment.substringAfter(",").takeUnless { it.isBlank() || it == "null" }
+                baseUrl.toHttpUrl().newBuilder().apply {
                     addPathSegment("Shows")
-                    addPathSegment(fragment.split(",").last())
+                    addPathSegment(seriesId ?: itemId)
                     addPathSegment("Episodes")
-                    addQueryParameter("seasonId", httpUrl.pathSegments.last())
+                    addQueryParameter("seasonId", itemId)
                     addQueryParameter("userId", preferences.userId)
                     addQueryParameter("Fields", "Overview,MediaSources,DateCreated,OriginalTitle,SortName")
                 }.build()
@@ -290,7 +292,7 @@ class Jellyfin(private val suffix: String) :
 
             fragment.startsWith("boxSet") -> {
                 httpUrl.newBuilder().apply {
-                    removePathSegment(3)
+                    removePathSegment(httpUrl.pathSize - 1)
                     addQueryParameter("Recursive", "true")
                     addQueryParameter("SortBy", "SortName")
                     addQueryParameter("SortOrder", "Ascending")
@@ -301,22 +303,24 @@ class Jellyfin(private val suffix: String) :
             }
 
             fragment.startsWith("series") -> {
-                httpUrl.newBuilder().apply {
-                    encodedPath("/")
+                baseUrl.toHttpUrl().newBuilder().apply {
                     addPathSegment("Shows")
                     addPathSegment(itemId)
                     addPathSegment("Episodes")
-                    addQueryParameter("Fields", "DateCreated,OriginalTitle,SortName")
+                    addQueryParameter("userId", preferences.userId)
+                    addQueryParameter("Fields", "Overview,MediaSources,DateCreated,OriginalTitle,SortName")
                 }.build()
             }
 
             else -> {
                 httpUrl.newBuilder().apply {
-                    addQueryParameter("Fields", "DateCreated,OriginalTitle,SortName")
+                    addQueryParameter("Fields", "Overview,MediaSources,DateCreated,OriginalTitle,SortName")
                 }.build()
             }
         }
     }
+
+    override fun getEpisodeUrl(episode: SEpisode): String = getWebUrl(episode.url)
 
     private fun episodeListParse(response: Response, prefix: String): List<SEpisode> {
         val itemList = if (response.request.url.pathSize > 3) {
@@ -425,6 +429,7 @@ class Jellyfin(private val suffix: String) :
             addPathSegment(itemId)
             addPathSegment("stream")
             addQueryParameter("static", "True")
+            mediaSource.id?.let { addQueryParameter("MediaSourceId", it) }
             addQueryParameter("PlaySessionId", sessionData.playSessionId)
         }.build().toString()
 
@@ -542,6 +547,12 @@ class Jellyfin(private val suffix: String) :
     }
 
     // ============================= Utilities ==============================
+
+    // Anime and episode urls point to the API, so open the item's page in the web client instead
+    private fun getWebUrl(apiUrl: String): String {
+        val itemId = apiUrl.toHttpUrl().pathSegments.last()
+        return "$baseUrl/web/#/details?id=$itemId"
+    }
 
     private fun getItemsUrl(startIndex: Int): HttpUrl = baseUrl.toHttpUrl().newBuilder().apply {
         addPathSegment("Users")
@@ -746,7 +757,10 @@ class Jellyfin(private val suffix: String) :
             }
         }
 
-        fun logIn() {
+        fun logIn(
+            username: String = preferences.username,
+            password: String = preferences.password,
+        ) {
             mediaLibraryPref.setEnabled(false)
             mediaLibraryPref.summary = "Loading..."
             clearCredentials()
@@ -754,7 +768,7 @@ class Jellyfin(private val suffix: String) :
             loginJob?.cancel()
             loginJob = scope.launch {
                 try {
-                    val loginDto = authenticate(preferences.username, preferences.password)
+                    val loginDto = authenticate(username, password)
 
                     preferences.userId = loginDto.sessionInfo.userId
                     preferences.apiKey = loginDto.accessToken
@@ -831,7 +845,7 @@ class Jellyfin(private val suffix: String) :
             if (it.isBlank()) {
                 onCompleteLogin(false)
             } else {
-                if (preferences.username.isNotBlank() && preferences.password.isNotBlank()) {
+                if (preferences.username.isNotBlank()) {
                     logIn()
                 }
             }
@@ -848,8 +862,8 @@ class Jellyfin(private val suffix: String) :
             if (it.isBlank()) {
                 onCompleteLogin(false)
             } else {
-                if (baseUrl.isNotBlank() && preferences.password.isNotBlank()) {
-                    logIn()
+                if (baseUrl.isNotBlank()) {
+                    logIn(username = it)
                 }
             }
         }
@@ -865,12 +879,9 @@ class Jellyfin(private val suffix: String) :
             getSummary = passwordSummary,
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD,
         ) {
-            if (it.isBlank()) {
-                onCompleteLogin(false)
-            } else {
-                if (baseUrl.isNotBlank() && preferences.username.isNotBlank()) {
-                    logIn()
-                }
+            // Jellyfin accounts can have an empty password
+            if (baseUrl.isNotBlank() && preferences.username.isNotBlank()) {
+                logIn(password = it)
             }
         }
 

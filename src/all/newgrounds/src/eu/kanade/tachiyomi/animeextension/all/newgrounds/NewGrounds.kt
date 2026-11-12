@@ -29,6 +29,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import tryParse
 import uy.kohesive.injekt.api.get
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -48,6 +49,17 @@ class NewGrounds :
     private val preferences by getPreferencesLazy()
 
     private val handler by lazy { Handler(Looper.getMainLooper()) }
+
+    override val client = network.client.newBuilder()
+        .addInterceptor { chain ->
+            val response = chain.proceed(chain.request())
+            if (response.code == 403 && response.peekBody(4096).string().contains("NG Guard")) {
+                response.close()
+                throw IOException("Newgrounds browser check (NG Guard) triggered. Open in WebView and log in.")
+            }
+            response
+        }
+        .build()
 
     private val videoListHeaders by lazy {
         headers.newBuilder()
