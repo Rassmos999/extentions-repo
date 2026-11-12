@@ -155,10 +155,10 @@
   {
     "name": "Aniyomi: Hentai Torrent (Torrent)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.hentaitorrent",
-    "apk": "aniyomi-all.hentaitorrent-v14.16.apk",
+    "apk": "aniyomi-all.hentaitorrent-v14.17.apk",
     "lang": "all",
-    "code": 16,
-    "version": "14.16",
+    "code": 17,
+    "version": "14.17",
     "nsfw": 1,
     "sources": [
       {
@@ -331,10 +331,10 @@
   {
     "name": "Aniyomi: Nyaa (Torrent)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.nyaatorrent",
-    "apk": "aniyomi-all.nyaatorrent-v14.4.apk",
+    "apk": "aniyomi-all.nyaatorrent-v14.7.apk",
     "lang": "all",
-    "code": 4,
-    "version": "14.4",
+    "code": 7,
+    "version": "14.7",
     "nsfw": 1,
     "sources": [
       {
@@ -365,10 +365,10 @@
   {
     "name": "Aniyomi: PTorrent (Torrent)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.ptorrent",
-    "apk": "aniyomi-all.ptorrent-v14.17.apk",
+    "apk": "aniyomi-all.ptorrent-v14.18.apk",
     "lang": "all",
-    "code": 17,
-    "version": "14.17",
+    "code": 18,
+    "version": "14.18",
     "nsfw": 1,
     "sources": [
       {
@@ -536,10 +536,10 @@
   {
     "name": "Aniyomi: Torrentio (Torrent / Debrid)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.torrentio",
-    "apk": "aniyomi-all.torrentio-v14.8.apk",
+    "apk": "aniyomi-all.torrentio-v14.9.apk",
     "lang": "all",
-    "code": 8,
-    "version": "14.8",
+    "code": 9,
+    "version": "14.9",
     "nsfw": 0,
     "sources": [
       {
