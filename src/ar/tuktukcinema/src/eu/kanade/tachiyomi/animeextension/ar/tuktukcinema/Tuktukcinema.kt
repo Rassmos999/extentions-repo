@@ -7,6 +7,7 @@ import androidx.preference.PreferenceScreen
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.megamaxmultiserver.MegaMaxMultiServer
 import aniyomi.lib.mixdropextractor.MixDropExtractor
+import aniyomi.lib.mp4uploadextractor.Mp4uploadExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
 import aniyomi.lib.vidbomextractor.VidBomExtractor
 import aniyomi.lib.vidlandextractor.VidLandExtractor
@@ -44,7 +45,7 @@ class Tuktukcinema :
     private val preferences by getPreferencesLazy()
 
     override val baseUrl
-        get() = preferences.customDomain.ifBlank { "https://tuktukhd.com" }
+        get() = preferences.customDomain.ifBlank { "https://tuktukcinemas.com" }
 
     override val lang = "ar"
 
@@ -102,7 +103,8 @@ class Tuktukcinema :
                     SEpisode.create().apply {
                         setUrlWithoutDomain(episode.attr("abs:href"))
                         name = "$seasonText : الحلقة $episodeNum"
-                        episode_number = ("$seasonNum.$episodeNum").toFloat()
+                        // Pad so E10 sorts after E9 (x.010 > x.009) rather than before E2.
+                        episode_number = "$seasonNum.${episodeNum.padStart(3, '0')}".toFloatOrNull() ?: 0F
                     }
                 }
             }
@@ -126,6 +128,7 @@ class Tuktukcinema :
     private val doodExtractor by lazy { DoodExtractor(client) }
     private val megaMax by lazy { MegaMaxMultiServer(client, headers) }
     private val mixDropExtractor by lazy { MixDropExtractor(client) }
+    private val mp4uploadExtractor by lazy { Mp4uploadExtractor(client) }
     private val streamWishExtractor by lazy { StreamWishExtractor(client, headers) }
     private val vidBomExtractor by lazy { VidBomExtractor(client) }
     private val vidLandExtractor by lazy { VidLandExtractor(client) }
@@ -143,6 +146,10 @@ class Tuktukcinema :
 
         "mixdrop" in server -> {
             mixDropExtractor.videosFromUrl(url, "Ar", customQuality?.let { "$it " } ?: "")
+        }
+
+        "mp4upload" in server || "mp4upload" in url -> {
+            mp4uploadExtractor.videosFromUrl(url, headers, suffix = customQuality?.let { " $it" }.orEmpty())
         }
 
         "dood" in server -> {

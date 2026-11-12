@@ -60,6 +60,7 @@ class KwikExtractor(
                         subtitleList = subtitleList,
                     )
                 }
+
                 else -> listOf(
                     Video(videoUrl, "${qualityLabel}Kwik", videoUrl, videoHeaders, subtitleTracks = subtitleList),
                 )

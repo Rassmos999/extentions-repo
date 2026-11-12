@@ -262,41 +262,75 @@ class OmniEmbedExtractor(
             when (embedType) {
                 // Original extractors
                 EmbedType.OKRU -> extractFromOkru(embedUrl, qualityLabel)
+
                 EmbedType.VK -> extractFromVk(embedUrl, qualityLabel)
+
                 EmbedType.DOOD -> extractFromDood(embedUrl, qualityLabel)
+
                 EmbedType.STREAMTAPE -> extractFromStreamtape(embedUrl, qualityLabel)
+
                 EmbedType.MP4UPLOAD -> extractFromMp4upload(embedUrl, qualityLabel)
+
                 EmbedType.STREAMWISH -> extractFromStreamwish(embedUrl, qualityLabel)
+
                 EmbedType.FILEMOON -> extractFromFilemoon(embedUrl, qualityLabel)
+
                 EmbedType.KWIK -> extractFromKwik(embedUrl, qualityLabel, subtitles)
+
                 // Tier 1: Simple extractors
                 EmbedType.VOE -> extractFromVoe(embedUrl, qualityLabel)
+
                 EmbedType.STREAMLARE -> extractFromStreamlare(embedUrl, qualityLabel)
+
                 EmbedType.STREAMHUB -> extractFromStreamhub(embedUrl, qualityLabel)
+
                 EmbedType.VIDGUARD -> extractFromVidguard(embedUrl, qualityLabel)
+
                 EmbedType.SENDVID -> extractFromSendvid(embedUrl, qualityLabel)
+
                 EmbedType.STREAMDAV -> extractFromStreamdav(embedUrl, qualityLabel)
+
                 EmbedType.STREAMSILK -> extractFromStreamsilk(embedUrl, qualityLabel)
+
                 EmbedType.VIDO -> extractFromVido(embedUrl, qualityLabel)
+
                 EmbedType.VUDEO -> extractFromVudeo(embedUrl, qualityLabel)
+
                 EmbedType.UPSTREAM -> extractFromUpstream(embedUrl, qualityLabel)
+
                 EmbedType.SIBNET -> extractFromSibnet(embedUrl, qualityLabel)
+
                 EmbedType.RUMBLE -> extractFromRumble(embedUrl, qualityLabel)
+
                 EmbedType.AMAZON -> extractFromAmazon(embedUrl, qualityLabel)
+
                 EmbedType.FUSEVIDEO -> extractFromFusevideo(embedUrl, qualityLabel)
+
                 EmbedType.LULU -> extractFromLulu(embedUrl, qualityLabel)
+
                 EmbedType.BUZZHEAVIER -> extractFromBuzzheavier(embedUrl, qualityLabel)
+
                 EmbedType.FASTREAM -> extractFromFastream(embedUrl, qualityLabel)
+
                 EmbedType.VIDBOM -> extractFromVidbom(embedUrl)
+
                 EmbedType.PIXELDRAIN -> extractFromPixeldrain(embedUrl, qualityLabel)
+
                 EmbedType.MIXDROP -> extractFromMixdrop(embedUrl, qualityLabel)
+
                 // Tier 2: Suspend extractors
                 EmbedType.VIDMOLY -> extractFromVidmoly(embedUrl, qualityLabel)
+
                 EmbedType.VIDHIDE -> extractFromVidhide(embedUrl, qualityLabel)
+
                 EmbedType.STREAMPLAY -> extractFromStreamplay(embedUrl, qualityLabel)
+
                 EmbedType.STREAMUP -> extractFromStreamup(embedUrl, qualityLabel)
+
                 EmbedType.UQLOAD -> extractFromUqload(embedUrl, qualityLabel)
+
                 EmbedType.BLOGGER -> extractFromBlogger(embedUrl, qualityLabel, subtitles)
+
                 EmbedType.UNKNOWN -> {
                     Log.w(TAG, "Unknown embed domain: ${embedUrl.take(100)}")
                     emptyList()

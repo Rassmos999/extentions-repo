@@ -4,9 +4,13 @@ import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.doodextractor.DoodExtractor
+import aniyomi.lib.megamaxmultiserver.MegaMaxMultiServer
+import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.mp4uploadextractor.Mp4uploadExtractor
 import aniyomi.lib.okruextractor.OkruExtractor
+import aniyomi.lib.streamwishextractor.StreamWishExtractor
 import aniyomi.lib.vidbomextractor.VidBomExtractor
+import aniyomi.lib.vidlandextractor.VidLandExtractor
 import aniyomi.lib.voeextractor.VoeExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -97,7 +101,8 @@ class Okanime :
         return AnimesPage(listOf(details), false)
     }
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList) = "$baseUrl/search/?s=$query"
+    // The redesigned search form submits ?q=; ?s= now returns an empty page.
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList) = "$baseUrl/search?q=$query"
         .let { if (page > 1) "$it&page=$page" else it }
         .let(::GET)
 
@@ -236,8 +241,19 @@ class Okanime :
     private val okruExtractor by lazy { OkruExtractor(client) }
     private val voeExtractor by lazy { VoeExtractor(client, headers) }
     private val vidBomExtractor by lazy { VidBomExtractor(client) }
+    private val megaMax by lazy { MegaMaxMultiServer(client, headers) }
+    private val streamWishExtractor by lazy { StreamWishExtractor(client, headers) }
+    private val mixDropExtractor by lazy { MixDropExtractor(client) }
+    private val vidLandExtractor by lazy { VidLandExtractor(client) }
 
     private suspend fun extractVideosFromUrl(url: String, quality: String, selection: Set<String>): List<Video> = when {
+        // "megamax" servers point at share4max, which lists mirrors on several hosts per quality.
+        "share4max" in url || "megamax" in url -> {
+            megaMax.extractUrls(url).parallelCatchingFlatMapBlocking {
+                extractMegaMaxMirror(it.url, it.name, it.quality, selection)
+            }
+        }
+
         ("https://doo" in url || "dsvplay" in url || "ds2play" in url) && selection.contains("Dood") -> {
             doodExtractor.videoFromUrl(url, "DoodStream - $quality")
                 ?.let(::listOf)
@@ -261,6 +277,13 @@ class Okanime :
 
         else -> null
     }.orEmpty()
+
+    private suspend fun extractMegaMaxMirror(url: String, driver: String, quality: String, selection: Set<String>): List<Video> = when (driver.lowercase()) {
+        "streamhg", "streamwish", "lulustream" -> streamWishExtractor.videosFromUrl(url, "MegaMax ${driver.replaceFirstChar(Char::titlecase)} $quality")
+        "mixdrop" -> mixDropExtractor.videosFromUrl(url, prefix = "MegaMax $quality ")
+        "earnvids" -> vidLandExtractor.videosFromUrl(url)
+        else -> extractVideosFromUrl(url, quality, selection)
+    }
 
     override fun videoListSelector(): String = throw UnsupportedOperationException()
 

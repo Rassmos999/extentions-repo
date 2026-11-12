@@ -2,10 +2,12 @@ package eu.kanade.tachiyomi.animeextension.ar.animerco
 
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.burstcloudextractor.BurstCloudExtractor
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.gdriveplayerextractor.GdrivePlayerExtractor
 import aniyomi.lib.mp4uploadextractor.Mp4uploadExtractor
 import aniyomi.lib.okruextractor.OkruExtractor
+import aniyomi.lib.sibnetextractor.SibnetExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
 import aniyomi.lib.uqloadextractor.UqloadExtractor
@@ -41,7 +43,7 @@ class Animerco :
 
     override val name = "Animerco"
 
-    override val baseUrl = "https://eta.animerco.org"
+    override val baseUrl = "https://eva.animerco.org"
 
     override val lang = "ar"
 
@@ -183,7 +185,8 @@ class Animerco :
         setUrlWithoutDomain(element.attr("href"))
         val epText = element.selectFirst("h3")?.ownText() ?: "Episode"
         name = "$epText - $seasonName"
-        val epNum = epText.filter(Char::isDigit)
+        // Titles often contain other digits ("الحلقة 12: ... 2"), so only take the episode number.
+        val epNum = EPISODE_NUMBER_REGEX.find(epText)?.groupValues?.get(1) ?: epText.filter(Char::isDigit)
         // good luck trying to track this xD
         episode_number = "$seasonNum.${epNum.padStart(3, '0')}".toFloatOrNull() ?: 1F
     }
@@ -209,6 +212,8 @@ class Animerco :
     private val okruExtractor by lazy { OkruExtractor(client) }
     private val streamWishExtractor by lazy { StreamWishExtractor(client, headers) }
     private val yourUploadExtractor by lazy { YourUploadExtractor(client) }
+    private val sibnetExtractor by lazy { SibnetExtractor(client) }
+    private val burstCloudExtractor by lazy { BurstCloudExtractor(client) }
 
     private suspend fun getPlayerVideos(player: Element): List<Video> {
         val url = getPlayerUrl(player) ?: return emptyList()
@@ -235,6 +240,10 @@ class Animerco :
 
             "uqload" in url -> uqloadExtractor.videosFromUrl(url)
 
+            "sibnet" in url -> sibnetExtractor.videosFromUrl(url)
+
+            "burstcloud" in url -> burstCloudExtractor.videoFromUrl(url, headers)
+
             VIDBOM_DOMAINS.any(url::contains) -> vidBomExtractor.videosFromUrl(url)
 
             else -> null
@@ -250,13 +259,21 @@ class Animerco :
             .add("type", player.attr("data-type"))
             .build()
 
-        return client.newCall(POST("$baseUrl/wp-admin/admin-ajax.php", headers, body))
+        val embedUrl = client.newCall(POST("$baseUrl/wp-admin/admin-ajax.php", headers, body))
             .awaitSuccess()
             .bodyString()
             .substringAfter("\"embed_url\":\"")
             .substringBefore("\",")
             .replace("\\", "")
             .takeIf(String::isNotBlank)
+            ?: return null
+
+        // The site now wraps every host in its own signed /player/?pnonce=... page.
+        if (!embedUrl.contains("/player/?")) return embedUrl
+        val playerHeaders = headers.newBuilder().set("Referer", "$baseUrl/").build()
+        return client.newCall(GET(embedUrl, playerHeaders)).awaitSuccess().useAsJsoup()
+            .selectFirst("iframe[src]")?.attr("abs:src")
+            ?.takeIf(String::isNotBlank)
     }
 
     override fun videoFromElement(element: Element) = throw UnsupportedOperationException()
@@ -361,6 +378,8 @@ class Animerco :
 
     // ============================= Utilities ==============================
     companion object {
+        private val EPISODE_NUMBER_REGEX = Regex("""الحلقة\s*(\d+)""")
+
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_TITLE = "Preferred quality"
         private const val PREF_QUALITY_DEFAULT = "1080"

@@ -317,6 +317,7 @@ class MiruroExtractor(
                         Video(proxiedUrl, qualityLabel, proxiedUrl, proxyHeaders, subtitleTracks = subtitles),
                     )
                 }
+
                 "embed" -> {
                     Log.d(TAG, "parseStreams: extracting embed: ${stream.url.take(80)}")
                     val embedVideos = extractPreRoutedEmbed(
@@ -330,6 +331,7 @@ class MiruroExtractor(
                         Log.w(TAG, "Failed to extract from embed: ${stream.url.take(80)}")
                     }
                 }
+
                 else -> {
                     Log.w(TAG, "Unknown stream type '${stream.type}', skipping: ${stream.url.take(80)}")
                 }

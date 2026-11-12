@@ -29,6 +29,7 @@ class StreamlareExtractor(private val client: OkHttpClient) {
                     when {
                         !urlPart.startsWith("http") ->
                             masterPlaylistUrl.substringBefore("master.m3u8") + urlPart
+
                         else -> urlPart
                     }
                 }

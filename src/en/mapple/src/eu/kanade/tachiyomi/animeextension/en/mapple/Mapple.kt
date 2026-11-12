@@ -667,9 +667,9 @@ class Mapple :
         private const val TMDB_API_KEY = BuildConfig.TMDB_API
 
         private const val PREF_DOMAIN_KEY = "pref_domain"
-        private const val PREF_DOMAIN_DEFAULT = "https://mapple.rip"
-        private val DOMAIN_ENTRIES = arrayOf("mapple.rip", "mapple.club")
-        private val DOMAIN_VALUES = arrayOf("https://mapple.rip", "https://mapple.club")
+        private const val PREF_DOMAIN_DEFAULT = "https://mapple.fun"
+        private val DOMAIN_ENTRIES = arrayOf("mapple.fun", "mapple.rip", "mapple.club")
+        private val DOMAIN_VALUES = arrayOf("https://mapple.fun", "https://mapple.rip", "https://mapple.club")
 
         private const val PREF_LATEST_KEY = "pref_latest"
         private const val PREF_LATEST_DEFAULT = "movie"

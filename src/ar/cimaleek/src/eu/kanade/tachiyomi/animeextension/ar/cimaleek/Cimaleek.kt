@@ -64,29 +64,32 @@ class Cimaleek :
     override fun episodeListParse(response: Response): List<SEpisode> {
         val episodes = mutableListOf<SEpisode>()
         val document = response.asJsoup()
-        val url = response.request.url.toString()
+        val url = response.request.url.toString().trimEnd('/')
         if (url.contains("movies")) {
             val episode = SEpisode.create().apply {
                 name = "مشاهدة"
+                episode_number = 1F
                 setUrlWithoutDomain("$url/watch/")
             }
             episodes.add(episode)
         } else {
-            document.select(seasonListSelector()).parallelCatchingFlatMapBlocking { sElement ->
-                val seasonNum = sElement.select("span.se-a").text()
+            // Collect from the parallel map instead of mutating a shared list across threads.
+            episodes += document.select(seasonListSelector()).parallelCatchingFlatMapBlocking { sElement ->
+                val seasonNum = sElement.select("span.se-a").text().filter(Char::isDigit).ifEmpty { "1" }
                 val seasonUrl = sElement.attr("href")
                 val seasonPage = client.newCall(GET(seasonUrl, headers)).execute().asJsoup()
                 seasonPage.select(episodeListSelector()).map { eElement ->
                     val episodeNum = eElement.select("span.serie").text().substringAfter("(").substringBefore(")")
-                    val episodeUrl = eElement.attr("href")
-                    val finalNum = ("$seasonNum.$episodeNum").toFloat()
+                        .filter(Char::isDigit).ifEmpty { "0" }
+                    val episodeUrl = eElement.attr("href").trimEnd('/')
+                    // Pad so S1E10 (1.010) sorts after S1E9 (1.009) instead of before S1E2 (1.2).
+                    val finalNum = "$seasonNum.${episodeNum.padStart(3, '0')}".toFloatOrNull() ?: 0F
                     val episodeTitle = "الموسم ${seasonNum.toInt()} الحلقة ${episodeNum.toInt()}"
-                    val episode = SEpisode.create().apply {
+                    SEpisode.create().apply {
                         name = episodeTitle
                         episode_number = finalNum
                         setUrlWithoutDomain("$episodeUrl/watch/")
                     }
-                    episodes.add(episode)
                 }
             }
         }
@@ -216,17 +219,17 @@ class Cimaleek :
             "اقسام الموقع",
             arrayOf(
                 Pair("اختر", "none"),
-                Pair("افلام اجنبي", "aflam-online"),
-                Pair("افلام نتفليكس", "netflix-movies"),
+                Pair("افلام اجنبي", "aflam-online-1"),
+                Pair("افلام نتفليكس", "netflix-movies-1"),
                 Pair("افلام هندي", "indian-movies"),
                 Pair("افلام اسيوي", "asian-aflam"),
                 Pair("افلام كرتون", "cartoon-movies"),
                 Pair("افلام انمي", "anime-movies"),
-                Pair("مسلسلات اجنبي", "english-series"),
+                Pair("مسلسلات اجنبي", "english-series-1"),
                 Pair("مسلسلات نتفليكس", "netflix-series"),
                 Pair("مسلسلات اسيوي", "asian-series"),
-                Pair("مسلسلات كرتون", "anime-series"),
-                Pair("مسلسلات انمي", "netflix-anime"),
+                Pair("مسلسلات انمي", "anime-series"),
+                Pair("انميات نتفليكس", "netflix-anime"),
             ),
         )
     private class CategoryFilter :

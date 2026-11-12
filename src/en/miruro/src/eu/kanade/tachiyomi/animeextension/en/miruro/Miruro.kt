@@ -1564,6 +1564,7 @@ class Miruro :
                                 }
                             }
                         }
+
                         FillerType.MIXED_MANGA -> {
                             if (preferences.fillerMarkMixed && fillerMode != "hide") {
                                 ep.scanlator = buildString {
@@ -1573,6 +1574,7 @@ class Miruro :
                                 }
                             }
                         }
+
                         FillerType.ANIME_CANON -> {
                             if (preferences.fillerMarkMixed && fillerMode != "hide") {
                                 ep.scanlator = buildString {
@@ -1582,6 +1584,7 @@ class Miruro :
                                 }
                             }
                         }
+
                         FillerType.MANGA_CANON -> { /* no mark needed */ }
                     }
                 }
@@ -2151,7 +2154,9 @@ class Miruro :
         is JSONObject -> coverImage.optString("extraLarge", "")
             .ifEmpty { coverImage.optString("large", "") }
             .ifEmpty { coverImage.optString("medium", "") }
+
         is String -> coverImage
+
         else -> ""
     }
 

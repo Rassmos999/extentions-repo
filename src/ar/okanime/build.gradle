@@ -1,7 +1,7 @@
 ext {
     extName = 'Okanime'
     extClass = '.Okanime'
-    extVersionCode = 28
+    extVersionCode = 29
 }
 
 apply plugin: "kei.plugins.extension.legacy"
@@ -12,4 +12,8 @@ dependencies {
     implementation(project(":lib:okruextractor"))
     implementation(project(":lib:vidbomextractor"))
     implementation(project(":lib:mp4uploadextractor"))
+    implementation(project(":lib:megamaxmultiserver"))
+    implementation(project(":lib:streamwishextractor"))
+    implementation(project(":lib:mixdropextractor"))
+    implementation(project(":lib:vidlandextractor"))
 }

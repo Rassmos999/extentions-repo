@@ -43,6 +43,7 @@ class LuluExtractor(private val client: OkHttpClient, headers: Headers) {
                     .takeIf { it.find() }
                     ?.group(1)
             }
+
             else -> {
                 Pattern.compile("sources: \\[\\{file:\"(https?://[^\"]+)\"")
                     .matcher(html)

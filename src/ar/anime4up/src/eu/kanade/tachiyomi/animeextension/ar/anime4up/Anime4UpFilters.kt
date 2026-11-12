@@ -18,7 +18,7 @@ object Anime4UpFilters {
 
     internal class GenreFilter : QueryPartFilter("تصنيف الأنمي", Anime4UpFiltersData.GENRES)
     internal class TypeFilter : QueryPartFilter("نوع الأنمي", Anime4UpFiltersData.TYPES)
-    internal class StatusFilter : QueryPartFilter("حالة الأنمي", Anime4UpFiltersData.STATUS)
+    internal class StatusFilter : QueryPartFilter("قسم الأنمي", Anime4UpFiltersData.STATUS)
 
     val FILTER_LIST get() = AnimeFilterList(
         AnimeFilter.Header("الفلترات مش هتشتغل لو بتبحث او وهي فاضيه"),
@@ -53,6 +53,7 @@ object Anime4UpFilters {
             Pair("إيتشي", "%d8%a5%d9%8a%d8%aa%d8%b4%d9%8a/"),
             Pair("اثارة", "%d8%a7%d8%ab%d8%a7%d8%b1%d8%a9/"),
             Pair("العاب", "%d8%a7%d9%84%d8%b9%d8%a7%d8%a8/"),
+            Pair("ايسيكاي", "%d8%a7%d9%8a%d8%b3%d9%8a%d9%83%d8%a7%d9%8a/"),
             Pair("بوليسي", "%d8%a8%d9%88%d9%84%d9%8a%d8%b3%d9%8a/"),
             Pair("تاريخي", "%d8%aa%d8%a7%d8%b1%d9%8a%d8%ae%d9%8a/"),
             Pair("جنون", "%d8%ac%d9%86%d9%88%d9%86/"),
@@ -66,6 +67,7 @@ object Anime4UpFilters {
             Pair("رومانسي", "%d8%b1%d9%88%d9%85%d8%a7%d9%86%d8%b3%d9%8a/"),
             Pair("رياضي", "%d8%b1%d9%8a%d8%a7%d8%b6%d9%8a/"),
             Pair("ساموراي", "%d8%b3%d8%a7%d9%85%d9%88%d8%b1%d8%a7%d9%8a/"),
+            Pair("سباق", "%d8%b3%d8%a8%d8%a7%d9%82/"),
             Pair("سحر", "%d8%b3%d8%ad%d8%b1/"),
             Pair("سينين", "%d8%b3%d9%8a%d9%86%d9%8a%d9%86/"),
             Pair("شريحة من الحياة", "%d8%b4%d8%b1%d9%8a%d8%ad%d8%a9-%d9%85%d9%86-%d8%a7%d9%84%d8%ad%d9%8a%d8%a7%d8%a9/"),
@@ -74,6 +76,7 @@ object Anime4UpFilters {
             Pair("شونين", "%d8%b4%d9%88%d9%86%d9%8a%d9%86/"),
             Pair("شونين اي", "%d8%b4%d9%88%d9%86%d9%8a%d9%86-%d8%a7%d9%8a/"),
             Pair("شياطين", "%d8%b4%d9%8a%d8%a7%d8%b7%d9%8a%d9%86/"),
+            Pair("طبي", "%d8%b7%d8%a8%d9%8a/"),
             Pair("غموض", "%d8%ba%d9%85%d9%88%d8%b6/"),
             Pair("فضائي", "%d9%81%d8%b6%d8%a7%d8%a6%d9%8a/"),
             Pair("فنتازيا", "%d9%81%d9%86%d8%aa%d8%a7%d8%b2%d9%8a%d8%a7/"),
@@ -98,11 +101,11 @@ object Anime4UpFilters {
             Pair("TV", "tv2"),
         )
 
+        // The site dropped /anime-status/; /anime-category/ (subbed/dubbed) is what remains.
         val STATUS = arrayOf(
             ANY,
-            Pair("لم يعرض بعد", "%d9%84%d9%85-%d9%8a%d8%b9%d8%b1%d8%b6-%d8%a8%d8%b9%d8%af"),
-            Pair("مكتمل", "complete"),
-            Pair("يعرض الان", "%d9%8a%d8%b9%d8%b1%d8%b6-%d8%a7%d9%84%d8%a7%d9%86-1"),
+            Pair("الأنمي المترجم", "%d8%a7%d9%84%d8%a3%d9%86%d9%85%d9%8a-%d8%a7%d9%84%d9%85%d8%aa%d8%b1%d8%ac%d9%85"),
+            Pair("الانمي المدبلج", "%d8%a7%d9%84%d8%a7%d9%86%d9%85%d9%8a-%d8%a7%d9%84%d9%85%d8%af%d8%a8%d9%84%d8%ac"),
         )
     }
 }

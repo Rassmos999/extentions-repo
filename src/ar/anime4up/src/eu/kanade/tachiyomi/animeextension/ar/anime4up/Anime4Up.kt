@@ -10,6 +10,7 @@ import aniyomi.lib.streamwishextractor.StreamWishExtractor
 import aniyomi.lib.uqloadextractor.UqloadExtractor
 import aniyomi.lib.vidbomextractor.VidBomExtractor
 import aniyomi.lib.voeextractor.VoeExtractor
+import eu.kanade.tachiyomi.animeextension.ar.anime4up.extractors.Anime4UpPlayerExtractor
 import eu.kanade.tachiyomi.animeextension.ar.anime4up.extractors.SharedExtractor
 import eu.kanade.tachiyomi.animeextension.ar.anime4up.extractors.VidYardExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -78,10 +79,11 @@ class Anime4Up :
             val url = when {
                 genre.isNotBlank() -> "$baseUrl/anime-genre/${genre.trimEnd('/')}"
                 type.isNotBlank() -> "$baseUrl/anime-type/${type.trimEnd('/')}"
-                status.isNotBlank() -> "$baseUrl/anime-status/${status.trimEnd('/')}"
+                status.isNotBlank() -> "$baseUrl/anime-category/${status.trimEnd('/')}"
                 else -> throw Exception("اختر فلتر")
             }
-            val paginatedUrl = if (page > 1) "$url/page/$page/" else "$url/"
+            // Taxonomy archives paginate with ?page=N; /page/N/ returns 404.
+            val paginatedUrl = if (page > 1) "$url/?page=$page" else "$url/"
             GET(paginatedUrl, headers)
         }
     }
@@ -120,7 +122,9 @@ class Anime4Up :
     }
 
     // ============================== Episodes ==============================
-    override fun episodeListParse(response: Response) = super.episodeListParse(response).reversed()
+    // The site lists episodes newest-first, but not consistently; sort explicitly.
+    override fun episodeListParse(response: Response) = super.episodeListParse(response)
+        .sortedByDescending { it.episode_number }
 
     override fun episodeListSelector() = "div#episodesList div.ep_num a"
 
@@ -137,9 +141,11 @@ class Anime4Up :
 
         // Servers are listed as <li data-watch="..."> items in the servers list.
         return document.select("ul#episode-servers li[data-watch], ul#watch-servers li[data-watch]")
-            .mapNotNull { it.attr("data-watch").takeIf(String::isNotBlank) }
-            .distinct()
-            .parallelCatchingFlatMapBlocking(::extractVideos)
+            .mapNotNull { li ->
+                li.attr("data-watch").takeIf(String::isNotBlank)?.let { it to li.text().trim() }
+            }
+            .distinctBy { it.first }
+            .parallelCatchingFlatMapBlocking { (url, serverName) -> extractVideos(url, serverName) }
     }
 
     private val uqloadExtractor by lazy { UqloadExtractor(client) }
@@ -152,8 +158,11 @@ class Anime4Up :
     private val vidbomExtractor by lazy { VidBomExtractor(client) }
     private val vidyardExtractor by lazy { VidYardExtractor(client, headers) }
     private val voeExtractor by lazy { VoeExtractor(client, headers) }
+    private val anime4upPlayerExtractor by lazy { Anime4UpPlayerExtractor(client, headers) }
 
-    private suspend fun extractVideos(url: String): List<Video> = when {
+    private suspend fun extractVideos(url: String, serverName: String = ""): List<Video> = when {
+        INTERNAL_PLAYER_REGEX.containsMatchIn(url) -> anime4upPlayerExtractor.videosFromUrl(url, serverName.ifBlank { "Anime4up" })
+
         url.contains("drive.google") -> {
             val embedUrlG = "https://gdriveplayer.to/embed2.php?link=$url"
             gdriveplayerExtractor.videosFromUrl(embedUrlG, "GdrivePlayer", headers)
@@ -213,6 +222,7 @@ class Anime4Up :
     }
 
     companion object {
+        private val INTERNAL_PLAYER_REGEX = Regex("/Anime4up-S\\d+/", RegexOption.IGNORE_CASE)
         private val VIDBOM_REGEX = Regex("(?:v[aie]d[bp][aoe]?m|myvii?d|segavid|v[aei]{1,2}dshar[er]?)\\.(?:com|net|org|xyz)(?::\\d+)?/(?:embed[/-])?([A-Za-z0-9]+)")
         private val DOOD_REGEX = Regex("(do*d(?:stream)?\\.(?:com?|watch|to|s[ho]|cx|la|w[sf]|pm|re|yt|stream))/[de]/([0-9a-zA-Z]+)")
         private val STREAMWISH_REGEX = Regex("((?:streamwish|anime7u|animezd|ajmidyad|khadhnayad|yadmalik|hayaatieadhab)\\.(?:com|to|sbs))/(?:e/|v/|f/)?([0-9a-zA-Z]+)")
