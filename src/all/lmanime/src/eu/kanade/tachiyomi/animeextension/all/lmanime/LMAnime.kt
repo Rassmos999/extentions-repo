@@ -4,7 +4,10 @@ import android.content.SharedPreferences
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.dailymotionextractor.DailymotionExtractor
 import aniyomi.lib.mp4uploadextractor.Mp4uploadExtractor
+import aniyomi.lib.okruextractor.OkruExtractor
+import aniyomi.lib.rumbleextractor.RumbleExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
+import aniyomi.lib.vidhideextractor.VidHideExtractor
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.multisrc.animestream.AnimeStream
 import keiyoushi.utils.addListPreference
@@ -38,14 +41,20 @@ class LMAnime :
     }
 
     private val streamwishExtractor by lazy { StreamWishExtractor(client, headers) }
+    private val vidhideExtractor by lazy { VidHideExtractor(client, headers) }
     private val dailyExtractor by lazy { DailymotionExtractor(client, headers) }
     private val mp4uploadExtractor by lazy { Mp4uploadExtractor(client) }
+    private val okruExtractor by lazy { OkruExtractor(client, headers) }
+    private val rumbleExtractor by lazy { RumbleExtractor(client, headers) }
 
     override suspend fun getVideoList(url: String, name: String): List<Video> {
         val prefix = "($name) - "
         return when {
             "dailymotion" in url -> dailyExtractor.videosFromUrl(url, "Dailymotion ($name)")
+            "ok.ru" in url -> okruExtractor.videosFromUrl(url, prefix)
+            "rumble" in url -> rumbleExtractor.videosFromUrl(url, "Rumble ($name)")
             "mp4upload" in url -> mp4uploadExtractor.videosFromUrl(url, headers, prefix)
+            "morencius" in url || "vidhide" in url -> vidhideExtractor.videosFromUrl(url) { "VidHide ($name) - $it" }
             "filelions" in url -> streamwishExtractor.videosFromUrl(url, "StreamWish ($name)")
             else -> emptyList()
         }

@@ -18,29 +18,26 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.firstInstance
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonRequestBody
-import keiyoushi.utils.tryParse
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.addJsonObject
-import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup.parseBodyFragment
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.parser.Parser
-import java.text.SimpleDateFormat
-import java.util.Locale
 
 class AniZone :
     AnimeHttpSource(),
@@ -55,12 +52,18 @@ class AniZone :
     override val supportsLatest = true
 
     override val client = network.client.newBuilder()
-        .rateLimit(3)
+        .rateLimit(2)
         .build()
 
     private val preferences by getPreferencesLazy()
 
     private var token: String = ""
+
+    private var nextCursor: String = ""
+
+    private var currentSlug: String = "/anime"
+
+    private val livewireUpdateUrl = "/livewire/update"
 
     private val snapShots: MutableMap<String, String> = mutableMapOf(
         ANIME_SNAPSHOT_KEY to "",
@@ -72,60 +75,92 @@ class AniZone :
 
     // ============================== Popular ===============================
 
-    override fun popularAnimeRequest(page: Int): Request = if (page == 1) {
-        snapShots[ANIME_SNAPSHOT_KEY] = ""
-        token = ""
-        seenUrls.clear()
-
-        GET("$baseUrl/anime?sort=title-asc", headers)
-    } else {
-        val updates = buildJsonObject { }
-        val calls = buildJsonArray {
-            addJsonObject {
-                put("path", "")
-                put("method", "loadMore")
-                putJsonArray("params") { }
-            }
+    override suspend fun getPopularAnime(page: Int): AnimesPage {
+        val response = if (page == 1) {
+            resetAnimeListState(slug = "/anime")
+            client.newCall(GET("$baseUrl/anime?sort=title-asc", headers)).awaitSuccess()
+        } else {
+            newLivewireCall(ANIME_SNAPSHOT_KEY, buildJsonObject { }, buildLoadPageCalls(nextCursor), currentSlug)
         }
-
-        createLivewireReq(ANIME_SNAPSHOT_KEY, updates, calls)
+        return parseAnimesPage(response)
     }
 
-    override fun popularAnimeParse(response: Response): AnimesPage {
+    private fun parseAnimesPage(response: Response): AnimesPage {
         val res = response.retryOn419 { req ->
-            if (req.url.encodedPath.contains("/livewire/update")) {
-                val updates = buildJsonObject { }
-                val calls = buildJsonArray {
-                    addJsonObject {
-                        put("path", "")
-                        put("method", "loadMore")
-                        putJsonArray("params") { }
-                    }
-                }
-                val slug = if (req.url.toString().contains("/episode")) "/episode" else "/anime"
-                newLivewireCall(ANIME_SNAPSHOT_KEY, updates, calls, slug)
+            if (req.url.encodedPath.contains(livewireUpdateUrl)) {
+                newLivewireCall(ANIME_SNAPSHOT_KEY, buildJsonObject { }, buildLoadPageCalls(nextCursor), currentSlug)
             } else {
                 client.newCall(req).execute()
             }
         }
 
-        val isLivewire = res.request.url.encodedPath.contains("/livewire/update")
+        val isLivewire = res.request.url.encodedPath.contains(livewireUpdateUrl)
+
+        var dispatchedItems: List<AnimeXData>? = null
+        var dispatchedCursor: String? = null
+        var dispatchedHasMore: Boolean? = null
+
         val html = if (isLivewire) {
-            res.parseAs<LivewireDto>().getHtml(ANIME_SNAPSHOT_KEY)
+            val dto = res.parseAs<LivewireDto>()
+
+            val itemsLoaded = dto.components
+                .firstOrNull()
+                ?.effects
+                ?.dispatches
+                ?.firstOrNull { it.name == "items-loaded" }
+
+            dispatchedItems = itemsLoaded?.params?.items.decodeItems<List<AnimeXData>>()
+            dispatchedCursor = itemsLoaded?.params?.nextCursor
+            dispatchedHasMore = itemsLoaded?.params?.hasMore
+
+            dto.getHtml(ANIME_SNAPSHOT_KEY).body()
         } else {
             res.asJsoup().updateState(ANIME_SNAPSHOT_KEY)
         }
 
-        val animeDict = (if (html.hasAttr("x-data") && html.attr("x-data").contains("animeDict")) html else html.selectFirst("[x-data*=animeDict]"))
-            ?.attr("x-data")?.let { extractAnimeDict(it) } ?: emptyMap()
+        val xDataContainer = html.selectFirst("[x-data*=items]")
+        val xData = xDataContainer?.attr("x-data") ?: ""
 
-        val allElements = html.select(".grid > div, .grid > li, li.space-y-3").filter { it.selectFirst("a[href*=/anime/]") != null }
-        val animeList = allElements
-            .mapNotNull { element -> animeFromElement(element, animeDict) }
-            .filter { it.url !in seenUrls }
-            .onEach { seenUrls.add(it.url) }
+        val itemsJson: JsonElement? = xData.extractAndParseJson("items")
 
-        val hasNextPage = html.selectFirst("div[x-intersect~=loadMore]") != null
+        val items = dispatchedItems
+            ?: extractJsonListFromXData<AnimeXData>(xData, "items")
+                ?.takeIf { it.isNotEmpty() }
+            ?: itemsJson?.takeIf { it !is JsonArray }
+                ?.let { runCatching { it.toString().parseAs<List<AnimeXData>>() }.getOrNull() }
+
+        val rawAnimeList = if (!items.isNullOrEmpty()) {
+            items.mapNotNull { it.toSAnime(preferences.preferredTitleLang) }
+        } else {
+            val wrapped = itemsJson
+                ?.let { runCatching { it.toString().parseAs<List<AnimeXDataWrapped>>() }.getOrNull() }
+
+            if (wrapped != null) {
+                wrapped.mapNotNull { it.toSAnime(preferences.preferredTitleLang) }
+            } else {
+                val animeDictStr = html.selectFirst("[x-data*=animeDict]")?.attr("x-data") ?: ""
+                val animeDict = extractAnimeDict(animeDictStr)
+                val allElements = html.select(".grid > div, .grid > li, li.space-y-3")
+                    .filter { it.selectFirst("a[href*=/anime/]") != null }
+                allElements.mapNotNull { element -> animeFromElement(element, animeDict) }
+            }
+        }
+
+        val animeList = rawAnimeList.filter { seenUrls.add(it.url) }
+
+        nextCursor = dispatchedCursor
+            ?: NEXT_CURSOR_REGEX.find(xData)?.groupValues?.get(1)
+            ?: ""
+
+        val hasNextPage = if (nextCursor.isNotBlank()) {
+            dispatchedHasMore ?: true
+        } else {
+            html.selectFirst("div[x-intersect~=loadMore]") != null
+        }
+
+        if (isLivewire && animeList.isEmpty() && rawAnimeList.isNotEmpty()) {
+            return AnimesPage(rawAnimeList, false)
+        }
 
         return AnimesPage(animeList, hasNextPage)
     }
@@ -140,69 +175,71 @@ class AniZone :
         val xData = element.attr("x-data")
 
         return SAnime.create().apply {
-            val rawUrl = titleLink.absUrl("href")
-            val animeUrl = if (rawUrl.substringAfter("/anime/").trim('/').contains("/")) {
-                rawUrl.substringBeforeLast("/")
+            val rawUrl = titleLink.absUrl("href").toHttpUrl()
+            val anmIndex = rawUrl.pathSegments.indexOf("anime")
+            val animeUrl = if (anmIndex != -1 && rawUrl.pathSegments.size > anmIndex + 2) {
+                rawUrl.newBuilder()
+                    .encodedPath("/" + rawUrl.pathSegments.subList(0, anmIndex + 2).joinToString("/"))
+                    .build()
             } else {
                 rawUrl
             }
-            setUrlWithoutDomain(animeUrl)
+            setUrlWithoutDomain(animeUrl.toString())
 
             val seriesTitleElement = titleLink.selectFirst("span[x-text*=AnimeTitle]")
                 ?: element.selectFirst("span[x-text*=AnimeTitle]")
             val fallback = seriesTitleElement?.text()
                 ?: titleLink.attr("title").takeIf { it.isNotBlank() }
-                ?: titleLink.text().takeIf { it.isNotBlank() }
+                ?: titleLink.text().takeIf { it.isNotEmpty() }
 
             val anmSlug = SLUG_REGEX.find(xData)?.groupValues?.get(1)
             val titlesFromDict = animeDict[anmSlug]
 
             title = getPreferredTitle(xData, fallback, isAnime = true, titlesFromDict = titlesFromDict) ?: return null
-
             thumbnail_url = element.selectFirst("img")?.attr("abs:src") ?: ""
         }
     }
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request = if (page == 1) {
-        snapShots[ANIME_SNAPSHOT_KEY] = ""
-        token = ""
-        seenUrls.clear()
-
-        GET("$baseUrl/episode?sort=release-desc", headers)
-    } else {
-        val updates = buildJsonObject { }
-        val calls = buildJsonArray {
-            addJsonObject {
-                put("path", "")
-                put("method", "loadMore")
-                putJsonArray("params") { }
-            }
+    override suspend fun getLatestUpdates(page: Int): AnimesPage {
+        val request = if (page == 1) {
+            resetAnimeListState(slug = "/")
+            GET("$baseUrl/", headers)
+        } else {
+            createLivewireReq(ANIME_SNAPSHOT_KEY, buildJsonObject { }, buildLoadPageCalls(nextCursor), currentSlug)
         }
 
-        createLivewireReq(ANIME_SNAPSHOT_KEY, updates, calls, "/episode")
+        return parseAnimesPage(fetchAnimesResponse(request))
     }
 
-    override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
+    private fun fetchAnimesResponse(request: Request): Response = client.newCall(request).execute().retryOn419 { req ->
+        if (req.url.encodedPath.contains(livewireUpdateUrl)) {
+            newLivewireCall(ANIME_SNAPSHOT_KEY, buildJsonObject { }, buildLoadPageCalls(nextCursor), currentSlug)
+        } else {
+            client.newCall(req).execute()
+        }
+    }
 
     // =============================== Search ===============================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val sortFilter = filters.firstInstance<SortFilter>()
 
-        return if (page == 1) {
-            snapShots[ANIME_SNAPSHOT_KEY] = ""
-            token = ""
-            seenUrls.clear()
+        val request = if (page == 1) {
+            val url = "$baseUrl/anime".toHttpUrl().newBuilder()
+                .addQueryParameter("search", query)
+                .addQueryParameter("sort", sortFilter.toUriPart())
+                .build()
 
-            GET("$baseUrl/anime?search=$query&sort=${sortFilter.toUriPart()}", headers)
+            resetAnimeListState(slug = url.encodedPath + "?" + url.encodedQuery)
+            GET(url, headers)
         } else {
-            popularAnimeRequest(page)
+            createLivewireReq(ANIME_SNAPSHOT_KEY, buildJsonObject { }, buildLoadPageCalls(nextCursor), currentSlug)
         }
-    }
 
-    override fun searchAnimeParse(response: Response): AnimesPage = popularAnimeParse(response)
+        return parseAnimesPage(fetchAnimesResponse(request))
+    }
 
     // ============================== Filters ===============================
 
@@ -236,7 +273,7 @@ class AniZone :
             val xDataElement = document.selectFirst("[x-data*=anmTitles]")
             val xData = xDataElement?.attr("x-data") ?: ""
 
-            val fallbackText = document.selectFirst("h1")?.text()?.takeIf { it.isNotBlank() }
+            val fallbackText = document.selectFirst("h1")?.text()?.takeIf { it.isNotEmpty() }
                 ?: document.selectFirst("title")?.text()?.substringBefore(" — AniZone")
 
             title = getPreferredTitle(xData, fallbackText) ?: throw Exception("Could not find title")
@@ -266,60 +303,98 @@ class AniZone :
 
     // ============================== Episodes ==============================
 
-    private fun getPredefinedSnapshots(slug: String): String = when (slug) {
-        "/anime/uyyyn4kf" -> """{"data":{"anime":[null,{"class":"anime","key":68,"s":"mdl"}],"title":null,"search":"","listSize":1104,"sort":"release-asc","sortOptions":[{"release-asc":"First Aired","release-desc":"Last Aired"},{"s":"arr"}],"view":"list","paginators":[{"page":1},{"s":"arr"}]},"memo":{"id":"GD1OiEMOJq6UQDQt1OBt","name":"pages.anime-detail","path":"anime\/uyyyn4kf","method":"GET","children":[],"scripts":[],"assets":[],"errors":[],"locale":"en"},"checksum":"5800932dd82e4862f34f6fd72d8098243b32643e8accb8da6a6a39cd0ee86acd"}"""
-        else -> ""
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        snapShots[EPISODE_SNAPSHOT_KEY] = ""
+        val response = client.newCall(GET(baseUrl + anime.url, headers)).awaitSuccess()
+        return parseEpisodeList(response)
     }
 
-    override fun episodeListRequest(anime: SAnime): Request {
-        snapShots[EPISODE_SNAPSHOT_KEY] = getPredefinedSnapshots(anime.url)
-        return GET(baseUrl + anime.url, headers)
-    }
-
-    override fun episodeListParse(response: Response): List<SEpisode> {
+    private fun parseEpisodeList(response: Response): List<SEpisode> {
         val res = response.retryOn419 { client.newCall(it).execute() }
 
-        val html = if (res.request.url.encodedPath.contains("/livewire/update")) {
-            res.parseAs<LivewireDto>().getHtml(EPISODE_SNAPSHOT_KEY)
+        val isLivewire = res.request.url.encodedPath.contains(livewireUpdateUrl)
+
+        var dispatchedItems: List<EpisodeXData>? = null
+        var dispatchedHasMore: Boolean? = null
+        var dispatchedCursor: String? = null
+
+        val html = if (isLivewire) {
+            val dto = res.parseAs<LivewireDto>()
+            val itemsLoaded = dto.components.firstOrNull()
+                ?.effects?.dispatches
+                ?.firstOrNull { it.name == "items-loaded" }
+
+            dispatchedItems = itemsLoaded?.params?.items.decodeItems<List<EpisodeXData>>()
+            dispatchedHasMore = itemsLoaded?.params?.hasMore
+            dispatchedCursor = itemsLoaded?.params?.nextCursor
+
+            dto.getHtml(EPISODE_SNAPSHOT_KEY).body()
         } else {
             res.asJsoup().updateState(EPISODE_SNAPSHOT_KEY)
         }
 
-        val allElements = html.select(episodeSelector)
-        val episodeList = allElements.mapNotNull(::episodeFromElement).toMutableList()
-        var epLoadCount = allElements.size
+        val xDataContainer = html.selectFirst("[x-data*=items]")
+        val xData = xDataContainer?.attr("x-data") ?: ""
 
-        var hasMore = html.selectFirst("div[x-intersect~=loadMore]") != null
+        val items = dispatchedItems ?: extractJsonListFromXData<EpisodeXData>(xData, "items", stripFields = listOf("summary"))
 
-        val updates = buildJsonObject { }
-        val calls = buildJsonArray {
-            addJsonObject {
-                put("path", "")
-                put("method", "loadMore")
-                putJsonArray("params") { }
-            }
+        val episodeList = mutableListOf<SEpisode>()
+
+        if (!items.isNullOrEmpty()) {
+            episodeList.addAll(items.mapNotNull { it.toSEpisode(preferences.preferredTitleLang) })
+        } else {
+            val allElements = html.select(episodeSelector)
+            episodeList.addAll(allElements.mapNotNull(::episodeFromElement))
         }
 
-        while (hasMore) {
+        val seenEpisodeUrls = episodeList.mapTo(mutableSetOf()) { it.url }
+
+        var hasMore = dispatchedHasMore
+            ?: (html.selectFirst("div[x-intersect~=loadMore]") != null)
+
+        var cursor = dispatchedCursor
+            ?: NEXT_CURSOR_REGEX.find(xData)?.groupValues?.get(1)
+            ?: ""
+
+        val updates = buildJsonObject { }
+
+        var iterations = 0
+        while (hasMore && cursor.isNotBlank()) {
+            if (++iterations > MAX_PAGINATION_ITERATIONS) break
+            val calls = buildLoadPageCalls(cursor)
+
             val resp = newLivewireCall(EPISODE_SNAPSHOT_KEY, updates, calls, response.request.url.encodedPath)
-            val livewireHtml = resp.parseAs<LivewireDto>().getHtml(EPISODE_SNAPSHOT_KEY)
+            val liveDto = resp.parseAs<LivewireDto>()
+            val liveHtml = liveDto.getHtml(EPISODE_SNAPSHOT_KEY)
 
-            val newElements = livewireHtml.select(episodeSelector)
-            val episodes = newElements.drop(epLoadCount)
-                .mapNotNull(::episodeFromElement)
+            val liveDispatch = liveDto.components.firstOrNull()
+                ?.effects?.dispatches
+                ?.firstOrNull { it.name == "items-loaded" }
 
-            episodeList.addAll(episodes)
-            epLoadCount = newElements.size
+            val newItems = liveDispatch?.params?.items.decodeItems<List<EpisodeXData>>()
 
-            hasMore = livewireHtml.selectFirst("div[x-intersect~=loadMore]") != null
+            val newlyParsed = if (!newItems.isNullOrEmpty()) {
+                newItems.mapNotNull { it.toSEpisode(preferences.preferredTitleLang) }
+            } else {
+                liveHtml.select(episodeSelector).mapNotNull(::episodeFromElement)
+            }
+
+            for (episode in newlyParsed) {
+                if (seenEpisodeUrls.add(episode.url)) {
+                    episodeList.add(episode)
+                }
+            }
+
+            val newCursor = liveDispatch?.params?.nextCursor ?: ""
+            hasMore = (liveDispatch?.params?.hasMore ?: false) && newCursor != cursor && newCursor.isNotBlank()
+            cursor = newCursor
         }
 
         val (specials, regulars) = episodeList.partition {
             val baseName = it.name.substringBefore(" - ")
             SEASON_REGEX.containsMatchIn(baseName) ||
                 baseName.contains("Special", true) ||
-                baseName.contains("Recap", true) ||
-                !baseName.contains("Episode", true)
+                baseName.contains("Recap", true)
         }
 
         return specials.sortedByDescending { it.episode_number } + regulars.sortedByDescending { it.episode_number }
@@ -362,14 +437,34 @@ class AniZone :
 
     // ============================ Video Links =============================
 
-    override fun videoListRequest(episode: SEpisode): Request = GET(baseUrl + episode.url, headers)
-
     private val playlistUtils: PlaylistUtils by lazy { PlaylistUtils(client, headers) }
 
-    override fun videoListParse(response: Response): List<Video> {
+    private fun Document.vidstackData(): VidstackConfig? {
+        val xData = selectFirst("[x-data*=vidstackPlayer]")?.attr("x-data") ?: return null
+
+        val jsonString = VIDSTACK_REGEX
+            .find(xData)
+            ?.groupValues?.get(1)
+            ?: return null
+
+        val normalizedJson = jsonString
+            .replace("""\u0022""", "\"")
+            .replace("""\u0026""", "&")
+            .replace("""\'""", "'")
+            .replace("""\/""", "/")
+
+        return runCatching {
+            normalizedJson.parseAs<VidstackConfig>()
+        }.getOrNull()
+    }
+
+    override suspend fun getVideoList(episode: SEpisode): List<Video> {
+        val response = client.newCall(GET(baseUrl + episode.url, headers)).awaitSuccess()
         val res = response.retryOn419 { client.newCall(it).execute() }
 
-        val document = res.asJsoup()
+        val initialDocument = res.asJsoup()
+        snapShots[VIDEO_SNAPSHOT_KEY] = initialDocument.getSnapshot() ?: ""
+
         val loadAll = preferences.loadAll
 
         val audioValue = preferences.audio
@@ -402,89 +497,58 @@ class AniZone :
             return (initial + others).take(subCount)
         }
 
-        val serverSelects = document.select("button[wire:click]")
+        val serverSelects = initialDocument.select("button[wire:click]")
             .filter { it.attr("wire:click").contains("setVideo") }
 
         val filteredServers = if (loadAll) {
             serverSelects
         } else {
-            // Sort servers: preferred audio first, then fallback audio, then others
             val sorted = serverSelects.sortedWith(
                 compareByDescending<Element> { it.text().containsLang(audioValue, audioEntry, audioRegex) }
                     .thenByDescending { it.text().containsLang(fallbackAudioValue, fallbackAudioEntry, fallbackAudioRegex) },
             )
-            // Take the best match
             listOfNotNull(sorted.firstOrNull())
         }.ifEmpty { serverSelects }
 
         val m3u8List = mutableListOf<VideoData>()
 
-        if (serverSelects.firstOrNull() in filteredServers) {
-            val subtitles = filterSubs(
-                document.select("track[kind=subtitles]").map {
-                    Track(it.attr("src"), it.attr("label"))
-                },
-            )
+        for (btn in filteredServers) {
+            val videoId = SET_VIDEO_REGEX.find(btn.attr("wire:click"))
+                ?.groupValues?.getOrNull(1)
+                ?: "0"
+            val isDefault = btn.hasAttr("disabled")
+            val hosterName = btn.selectFirst("div.text-lg")?.text()?.takeIf { it.isNotEmpty() } ?: btn.text()
 
-            document.selectFirst("media-player")?.attr("src")?.also {
-                m3u8List.add(
-                    VideoData(
-                        url = it,
-                        name = serverSelects.firstOrNull()?.text() ?: "Default",
-                        subtitles = subtitles,
-                    ),
-                )
-            }
-        }
-
-        snapShots[VIDEO_SNAPSHOT_KEY] = document.getSnapshot() ?: ""
-
-        filteredServers.filter { it != serverSelects.firstOrNull() }.forEach { video ->
-            val matchResult = SET_VIDEO_REGEX.find(video.attr("wire:click"))
-            val videoId = if (matchResult != null && matchResult.groupValues.size == 2) {
-                matchResult.groupValues[1]
+            val doc = if (isDefault) {
+                initialDocument
             } else {
-                "0"
-            }
-            val updates = buildJsonObject { }
-            val calls = buildJsonArray {
-                add(
-                    buildJsonObject {
-                        put("path", "")
-                        put("method", "setVideo")
-                        putJsonArray("params") {
-                            add(videoId.toInt())
-                        }
-                    },
+                val calls = listOf(
+                    LivewireCall(method = "setVideo", params = listOf(JsonPrimitive(videoId.toIntOrNull() ?: 0))),
                 )
+                val resp = newLivewireCall(VIDEO_SNAPSHOT_KEY, buildJsonObject { }, calls, res.request.url.encodedPath)
+                resp.parseAs<LivewireDto>().getHtml(VIDEO_SNAPSHOT_KEY)
             }
 
-            val resp = newLivewireCall(VIDEO_SNAPSHOT_KEY, updates, calls, res.request.url.encodedPath)
-            val doc = resp.parseAs<LivewireDto>().getHtml(VIDEO_SNAPSHOT_KEY)
-
-            val subs = filterSubs(
-                doc.select("track[kind=subtitles]").map {
-                    Track(it.attr("src"), it.attr("label"))
-                },
+            val vidstack = doc.vidstackData()
+            val subtitles = filterSubs(
+                vidstack?.subtitles?.map { Track(it.file.replace("\\/", "/"), it.title) }
+                    ?: doc.select("track[kind=subtitles]").map {
+                        Track(it.attr("src").replace("\\/", "/"), it.attr("label"))
+                    },
             )
 
-            doc.selectFirst("media-player")?.attr("src")?.also {
-                m3u8List.add(
-                    VideoData(
-                        url = it,
-                        name = video.text(),
-                        subtitles = subs,
-                    ),
-                )
+            val videoUrl = vidstack?.src ?: doc.selectFirst("media-player")?.attr("src")
+            if (!videoUrl.isNullOrBlank()) {
+                m3u8List.add(VideoData(videoUrl, hosterName, subtitles))
             }
         }
 
-        val allVideos = m3u8List.flatMap {
+        val allVideos = m3u8List.flatMap { data ->
             playlistUtils.extractFromHls(
-                playlistUrl = it.url,
+                playlistUrl = data.url,
                 referer = "$baseUrl/",
-                videoNameGen = { q -> "${it.name} - $q" },
-                subtitleList = it.subtitles,
+                videoNameGen = { q -> "${data.name} - $q" },
+                subtitleList = data.subtitles,
             )
         }
 
@@ -504,12 +568,6 @@ class AniZone :
         }.ifEmpty { allVideos }
     }
 
-    data class VideoData(
-        val url: String,
-        val name: String,
-        val subtitles: List<Track>,
-    )
-
     override fun List<Video>.sort(): List<Video> {
         val quality = preferences.quality
         val audio = preferences.audio
@@ -526,10 +584,22 @@ class AniZone :
 
     // ============================= Utilities ==============================
 
+    private fun resetAnimeListState(slug: String) {
+        snapShots[ANIME_SNAPSHOT_KEY] = ""
+        token = ""
+        seenUrls.clear()
+        nextCursor = ""
+        currentSlug = slug
+    }
+
+    private fun buildLoadPageCalls(cursor: String): List<LivewireCall> = listOf(
+        LivewireCall(method = "loadPage", params = listOf(JsonPrimitive(cursor))),
+    )
+
     private fun newLivewireCall(
         mapKey: String,
         updates: JsonObject,
-        calls: JsonArray,
+        calls: List<LivewireCall>,
         initialSlug: String = "/anime",
     ): Response {
         fun build() = createLivewireReq(mapKey, updates, calls, initialSlug)
@@ -564,13 +634,13 @@ class AniZone :
     private fun Document.updateState(mapKey: String): Element {
         this.selectFirst("script[data-csrf]")?.attr("data-csrf")?.takeIf(String::isNotEmpty)?.let { token = it }
         this.getSnapshot()?.let { snapShots[mapKey] = it }
-        return this.selectFirst("main > div[wire:snapshot], main > ul[wire:snapshot]") ?: this
+        return this.selectFirst("main > div[wire:snapshot], main > ul[wire:snapshot]") ?: this.body()
     }
 
     private fun createLivewireReq(
         mapKey: String,
         updates: JsonObject,
-        calls: JsonArray,
+        calls: List<LivewireCall>,
         initialSlug: String = "/anime",
     ): Request {
         val firstSnapshot = snapShots[mapKey] ?: ""
@@ -585,24 +655,30 @@ class AniZone :
             }
         }
 
-        val headers = headersBuilder().apply {
+        val requestHeaders = headersBuilder().apply {
+            add("Accept", "*/*")
+            add("Content-Type", "application/json")
             add("X-Livewire", "")
-            add("X-CSRF-TOKEN", token)
             add("Origin", baseUrl)
+            add("Referer", "$baseUrl$initialSlug")
         }.build()
 
-        val body = LivewireRequestDto(
+        val payload = LivewirePayload(
             token = token,
             components = listOf(
-                LivewireComponentRequestDto(
-                    calls = calls,
-                    snapshot = snapShots[mapKey]!!,
+                LivewireComponentPayload(
+                    snapshot = snapShots[mapKey] ?: "",
                     updates = updates,
+                    calls = calls,
                 ),
             ),
-        ).toJsonRequestBody()
+        )
 
-        return POST("$baseUrl/livewire/update", headers, body)
+        return POST(
+            url = "$baseUrl/livewire/update",
+            headers = requestHeaders,
+            body = payload.toJsonRequestBody(),
+        )
     }
 
     private fun getPreferredTitle(
@@ -621,33 +697,114 @@ class AniZone :
             extractJsonFromXData<Map<String, String>>(xData, targetKey)
         }
 
-        val title = titlesMap?.let {
-            it[preferences.preferredTitleLang]
-                ?: it["1"]
-                ?: it["5"]
-        } ?: fallbackTitle
+        val title = titlesMap?.preferredTitle() ?: fallbackTitle
 
         return title?.clean()
     }
 
     private fun extractAnimeDict(xData: String): Map<String, Map<String, String>> = extractJsonFromXData<Map<String, Map<String, String>>>(xData, "animeDict") ?: emptyMap()
 
-    private inline fun <reified T> extractJsonFromXData(xData: String, key: String): T? {
-        val marker = "$key: JSON.parse('"
-        val start = xData.indexOf(marker)
-        if (start == -1) return null
-        val startIdx = start + marker.length
-        val endIdx = xData.indexOf("')", startIdx)
-        if (endIdx == -1) return null
-        val jsonString = xData.substring(startIdx, endIdx)
-            .replace("\\u0022", "\"")
-            .replace("\\u0026", "\\&")
-            .replace("\\'", "'")
+    private fun Map<String, String>.preferredTitle(): String? = this[preferences.preferredTitleLang] ?: this["1"] ?: this["5"]
+
+    private inline fun <reified T> JsonArray?.decodeItems(): T? {
+        if (this == null) return null
         return try {
-            jsonString.parseAs<T>()
+            this.toString().parseAs<T>()
         } catch (_: Exception) {
             null
         }
+    }
+
+    private inline fun <reified T> extractJsonFromXData(xData: String, key: String): T? {
+        val rawJson = xData.findRawJsonParseArg(key) ?: return null
+        return try {
+            rawJson.unescapeXDataJson().parseAs<T>()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private inline fun <reified T> extractJsonListFromXData(
+        xData: String,
+        key: String,
+        stripFields: List<String> = emptyList(),
+    ): List<T>? {
+        val rawArray = xData.findRawJsonParseArg(key) ?: return null
+
+        return splitTopLevelJsonObjects(rawArray).mapNotNull { rawElement ->
+            val cleaned = stripFields
+                .fold(rawElement) { acc, field -> acc.stripXDataTextField(field) }
+                .unescapeXDataJson()
+                .sanitizeInvalidEscapes()
+
+            try {
+                cleaned.parseAs<T>()
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    private fun String.findRawJsonParseArg(key: String): String? = JSON_PARSE_REGEX.findAll(this).firstOrNull { it.groupValues[1] == key }?.groupValues?.get(2)
+
+    private fun String.stripXDataTextField(key: String): String {
+        val fieldRegex = STRIP_FIELD_REGEX_CACHE.getOrPut(key) {
+            Regex(
+                """(\\u0022$key\\u0022:\\u0022).*?(\\u0022,\\u0022|\\u0022\})""",
+                RegexOption.DOT_MATCHES_ALL,
+            )
+        }
+        return this.replace(fieldRegex, "$1$2")
+    }
+
+    private fun String.unescapeXDataJson(): String = this
+        .replace("""\u0022""", "\"")
+        .replace("""\u0026""", "&")
+        .replace("""\'""", "'")
+        .replace("""\/""", "/")
+        .replace("""\\""", """\""")
+
+    private fun String.sanitizeInvalidEscapes(): String = this
+        .replace("\\&", "&")
+        .replace("\\'", "'")
+        .replace("\\0", "\\u0000")
+        .replace(HEX_ESCAPE) { "\\u%04x".format(it.groupValues[1].toInt(16)) }
+        .replace(INVALID_BACKSLASH, "")
+
+    private fun splitTopLevelJsonObjects(rawArray: String): List<String> {
+        val body = rawArray.trim().removePrefix("[").removeSuffix("]")
+        val chunks = mutableListOf<String>()
+        var depth = 0
+        var start = -1
+        for (i in body.indices) {
+            when (body[i]) {
+                '{' -> {
+                    if (depth == 0) start = i
+                    depth++
+                }
+
+                '}' -> {
+                    depth--
+                    if (depth == 0 && start != -1) {
+                        chunks.add(body.substring(start, i + 1))
+                        start = -1
+                    }
+                }
+            }
+        }
+        return chunks
+    }
+
+    private fun String.extractAndParseJson(prefix: String): JsonElement? {
+        val jsonString = this.substringAfter("$prefix: JSON.parse('", "").substringBefore("')")
+        if (jsonString.isEmpty()) return null
+
+        val cleanJson = Parser.unescapeEntities(jsonString, true)
+            .replace("\\u0022", "\"")
+            .replace("\\\\", "\\")
+            .replace("\\/", "/")
+
+        return runCatching { Json.parseToJsonElement(cleanJson) }.getOrNull()
     }
 
     private fun getLangRegex(langValue: String): Regex? {
@@ -684,8 +841,6 @@ class AniZone :
         .replace("`", "'")
         .trim()
 
-    private fun parseDate(dateStr: String): Long = DATE_FORMAT.tryParse(dateStr)
-
     private val SharedPreferences.quality
         get() = getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
 
@@ -704,22 +859,41 @@ class AniZone :
     private val SharedPreferences.preferredTitleLang
         get() = getString(PREF_TITLE_LANG_KEY, PREF_TITLE_LANG_DEFAULT)!!
 
+    override fun popularAnimeRequest(page: Int): Request = throw UnsupportedOperationException()
+    override fun popularAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
+    override fun latestUpdatesParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = throw UnsupportedOperationException()
+    override fun searchAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException()
+    override fun episodeListRequest(anime: SAnime): Request = throw UnsupportedOperationException()
+    override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
+    override fun videoListRequest(episode: SEpisode): Request = throw UnsupportedOperationException()
+    override fun videoListParse(response: Response): List<Video> = throw UnsupportedOperationException()
+
     companion object {
+        private val HEX_ESCAPE = Regex("""\\x([0-9a-fA-F]{2})""")
+        private val INVALID_BACKSLASH = Regex("""\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})""")
         private val BR_REGEX = Regex("(?i)<br\\s*/?>")
         private val FALLBACK_TITLE_REGEX = Regex("""getTitle\([^,]+,\s*'([^']+)'\)""")
         private val SLUG_REGEX = Regex("""anmSlug:\s*'([^']+)'""")
-        private val SET_VIDEO_REGEX = Regex("""setVideo\('(\d+)'\)""")
+        private val SET_VIDEO_REGEX = Regex("""setVideo\(['"]?(\d+)['"]?\)""")
+
+        private val JSON_PARSE_REGEX = Regex("""([a-zA-Z0-9_]+):\s*JSON\.parse\('((?:[^'\\]|\\.)*)'\)""")
+        private val VIDSTACK_REGEX = Regex("""JSON\.parse\('((?:[^'\\]|\\.)*)'\)""")
         private val DATE_REGEX = Regex("""\d{4}-\d{2}-\d{2}""")
         private val SEASON_REGEX = Regex("(?i)s\\d+")
         private val EPISODE_NUMBER_REGEX = Regex("""\d+(\.\d+)?""")
 
         private val LANG_REGEX_CACHE = mutableMapOf<String, Regex>()
+        private val STRIP_FIELD_REGEX_CACHE = mutableMapOf<String, Regex>()
 
-        private val DATE_FORMAT by lazy { SimpleDateFormat("yyyy-MM-dd", Locale.ROOT) }
+        private val NEXT_CURSOR_REGEX = Regex("""nextCursor:\s*'([^']+)'""")
 
         private const val ANIME_SNAPSHOT_KEY = "anime_snapshot_key"
         private const val EPISODE_SNAPSHOT_KEY = "episode_snapshot_key"
         private const val VIDEO_SNAPSHOT_KEY = "video_snapshot_key"
+
+        private const val MAX_PAGINATION_ITERATIONS = 50
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_TITLE = "Preferred Quality"

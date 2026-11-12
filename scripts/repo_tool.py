@@ -240,7 +240,16 @@ def cmd_build(targets: list[tuple[str, str]], bump: bool, batch_size: int) -> in
     for i in range(0, len(tasks), batch_size):
         chunk = tasks[i : i + batch_size]
         print(f"Building: {' '.join(chunk)}")
-        res = subprocess.run([str(GRADLEW), *chunk, "--no-daemon"], cwd=ROOT)
+        res = subprocess.run(
+            [
+                str(GRADLEW),
+                *chunk,
+                "--no-daemon",
+                "--max-workers=2",
+                "-Dorg.gradle.jvmargs=-Xmx1536m -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8",
+            ],
+            cwd=ROOT,
+        )
         if res.returncode != 0:
             return res.returncode
 
@@ -286,7 +295,7 @@ def main() -> int:
     p_build.add_argument("--group", help="Named group e.g. all:A1")
     p_build.add_argument("--lang", choices=["all", "ar", "en"], help="Build all modules for language")
     p_build.add_argument("--bump", action="store_true", help="Increment version code before building")
-    p_build.add_argument("--batch-size", type=int, default=6)
+    p_build.add_argument("--batch-size", type=int, default=2)
 
     args = parser.parse_args()
     if args.cmd == "status":

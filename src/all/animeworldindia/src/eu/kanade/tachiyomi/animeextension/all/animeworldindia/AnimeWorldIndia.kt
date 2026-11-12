@@ -1,245 +1,201 @@
 package eu.kanade.tachiyomi.animeextension.all.animeworldindia
 
-import androidx.preference.ListPreference
-import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
+import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.utils.getPreferencesLazy
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
+import eu.kanade.tachiyomi.network.POST
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.useAsJsoup
+import okhttp3.FormBody
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import uy.kohesive.injekt.injectLazy
 
 class AnimeWorldIndia(
-    final override val lang: String,
+    override val lang: String,
     private val language: String,
-) : ParsedAnimeHttpSource(),
-    ConfigurableAnimeSource {
+) : ParsedAnimeHttpSource() {
 
     override val name = "AnimeWorld India"
 
-    override val baseUrl = "https://anime-world.co"
+    override val baseUrl = "https://watchanimeworld.one"
 
     override val supportsLatest = true
 
-    private val json: Json by injectLazy()
-
-    private val preferences by getPreferencesLazy()
+    private val zephyrixExtractor by lazy { ZephyrixExtractor(client, headers, baseUrl) }
 
     // ============================== Popular ===============================
-    override fun popularAnimeRequest(page: Int) = GET("$baseUrl/advanced-search/page/$page/?s_lang=$lang&s_orderby=viewed")
+    override fun popularAnimeRequest(page: Int): Request {
+        val path = if (language.isNotBlank()) "/category/language/$language" else "/series"
+        return GET("$baseUrl$path/page/$page/", headers)
+    }
 
-    override fun popularAnimeSelector() = searchAnimeSelector()
+    override fun popularAnimeSelector() = "article.post"
 
-    override fun popularAnimeFromElement(element: Element) = searchAnimeFromElement(element)
+    override fun popularAnimeFromElement(element: Element) = SAnime.create().apply {
+        val link = element.selectFirst("a.lnk-blk") ?: element.selectFirst("a[href]")!!
+        setUrlWithoutDomain(link.attr("abs:href"))
+        title = element.selectFirst("header h2.entry-title, h2.entry-title, .title")?.text().orEmpty()
+        thumbnail_url = element.selectFirst("img")?.let { img ->
+            img.attr("abs:src").ifBlank { img.attr("abs:data-src") }
+        }
+    }
 
-    override fun popularAnimeNextPageSelector() = searchAnimeNextPageSelector()
+    override fun popularAnimeNextPageSelector() = "div.nav-links a.next, div.nav-links a:contains(NEXT)"
 
     // =============================== Latest ===============================
-    override fun latestUpdatesNextPageSelector() = searchAnimeNextPageSelector()
+    override fun latestUpdatesRequest(page: Int): Request {
+        val path = if (language.isNotBlank()) "/category/language/$language" else "/movies"
+        return GET("$baseUrl$path/page/$page/", headers)
+    }
 
-    override fun latestUpdatesSelector() = searchAnimeSelector()
+    override fun latestUpdatesSelector() = popularAnimeSelector()
 
-    override fun latestUpdatesFromElement(element: Element) = searchAnimeFromElement(element)
+    override fun latestUpdatesFromElement(element: Element) = popularAnimeFromElement(element)
 
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/advanced-search/page/$page/?s_lang=$lang&s_orderby=update")
+    override fun latestUpdatesNextPageSelector() = popularAnimeNextPageSelector()
 
     // =============================== Search ===============================
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val searchParams = AnimeWorldIndiaFilters().getSearchParams(filters)
-        return GET("$baseUrl/advanced-search/page/$page/?s_keyword=$query&s_lang=$lang$searchParams")
+        if (query.isNotBlank()) {
+            val url = "$baseUrl/page/$page/".toHttpUrl().newBuilder()
+                .addQueryParameter("s", query.trim())
+                .build()
+            return GET(url, headers)
+        }
+        val path = AnimeWorldIndiaFilters.resolveFilterPath(filters, language)
+        return GET("$baseUrl$path/page/$page/", headers)
     }
 
-    override fun searchAnimeSelector() = "div.col-span-1"
+    override fun searchAnimeSelector() = popularAnimeSelector()
 
-    override fun searchAnimeFromElement(element: Element) = SAnime.create().apply {
-        setUrlWithoutDomain(element.selectFirst("a")!!.attr("href"))
-        thumbnail_url = element.selectFirst("img")!!.attr("abs:src")
-        title = element.selectFirst("div.font-medium.line-clamp-2.mb-3")!!.text()
-    }
+    override fun searchAnimeFromElement(element: Element) = popularAnimeFromElement(element)
 
-    override fun searchAnimeNextPageSelector() = "ul.page-numbers li:has(span.current) + li"
+    override fun searchAnimeNextPageSelector() = popularAnimeNextPageSelector()
 
-    override fun getFilterList() = AnimeWorldIndiaFilters().filters
+    // ============================== Filters ===============================
+    override fun getFilterList() = AnimeWorldIndiaFilters.filters
 
     // =========================== Anime Details ============================
     override fun animeDetailsParse(document: Document) = SAnime.create().apply {
-        title = document.selectFirst("h2.text-4xl")!!.text()
-        genre = document.select("span.leading-6 a[class~=border-opacity-30]").joinToString { it.text() }
-        description = document.selectFirst("div[data-synopsis]")?.text()
-        author = document.selectFirst("span.leading-6 a[href*=\"producer\"]:first-child")?.text()
-        artist = document.selectFirst("span.leading-6 a[href*=\"studio\"]:first-child")?.text()
-        status = parseStatus(document)
-    }
-
-    private val selector = "ul li:has(div.w-1.h-1.bg-gray-500.rounded-full) + li"
-
-    private fun parseStatus(document: Document): Int {
-        return when (document.selectFirst("$selector a:not(:contains(Ep))")?.text()) {
-            null -> SAnime.UNKNOWN
-
-            "Movie" -> SAnime.COMPLETED
-
-            else -> {
-                val epParts = document.selectFirst("$selector a:not(:contains(TV))")
-                    ?.text()
-                    ?.drop(3)
-                    ?.split("/")
-                    ?.takeIf { it.size >= 2 }
-                    ?: return SAnime.UNKNOWN
-                if (epParts.first().trim().compareTo(epParts[1].trim()) == 0) {
-                    SAnime.COMPLETED
-                } else {
-                    SAnime.ONGOING
-                }
-            }
-        }
+        title = document.selectFirst("article.post.single h1.entry-title, h1.entry-title")?.text().orEmpty()
+        thumbnail_url = document.selectFirst("article.post.single img[loading], article.post.single > div img, .post-thumbnail img")
+            ?.attr("abs:src")
+        description = document.select("article.post.single .description p")
+            .joinToString("\n\n") { it.text() }
+            .ifBlank { document.selectFirst("article.post.single .description")?.text() }
+        genre = document.select("article.post.single p.genres a, ul.cast-lst a[href*='/genre/']")
+            .joinToString { it.text() }
+        status = SAnime.UNKNOWN
     }
 
     // ============================== Episodes ==============================
-    override fun episodeListSelector() = throw UnsupportedOperationException()
-
-    override fun episodeFromElement(element: Element): SEpisode = throw UnsupportedOperationException()
-
-    @Serializable
-    data class SeasonDto(val episodes: EpisodeTypeDto)
-
-    @Serializable
-    data class EpisodeTypeDto(val all: List<EpisodeDto>) {
-        @Serializable
-        data class EpisodeDto(val id: Int, val metadata: MetadataDto)
-
-        @Serializable
-        data class MetadataDto(
-            val number: String,
-            val title: String,
-            val released: String? = null,
-        )
-    }
-
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val document = response.asJsoup()
-        val isMovie = document.selectFirst("nav li > a[href*=\"type/movies/\"]") != null
+        val document = response.useAsJsoup()
+        val pageUrl = response.request.url.toString()
 
-        val seasonsJson = json.decodeFromString<List<SeasonDto>>(
-            document.html()
-                .substringAfter("var season_list = ")
-                .substringBefore("var season_label =")
-                .trim().dropLast(1),
-        )
-
-        var episodeNumberFallback = 1F
-        val isSingleSeason = seasonsJson.size == 1
-        return seasonsJson.flatMapIndexed { seasonNumber, season ->
-            val seasonName = if (isSingleSeason) "" else "Season ${seasonNumber + 1}"
-
-            season.episodes.all.reversed().map { episode ->
-                val episodeTitle = episode.metadata.title
-                val epNum = episode.metadata.number.toIntOrNull() ?: episodeNumberFallback.toInt()
-
-                val episodeName = when {
-                    isMovie -> "Movie"
-
-                    else -> buildString {
-                        if (seasonName.isNotBlank()) append("$seasonName - ")
-                        append("Episode $epNum")
-                        if (episodeTitle.isNotBlank()) append(" - $episodeTitle")
-                    }
-                }
-
+        if (pageUrl.contains("/movies/") || document.selectFirst("#options-0 iframe") != null) {
+            return listOf(
                 SEpisode.create().apply {
-                    name = episodeName
-                    episode_number = when {
-                        isSingleSeason -> epNum.toFloat()
-                        else -> episodeNumberFallback
-                    }
-                    episodeNumberFallback++
-                    setUrlWithoutDomain("$baseUrl/wp-json/kiranime/v1/episode?id=${episode.id}")
-                    date_upload = episode.metadata.released?.toLongOrNull()?.times(1000) ?: 0L
+                    setUrlWithoutDomain(pageUrl)
+                    name = "Movie"
+                    episode_number = 1f
+                },
+            )
+        }
+
+        val seasonAnchors = document.select("ul.aa-cnt li a[data-post][data-season]")
+        if (seasonAnchors.size <= 1) {
+            return document.select(episodeListSelector())
+                .map(::episodeFromElement)
+                .reversed()
+        }
+
+        val allEpisodes = mutableListOf<SEpisode>()
+        val ajaxHeaders = headers.newBuilder()
+            .set("X-Requested-With", "XMLHttpRequest")
+            .set("Referer", pageUrl)
+            .build()
+
+        seasonAnchors.forEach { anchor ->
+            val postId = anchor.attr("data-post")
+            val seasonNum = anchor.attr("data-season")
+            val formBody = FormBody.Builder()
+                .add("action", "action_select_season")
+                .add("season", seasonNum)
+                .add("post", postId)
+                .build()
+            runCatching {
+                val seasonDoc = client.newCall(
+                    POST("$baseUrl/wp-admin/admin-ajax.php", ajaxHeaders, formBody),
+                ).execute().useAsJsoup()
+                seasonDoc.select("article.post").forEach { el ->
+                    allEpisodes.add(episodeFromElement(el))
                 }
             }
-        }.sortedByDescending { it.episode_number }
+        }
+
+        if (allEpisodes.isEmpty()) {
+            allEpisodes.addAll(document.select(episodeListSelector()).map(::episodeFromElement))
+        }
+
+        return allEpisodes.distinctBy { it.url }.reversed()
+    }
+
+    override fun episodeListSelector() = "ul#episode_by_temp article.post, article.episodes"
+
+    override fun episodeFromElement(element: Element) = SEpisode.create().apply {
+        val link = element.selectFirst("a.lnk-blk") ?: element.selectFirst("a[href]")!!
+        setUrlWithoutDomain(link.attr("abs:href"))
+        val code = element.selectFirst("span.num-epi")?.text()?.trim().orEmpty()
+        val epTitle = element.selectFirst("h2.entry-title")?.text()?.trim().orEmpty()
+        name = when {
+            code.isNotEmpty() && epTitle.isNotEmpty() -> "$code - $epTitle"
+            epTitle.isNotEmpty() -> epTitle
+            code.isNotEmpty() -> "Episode $code"
+            else -> "Episode"
+        }
+        episode_number = parseEpisodeNumber(code, link.attr("href"))
+    }
+
+    private fun parseEpisodeNumber(code: String, href: String): Float {
+        if (code.contains("x", ignoreCase = true)) {
+            val season = code.substringBefore("x", "").toIntOrNull() ?: 0
+            val ep = code.substringAfter("x", "").toFloatOrNull() ?: 0f
+            return if (season > 1) season * 1000f + ep else ep
+        }
+        return EP_NUM_REGEX.find(href)?.groupValues?.get(1)?.toFloatOrNull() ?: 1f
     }
 
     // ============================ Video Links =============================
-    override fun videoFromElement(element: Element): Video = throw UnsupportedOperationException()
+    override fun videoListParse(response: Response): List<Video> {
+        val document = response.useAsJsoup()
+        val iframes = document.select("div[id^=options-] iframe, #options-0 iframe")
+        val videos = mutableListOf<Video>()
 
-    override fun videoUrlParse(document: Document) = throw UnsupportedOperationException()
+        iframes.forEachIndexed { idx, iframe ->
+            val src = iframe.attr("abs:src").ifBlank { iframe.attr("abs:data-src") }
+            if (src.contains("zephyrix", ignoreCase = true)) {
+                videos.addAll(zephyrixExtractor.videosFromUrl(src, "Server ${idx + 1}"))
+            }
+        }
+
+        return videos
+    }
 
     override fun videoListSelector() = throw UnsupportedOperationException()
 
-    @Serializable
-    private data class PlayerDto(
-        val type: String,
-        val url: String,
-        val language: String,
-        val server: String,
-    )
+    override fun videoFromElement(element: Element) = throw UnsupportedOperationException()
 
-    private val mystreamExtractor by lazy { MyStreamExtractor(client, headers) }
-
-    override fun videoListParse(response: Response): List<Video> {
-        val body = response.body.string()
-        val documentTrimmed = body
-            .substringAfterLast("\"players\":")
-            .substringBefore(",\"noplayer\":")
-            .trim()
-
-        val playersList = json.decodeFromString<List<PlayerDto>>(documentTrimmed)
-            .filter { it.type == "stream" && it.url.isNotBlank() }
-            .also { require(it.isNotEmpty()) { "No streams available!" } }
-            .filter { language.isEmpty() || it.language.equals(language) }
-            .also { require(it.isNotEmpty()) { "No videos for your language!" } }
-
-        return playersList.flatMap {
-            when (it.server) {
-                "Mystream" -> mystreamExtractor.videosFromUrl(it.url, it.language)
-                else -> emptyList()
-            }
-        }
-    }
-
-    override fun List<Video>.sort(): List<Video> {
-        val quality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
-
-        return sortedWith(
-            compareBy { it.quality.contains(quality) },
-        ).reversed()
-    }
-
-    // ============================ Preferences =============================
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        ListPreference(screen.context).apply {
-            key = PREF_QUALITY_KEY
-            title = PREF_QUALITY_TITLE
-            entries = PREF_QUALITY_ENTRIES
-            entryValues = PREF_QUALITY_VALUES
-            setDefaultValue(PREF_QUALITY_DEFAULT)
-            summary = "%s"
-
-            setOnPreferenceChangeListener { _, newValue ->
-                val selected = newValue as String
-                val index = findIndexOfValue(selected)
-                val entry = entryValues[index] as String
-                preferences.edit().putString(key, entry).commit()
-            }
-        }.also(screen::addPreference)
-    }
+    override fun videoUrlParse(document: Document) = throw UnsupportedOperationException()
 
     companion object {
-        private const val PREF_QUALITY_KEY = "preferred_quality"
-        private const val PREF_QUALITY_TITLE = "Preferred quality"
-        private const val PREF_QUALITY_DEFAULT = "1080"
-        private val PREF_QUALITY_ENTRIES = arrayOf("1080p", "720p", "480p", "360p", "240p")
-        private val PREF_QUALITY_VALUES = arrayOf("1080", "720", "480", "360", "240")
+        private val EP_NUM_REGEX = Regex("""(\d+(?:\.\d+)?)/?$""")
     }
 }

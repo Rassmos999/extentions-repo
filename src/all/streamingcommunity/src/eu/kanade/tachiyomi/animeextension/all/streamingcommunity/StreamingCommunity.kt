@@ -21,6 +21,7 @@ import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
+import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
@@ -32,6 +33,7 @@ import keiyoushi.utils.addEditTextPreference
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.delegate
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.parseAs
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -389,19 +391,51 @@ class StreamingCommunity(
         val expires = EXPIRES_REGEX.find(script)?.groupValues?.get(1)
             ?: error("Failed to extract expires")
 
-        val masterPlUrl = buildString {
-            append(playlistUrl)
-            append(if (playlistUrl.contains('?')) '&' else '?')
-            append("h=1&token=")
-            append(token)
-            append("&expires=")
-            append(expires)
-            append("&lang=")
-            append(lang)
+        // `h=1` asks vixcloud for the FHD rendition set. It answers 403
+        // whenever the embed says the session may not play FHD, so only send
+        // it when `window.canPlayFHD` is true.
+        val canPlayFhd = CAN_PLAY_FHD_REGEX.find(script)?.groupValues?.get(1) == "true"
+        val masterPlUrl = buildMasterPlaylistUrl(playlistUrl, token, expires, canPlayFhd)
+
+        val serverPlaylists = STREAMS_REGEX.find(script)?.groupValues?.get(1)
+            ?.let { streams ->
+                runCatching { streams.parseAs<List<StreamServer>>() }
+                    .onFailure { Log.w(TAG, "Could not parse window.streams: $it") }
+                    .getOrNull()
+            }
+            .orEmpty()
+            .sortedByDescending(StreamServer::isActive)
+            .map { buildMasterPlaylistUrl(it.url, token, expires, canPlayFhd) }
+            .ifEmpty { listOf(masterPlUrl) }
+
+        val videos = coroutineScope {
+            serverPlaylists.map { serverPlaylistUrl ->
+                async {
+                    runCatching {
+                        playlistUtils.extractFromHls(playlistUrl = serverPlaylistUrl)
+                            .takeIf { it.isNotEmpty() }
+                    }.getOrNull()
+                }
+            }.awaitAll()
+                .firstOrNull { !it.isNullOrEmpty() }
+                ?: runCatching { playlistUtils.extractFromHls(playlistUrl = masterPlUrl) }.getOrNull()
+                    ?.takeIf { it.isNotEmpty() }
+                    .orEmpty()
         }
 
-        return playlistUtils.extractFromHls(playlistUrl = masterPlUrl)
+        return videos.map { video ->
+            Video(
+                url = video.url,
+                quality = video.quality,
+                videoUrl = video.videoUrl,
+                headers = video.headers ?: headers,
+                subtitleTracks = video.subtitleTracks.distinctBy(Track::url),
+                audioTracks = video.audioTracks.distinctBy(Track::url),
+            )
+        }
     }
+
+    private fun buildMasterPlaylistUrl(base: String, token: String, expires: String, canPlayFhd: Boolean) = base + (if ('?' in base) '&' else '?') + (if (canPlayFhd) "h=1&" else "") + "token=$token&expires=$expires&lang=$lang"
 
     override fun videoListRequest(episode: SEpisode): Request = throw Exception("Not used")
 
@@ -430,13 +464,15 @@ class StreamingCommunity(
     }
 
     companion object {
-        private const val DOMAIN_DEFAULT = "https://streamingunity.dog"
+        private const val DOMAIN_DEFAULT = "https://streamingunity.fun"
         private const val PREF_CUSTOM_DOMAIN_KEY = "custom_domain_v${BuildConfig.VERSION_NAME}"
         private const val TAG = "StreamingCommunity"
 
         private val PLAYLIST_URL_REGEX = Regex("""url: ?'(.*?)'""")
         private val EXPIRES_REGEX = Regex("""'expires': ?'(\d+)'""")
         private val TOKEN_REGEX = Regex("""'token': ?'([\w-]+)'""")
+        private val STREAMS_REGEX = Regex("""window\.streams\s*=\s*(\[.*?\}\s*\])""", RegexOption.DOT_MATCHES_ALL)
+        private val CAN_PLAY_FHD_REGEX = Regex("""window\.canPlayFHD\s*=\s*(\w+)""")
         private val QUALITY_REGEX = Regex("""(\d+)p""")
 
         private const val PREF_QUALITY_KEY = "preferred_quality"

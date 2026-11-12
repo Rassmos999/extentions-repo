@@ -6,6 +6,7 @@ import aniyomi.lib.dailymotionextractor.DailymotionExtractor
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.gdriveplayerextractor.GdrivePlayerExtractor
 import aniyomi.lib.okruextractor.OkruExtractor
+import aniyomi.lib.vidhideextractor.VidHideExtractor
 import eu.kanade.tachiyomi.animeextension.all.animexin.extractors.VidstreamingExtractor
 import eu.kanade.tachiyomi.animeextension.all.animexin.extractors.YouTubeExtractor
 import eu.kanade.tachiyomi.animesource.model.Video
@@ -46,6 +47,7 @@ class AnimeXin :
     private val doodExtractor by lazy { DoodExtractor(client) }
     private val gdrivePlayerExtractor by lazy { GdrivePlayerExtractor(client) }
     private val okruExtractor by lazy { OkruExtractor(client) }
+    private val vidhideExtractor by lazy { VidHideExtractor(client, headers) }
     private val vidstreamingExtractor by lazy { VidstreamingExtractor(client) }
     private val youTubeExtractor by lazy { YouTubeExtractor(client) }
 
@@ -69,6 +71,8 @@ class AnimeXin :
             url.contains("youtube.com") -> youTubeExtractor.videosFromUrl(url, prefix)
 
             url.contains("vidstreaming") -> vidstreamingExtractor.videosFromUrl(url, prefix)
+
+            url.contains("ahvsh") || url.contains("vidhide") || url.contains("streamhide") -> vidhideExtractor.videosFromUrl(url) { "$prefix$it" }
 
             else -> emptyList()
         }

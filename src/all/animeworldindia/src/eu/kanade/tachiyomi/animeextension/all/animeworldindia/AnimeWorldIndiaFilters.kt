@@ -3,182 +3,130 @@ package eu.kanade.tachiyomi.animeextension.all.animeworldindia
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 
-class AnimeWorldIndiaFilters {
+object AnimeWorldIndiaFilters {
 
-    private data class StringQuery(val name: String, val query: String)
+    private class SectionFilter :
+        UriPartFilter(
+            "Section",
+            arrayOf(
+                Pair("Series", "/series"),
+                Pair("Movies", "/movies"),
+            ),
+        )
 
-    private class TypeList(types: Array<String>) : AnimeFilter.Select<String>("Type", types)
-    private val typesName = getTypeList().map {
-        it.name
-    }.toTypedArray()
+    private class LanguageFilter :
+        UriPartFilter(
+            "Language",
+            arrayOf(
+                Pair("Default (Extension Language)", ""),
+                Pair("All Languages", "__all__"),
+                Pair("Hindi", "/category/language/hindi"),
+                Pair("English", "/category/language/english"),
+                Pair("Japanese", "/category/language/japanese"),
+                Pair("Tamil", "/category/language/tamil"),
+                Pair("Telugu", "/category/language/telugu"),
+                Pair("Malayalam", "/category/language/malayalam"),
+                Pair("Bengali", "/category/language/bengali"),
+                Pair("Kannada", "/category/language/kannada"),
+                Pair("Korean", "/category/language/korean"),
+                Pair("Marathi", "/category/language/marathi"),
+            ),
+        )
 
-    private fun getTypeList() = listOf(
-        StringQuery("Any", "all"),
-        StringQuery("TV", "tv"),
-        StringQuery("Movie", "movie"),
-    )
+    private class NetworkFilter :
+        UriPartFilter(
+            "Network",
+            arrayOf(
+                Pair("Any", ""),
+                Pair("Crunchyroll", "/category/network/crunchyroll"),
+                Pair("Netflix", "/category/network/netflix"),
+                Pair("Prime Video", "/category/network/prime-video"),
+                Pair("Disney+", "/category/network/disney"),
+                Pair("Disney Channel", "/category/network/disney-channel"),
+                Pair("Cartoon Network", "/category/network/cartoon-network"),
+                Pair("Hungama TV", "/category/network/hungama-tv"),
+                Pair("Sony YAY", "/category/network/sony-yay"),
+            ),
+        )
 
-    private class StatusList(statuses: Array<String>) : AnimeFilter.Select<String>("Status", statuses)
-    private val statusesName = getStatusesList().map {
-        it.name
-    }.toTypedArray()
+    private class FranchiseFilter :
+        UriPartFilter(
+            "Franchise",
+            arrayOf(
+                Pair("Any", ""),
+                Pair("Naruto", "/category/franchise/naruto"),
+                Pair("Dragon Ball", "/category/franchise/dragon-ball"),
+                Pair("Pokemon", "/category/franchise/pokemon"),
+                Pair("Ben 10", "/category/franchise/ben-10"),
+                Pair("Beyblade", "/category/franchise/beyblade"),
+                Pair("Doraemon", "/category/franchise/doraemon"),
+                Pair("Shinchan", "/category/franchise/shinchan"),
+                Pair("Transformers", "/category/franchise/transformers"),
+            ),
+        )
 
-    private fun getStatusesList() = listOf(
-        StringQuery("Any", "all"),
-        StringQuery("Currently Airing", "airing"),
-        StringQuery("Finished Airing", "completed"),
-    )
+    private class GenreFilter :
+        UriPartFilter(
+            "Genre",
+            arrayOf(
+                Pair("Any", ""),
+                Pair("Action", "/category/genre/action"),
+                Pair("Adventure", "/category/genre/adventure"),
+                Pair("Animation", "/category/genre/animation"),
+                Pair("Comedy", "/category/genre/comedy"),
+                Pair("Drama", "/category/genre/drama"),
+                Pair("Fantasy", "/category/genre/fantasy"),
+                Pair("Isekai", "/category/genre/isekai"),
+                Pair("Martial Arts", "/category/genre/martial-arts"),
+                Pair("Mystery", "/category/genre/mystery"),
+                Pair("Romance", "/category/genre/romance"),
+                Pair("Sci-Fi", "/category/genre/sci-fi"),
+                Pair("Shounen", "/category/genre/shounen"),
+                Pair("Supernatural", "/category/genre/supernatural"),
+                Pair("Thriller", "/category/genre/thriller"),
+            ),
+        )
 
-    private class StyleList(styles: Array<String>) : AnimeFilter.Select<String>("Style", styles)
-    private val stylesName = getStyleList().map {
-        it.name
-    }.toTypedArray()
+    private open class UriPartFilter(
+        displayName: String,
+        val vals: Array<Pair<String, String>>,
+    ) : AnimeFilter.Select<String>(displayName, vals.map { it.first }.toTypedArray()) {
+        fun toUriPart() = vals[state].second
+    }
 
-    private fun getStyleList() = listOf(
-        StringQuery("Any", "all"),
-        StringQuery("Anime", "anime"),
-        StringQuery("Cartoon", "cartoon"),
-    )
+    val filters: AnimeFilterList
+        get() = AnimeFilterList(
+            AnimeFilter.Header("Note: Text search ignores browse filters"),
+            SectionFilter(),
+            LanguageFilter(),
+            NetworkFilter(),
+            FranchiseFilter(),
+            GenreFilter(),
+        )
 
-    private class YearList(years: Array<String>) : AnimeFilter.Select<String>("Year", years)
-    private val yearsName = getYearList().map {
-        it.name
-    }.toTypedArray()
+    fun resolveFilterPath(filters: AnimeFilterList, defaultLangSlug: String): String {
+        val network = filters.filterIsInstance<NetworkFilter>().firstOrNull()?.toUriPart().orEmpty()
+        if (network.isNotEmpty()) return network
 
-    private fun getYearList() = listOf(
-        StringQuery("Any", "all"),
-        StringQuery("2025", "2025"),
-        StringQuery("2024", "2024"),
-        StringQuery("2023", "2023"),
-        StringQuery("2022", "2022"),
-        StringQuery("2021", "2021"),
-        StringQuery("2020", "2020"),
-        StringQuery("2019", "2019"),
-        StringQuery("2018", "2018"),
-        StringQuery("2017", "2017"),
-        StringQuery("2016", "2016"),
-        StringQuery("2015", "2015"),
-        StringQuery("2014", "2014"),
-        StringQuery("2013", "2013"),
-        StringQuery("2012", "2012"),
-        StringQuery("2011", "2011"),
-        StringQuery("2010", "2010"),
-        StringQuery("2009", "2009"),
-        StringQuery("2008", "2008"),
-        StringQuery("2007", "2007"),
-        StringQuery("2006", "2006"),
-        StringQuery("2005", "2005"),
-        StringQuery("2004", "2004"),
-        StringQuery("2003", "2003"),
-        StringQuery("2002", "2002"),
-        StringQuery("2001", "2001"),
-        StringQuery("2000", "2000"),
-        StringQuery("1999", "1999"),
-        StringQuery("1998", "1998"),
-        StringQuery("1997", "1997"),
-        StringQuery("1996", "1996"),
-        StringQuery("1995", "1995"),
-        StringQuery("1994", "1994"),
-        StringQuery("1993", "1993"),
-        StringQuery("1992", "1992"),
-        StringQuery("1991", "1991"),
-        StringQuery("1990", "1990"),
-    )
+        val franchise = filters.filterIsInstance<FranchiseFilter>().firstOrNull()?.toUriPart().orEmpty()
+        if (franchise.isNotEmpty()) return franchise
 
-    private class SortList(sorts: Array<String>) : AnimeFilter.Select<String>("Sort", sorts)
-    private val sortsName = getSortList().map {
-        it.name
-    }.toTypedArray()
+        val genre = filters.filterIsInstance<GenreFilter>().firstOrNull()?.toUriPart().orEmpty()
+        if (genre.isNotEmpty()) return genre
 
-    private fun getSortList() = listOf(
-        StringQuery("Default", "default"),
-        StringQuery("Ascending", "title_a_z"),
-        StringQuery("Descending", "title_z_a"),
-        StringQuery("Updated", "update"),
-        StringQuery("Published", "date"),
-        StringQuery("Most Viewed", "viewed"),
-        StringQuery("Favourite", "favorite"),
-    )
-
-    internal class Genre(val id: String) : AnimeFilter.CheckBox(id)
-    private class GenreList(genres: List<Genre>) : AnimeFilter.Group<Genre>("Genres", genres)
-    private fun genresName() = listOf(
-        Genre("Action"),
-        Genre("Adult Cast"),
-        Genre("Adventure"),
-        Genre("Animation"),
-        Genre("Comedy"),
-        Genre("Detective"),
-        Genre("Drama"),
-        Genre("Ecchi"),
-        Genre("Family"),
-        Genre("Fantasy"),
-        Genre("Isekai"),
-        Genre("Kids"),
-        Genre("Martial Arts"),
-        Genre("Mecha"),
-        Genre("Military"),
-        Genre("Mystery"),
-        Genre("Otaku Culture"),
-        Genre("Reality"),
-        Genre("Romance"),
-        Genre("School"),
-        Genre("Sci-Fi"),
-        Genre("Seinen"),
-        Genre("Shounen"),
-        Genre("Slice of Life"),
-        Genre("Sports"),
-        Genre("Super Power"),
-        Genre("SuperHero"),
-        Genre("Supernatural"),
-        Genre("TV Movie"),
-    )
-
-    val filters: AnimeFilterList get() = AnimeFilterList(
-        TypeList(typesName),
-        StatusList(statusesName),
-        StyleList(stylesName),
-        YearList(yearsName),
-        SortList(sortsName),
-        GenreList(genresName()),
-    )
-
-    fun getSearchParams(filters: AnimeFilterList): String = "&" + filters.mapNotNull { filter ->
-        when (filter) {
-            is TypeList -> {
-                val type = getTypeList()[filter.state].query
-                "s_type=$type"
-            }
-
-            is StatusList -> {
-                val status = getStatusesList()[filter.state].query
-                "s_status=$status"
-            }
-
-            is StyleList -> {
-                val style = getStyleList()[filter.state].query
-                "s_sub_type=$style"
-            }
-
-            is YearList -> {
-                val year = getYearList()[filter.state].query
-                "s_year=$year"
-            }
-
-            is SortList -> {
-                val sort = getSortList()[filter.state].query
-                "s_orderby=$sort"
-            }
-
-            is GenreList -> {
-                "s_genre=" + filter.state.filter { it.state }
-                    .joinToString("%2C") {
-                        val genre = it.id.replace(" ", "-")
-                        "$genre%2C"
-                    }
-            }
-
-            else -> null
+        val langPath = filters.filterIsInstance<LanguageFilter>().firstOrNull()?.toUriPart().orEmpty()
+        if (langPath == "__all__") {
+            return filters.filterIsInstance<SectionFilter>().firstOrNull()?.toUriPart() ?: "/series"
         }
-    }.joinToString("&")
+        if (langPath.isNotEmpty()) return langPath
+
+        val section = filters.filterIsInstance<SectionFilter>().firstOrNull()?.toUriPart() ?: "/series"
+        if (section != "/series") return section
+
+        return if (defaultLangSlug.isNotBlank()) {
+            "/category/language/$defaultLangSlug"
+        } else {
+            "/series"
+        }
+    }
 }
