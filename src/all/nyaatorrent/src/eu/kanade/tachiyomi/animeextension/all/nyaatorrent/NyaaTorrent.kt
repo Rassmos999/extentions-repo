@@ -19,6 +19,7 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -35,7 +36,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override val name = extName
 
     override val baseUrl by lazy {
-        preferences.getString(PREF_DOMAIN_KEY, extURL)?.trim().takeIf { it?.isNotEmpty() ?: false } ?: extURL
+        preferences.getString(PREF_DOMAIN_KEY, extURL)?.trim()?.trimEnd('/').takeIf { !it.isNullOrEmpty() } ?: extURL.trimEnd('/')
     }
 
     override val lang = "all"
@@ -80,26 +81,32 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
 
     // =============================== Search ===============================
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        if (query.startsWith("https://")) {
-            val url = query.toHttpUrl()
+        val url = query.toHttpUrlOrNull()
+        if (url != null) {
             if (url.host != baseUrl.toHttpUrl().host) {
                 throw Exception("Unsupported url")
             }
-            val id = url.pathSegments.getOrNull(1)
+            val segments = url.pathSegments
+            val id = segments.getOrNull(1)
+                ?.takeIf { segments.firstOrNull() == "view" && it.isNotEmpty() }
                 ?: throw Exception("Unsupported url")
             return getSearchAnime(page, "$PREFIX_SEARCH$id", filters)
         }
         if (query.startsWith(PREFIX_SEARCH)) {
-            val id = query.removePrefix(PREFIX_SEARCH)
+            val id = query.removePrefix(PREFIX_SEARCH).trim()
             return client.newCall(GET("$baseUrl/view/$id"))
                 .awaitSuccess()
-                .use(::searchAnimeByIdParse)
+                .use { searchAnimeByIdParse(it, id) }
         }
         return super.getSearchAnime(page, query, filters)
     }
 
-    private fun searchAnimeByIdParse(response: Response): AnimesPage {
-        val details = animeDetailsParse(response.use { it.asJsoup() })
+    private fun searchAnimeByIdParse(response: Response, id: String): AnimesPage {
+        val document = response.asJsoup()
+        val details = animeDetailsParse(document).apply {
+            url = "/view/$id"
+            title = document.selectFirst("h3.panel-title")?.text().orEmpty()
+        }
         return AnimesPage(listOf(details), false)
     }
 
@@ -290,6 +297,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         listOf(
             Category("Anime", "1_1"),
             Category("Real Life", "2_2"),
+            Category("All", "0_0"),
         )
     }
 

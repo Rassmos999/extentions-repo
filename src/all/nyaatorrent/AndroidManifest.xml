@@ -17,6 +17,10 @@
                     android:host="nyaa.si"
                     android:pathPattern="/view/..*"
                     android:scheme="https" />
+                <data
+                    android:host="sukebei.nyaa.si"
+                    android:pathPattern="/view/..*"
+                    android:scheme="https" />
             </intent-filter>
         </activity>
     </application>

@@ -1,7 +1,7 @@
 ext {
     extName = 'PTorrent (Torrent)'
     extClass = '.PTorrent'
-    extVersionCode = 17
+    extVersionCode = 18
     isTorrent = true
     isNsfw = true
 }

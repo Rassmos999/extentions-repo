@@ -26,6 +26,7 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.toJsonBody
 import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import uy.kohesive.injekt.injectLazy
@@ -193,29 +194,41 @@ class Torrentio :
 
     // =============================== Search ===============================
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        if (query.startsWith("https://")) {
-            val url = query.toHttpUrl()
-            if (url.host != baseUrl.toHttpUrl().host) {
-                throw Exception("Unsupported url")
-            }
-            val id = url.pathSegments.getOrNull(1)
+        val url = query.toHttpUrlOrNull()
+        if (url != null && url.host == baseUrl.toHttpUrl().host) {
+            val segments = url.pathSegments
+            val id = segments.getOrNull(1)
+                ?.takeIf { segments.firstOrNull() == "anime" && it.isNotEmpty() }
                 ?: throw Exception("Unsupported url")
-            return getSearchAnime(page, "${PREFIX_SEARCH}$id", filters)
+            return getSearchAnime(page, "$PREFIX_SEARCH$id", filters)
         }
 
         if (query.startsWith(PREFIX_SEARCH)) {
-            val id = query.removePrefix(PREFIX_SEARCH)
-            return client.newCall(GET("$baseUrl/anime/$id"))
-                .awaitSuccess()
-                .use(::searchAnimeByIdParse)
+            val id = query.removePrefix(PREFIX_SEARCH).trim()
+            if (id.isNotEmpty()) {
+                for (type in listOf("series", "movie")) {
+                    val meta = runCatching {
+                        client.newCall(GET("https://cinemeta-live.strem.io/meta/$type/$id.json"))
+                            .awaitSuccess()
+                            .use { json.decodeFromString<EpisodeList>(it.body.string()) }
+                            .meta
+                    }.getOrNull()
+                    if (meta != null && (meta.id != null || meta.name != null)) {
+                        val anime = SAnime.create().apply {
+                            this.url = "${meta.id ?: id},${meta.type ?: type},"
+                            title = meta.name ?: id
+                            thumbnail_url = meta.poster
+                            description = meta.description ?: ""
+                            initialized = true
+                        }
+                        return AnimesPage(listOf(anime), false)
+                    }
+                }
+            }
+            return AnimesPage(emptyList(), false)
         }
 
         return super.getSearchAnime(page, query, filters)
-    }
-
-    private fun searchAnimeByIdParse(response: Response): AnimesPage {
-        val details = animeDetailsParse(response)
-        return AnimesPage(listOf(details), false)
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
@@ -283,11 +296,14 @@ class Torrentio :
             }
         """.trimIndent()
 
+        val fullPath = anime.url.split(',').last()
+        if (fullPath.isBlank()) return anime
+
         val country = preferences.getString(PREF_REGION_KEY, PREF_REGION_DEFAULT)
         val language = preferences.getString(PREF_JW_LANG_KEY, PREF_JW_LANG_DEFAULT)
         val variables = """
             {
-              "fullPath": "${anime.url.split(',').last()}",
+              "fullPath": "$fullPath",
               "country": "$country",
               "language": "$language"
             }
@@ -295,13 +311,17 @@ class Torrentio :
 
         val content = runCatching {
             json.decodeFromString<GetUrlTitleDetailsResponse>(client.newCall(makeGraphQLRequest(query, variables)).execute().body.string())
-        }.getOrNull()?.data?.urlV2?.node?.content
+        }.getOrNull()?.data?.urlV2?.node?.content ?: return anime
 
-        anime.title = content?.title ?: ""
-        anime.thumbnail_url = "https://images.justwatch.com${content?.posterUrl?.replace("{profile}", "s718")?.replace("{format}", "webp")}"
-        anime.description = content?.shortDescription ?: ""
-        val genresList = content?.genres?.mapNotNull { it.translation }.orEmpty()
-        anime.genre = genresList.joinToString()
+        content.title?.let { anime.title = it }
+        content.posterUrl?.let {
+            anime.thumbnail_url = "https://images.justwatch.com${it.replace("{profile}", "s718").replace("{format}", "webp")}"
+        }
+        content.shortDescription?.let { anime.description = it }
+        val genresList = content.genres?.mapNotNull { it.translation }.orEmpty()
+        if (genresList.isNotEmpty()) {
+            anime.genre = genresList.joinToString()
+        }
 
         return anime
     }
@@ -467,16 +487,15 @@ class Torrentio :
         )
     }
 
-    private fun fetchTrackers(): String {
+    private fun fetchTrackers(): String = runCatching {
         val request = Request.Builder()
             .url("https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt")
             .build()
 
         client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw Exception("Unexpected code $response")
-            return response.body.string().trim()
+            if (!response.isSuccessful) "" else response.body.string().trim()
         }
-    }
+    }.getOrDefault("")
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         // Debrid provider

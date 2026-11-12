@@ -9,6 +9,7 @@ import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animeextension.all.torrentioanime.dto.AniZipResponse
+import eu.kanade.tachiyomi.animeextension.all.torrentioanime.dto.AnilistMedia
 import eu.kanade.tachiyomi.animeextension.all.torrentioanime.dto.AnilistMeta
 import eu.kanade.tachiyomi.animeextension.all.torrentioanime.dto.AnilistMetaLatest
 import eu.kanade.tachiyomi.animeextension.all.torrentioanime.dto.DetailsById
@@ -35,6 +36,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
@@ -172,29 +174,28 @@ class Torrentio :
 
     // =============================== Search ===============================
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        if (query.startsWith("https://")) {
-            val url = query.toHttpUrl()
-            if (url.host != baseUrl.toHttpUrl().host) {
-                throw Exception("Unsupported url")
-            }
-            val id = url.pathSegments.getOrNull(1)
+        val queryUrl = query.toHttpUrlOrNull()
+        if (queryUrl != null && queryUrl.host == baseUrl.toHttpUrl().host) {
+            val segments = queryUrl.pathSegments
+            val id = segments.getOrNull(1)
+                ?.takeIf { segments.firstOrNull() == "anime" && it.isNotEmpty() }
                 ?: throw Exception("Unsupported url")
-            return getSearchAnime(page, "${PREFIX_SEARCH}$id", filters)
+            return getSearchAnime(page, "$PREFIX_SEARCH$id", filters)
         }
 
         if (query.startsWith(PREFIX_SEARCH)) {
-            val id = query.removePrefix(PREFIX_SEARCH)
-            return client.newCall(GET("$baseUrl/anime/$id"))
-                .awaitSuccess()
-                .use(::searchAnimeByIdParse)
+            val id = query.removePrefix(PREFIX_SEARCH).trim()
+            val numericId = id.toIntOrNull() ?: return AnimesPage(emptyList(), false)
+            val metaData = fetchAnilistMedia(numericId.toString()) ?: return AnimesPage(emptyList(), false)
+            val anime = SAnime.create().apply {
+                url = id
+                applyAnilistDetails(metaData)
+                initialized = true
+            }
+            return AnimesPage(listOf(anime), false)
         }
 
         return super.getSearchAnime(page, query, filters)
-    }
-
-    private fun searchAnimeByIdParse(response: Response): AnimesPage {
-        val details = animeDetailsParse(response)
-        return AnimesPage(listOf(details), false)
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
@@ -252,14 +253,15 @@ class Torrentio :
 
     override fun animeDetailsParse(response: Response): SAnime = throw UnsupportedOperationException()
 
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
-        val variables = """{"id": ${anime.url}}"""
-
-        val metaData = runCatching {
+    private suspend fun fetchAnilistMedia(id: String): AnilistMedia? {
+        val variables = """{"id": $id}"""
+        return runCatching {
             json.decodeFromString<DetailsById>(client.newCall(makeGraphQLRequest(getDetailsQuery(), variables)).awaitSuccess().bodyString())
         }.getOrNull()?.data?.media
+    }
 
-        anime.title = metaData?.title?.let { title ->
+    private fun SAnime.applyAnilistDetails(metaData: AnilistMedia): SAnime {
+        title = metaData.title?.let { title ->
             when (preferences.getString(PREF_TITLE_KEY, "romaji")) {
                 "romaji" -> title.romaji
                 "english" -> (metaData.title.english?.takeIf { it.isNotBlank() } ?: metaData.title.romaji).toString()
@@ -268,11 +270,11 @@ class Torrentio :
             }
         } ?: ""
 
-        anime.thumbnail_url = metaData?.coverImage?.extraLarge
+        thumbnail_url = metaData.coverImage?.extraLarge
 
-        anime.description = buildString {
+        description = buildString {
             append(
-                metaData?.description?.let {
+                metaData.description?.let {
                     Jsoup.parseBodyFragment(
                         it.replace("<br>\n", "br2n")
                             .replace("<br>", "br2n")
@@ -281,14 +283,14 @@ class Torrentio :
                 },
             )
             append("\n\n")
-            if (!(metaData?.season == null && metaData?.seasonYear == null)) {
-                append("Release: ${ metaData.season ?: ""} ${ metaData.seasonYear ?: ""}")
+            if (!(metaData.season == null && metaData.seasonYear == null)) {
+                append("Release: ${metaData.season ?: ""} ${metaData.seasonYear ?: ""}")
             }
-            metaData?.format?.let { append("\nType: ${metaData.format}") }
-            metaData?.episodes?.let { append("\nTotal Episode Count: ${metaData.episodes}") }
+            metaData.format?.let { append("\nType: ${metaData.format}") }
+            metaData.episodes?.let { append("\nTotal Episode Count: ${metaData.episodes}") }
         }.trim()
 
-        anime.status = when (metaData?.status) {
+        status = when (metaData.status) {
             "RELEASING" -> SAnime.ONGOING
             "FINISHED" -> SAnime.COMPLETED
             "HIATUS" -> SAnime.ON_HIATUS
@@ -297,14 +299,19 @@ class Torrentio :
         }
 
         // Extracting tags, genres, and studios
-        val tagsList = metaData?.tags?.mapNotNull { it.name } ?: emptyList()
-        val genresList = metaData?.genres ?: emptyList()
-        val studiosList = metaData?.studios?.nodes?.mapNotNull { it.name } ?: emptyList()
+        val tagsList = metaData.tags?.mapNotNull { it.name } ?: emptyList()
+        val genresList = metaData.genres ?: emptyList()
+        val studiosList = metaData.studios?.nodes?.mapNotNull { it.name } ?: emptyList()
 
-        anime.genre = (tagsList + genresList).toSet().sorted().joinToString()
-        anime.author = studiosList.sorted().joinToString()
+        genre = (tagsList + genresList).toSet().sorted().joinToString()
+        author = studiosList.sorted().joinToString()
 
-        return anime
+        return this
+    }
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
+        val metaData = fetchAnilistMedia(anime.url) ?: return anime
+        return anime.applyAnilistDetails(metaData)
     }
 
     // ============================== Episodes ==============================
@@ -489,16 +496,15 @@ class Torrentio :
         else -> "other"
     }
 
-    private fun fetchTrackers(): String {
+    private fun fetchTrackers(): String = runCatching {
         val request = Request.Builder()
             .url("https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt")
             .build()
 
         client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw Exception("Unexpected code $response")
-            return response.body.string().trim()
+            if (!response.isSuccessful) "" else response.body.string().trim()
         }
-    }
+    }.getOrDefault("")
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         // Debrid provider

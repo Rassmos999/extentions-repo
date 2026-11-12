@@ -18,6 +18,7 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -79,22 +80,34 @@ class PTorrent :
 
     // =============================== Search ===============================
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        if (query.startsWith("https://")) {
-            val url = query.toHttpUrl()
-            if (url.host != baseUrl.toHttpUrl().host) {
-                throw Exception("Unsupported url")
-            }
-            return client.newCall(GET(query))
+        val url = query.toHttpUrlOrNull()
+        if (url != null && url.host.removePrefix("www.") == baseUrl.toHttpUrl().host.removePrefix("www.")) {
+            val path = url.encodedPath
+            if (!path.endsWith(".html")) throw Exception("Unsupported url")
+            return client.newCall(GET(baseUrl + path, headers))
                 .awaitSuccess()
-                .use(::searchAnimeByIdParse)
+                .use { searchAnimeByUrlParse(it, path) }
         }
 
         return super.getSearchAnime(page, query, filters)
     }
 
-    private fun searchAnimeByIdParse(response: Response): AnimesPage {
-        val details = animeDetailsParse(response.use { it.asJsoup() })
-        return AnimesPage(listOf(details), false)
+    private fun searchAnimeByUrlParse(response: Response, path: String): AnimesPage {
+        val document = response.asJsoup()
+        val anime = animeDetailsParse(document).apply {
+            url = path
+            title = document.selectFirst("h1")?.text().orEmpty()
+            thumbnail_url = document.selectFirst("div.categories ~ img")?.absUrl("src")?.toListingThumbnail()
+        }
+        return AnimesPage(listOf(anime), false)
+    }
+
+    // ".../pic/<yyyymm>/<dd>/<name>.<ext>" -> the listing's "$baseUrl/mini/<yyyymm>/<name>-500.<ext>"
+    private fun String.toListingThumbnail(): String {
+        val segments = toHttpUrlOrNull()?.pathSegments ?: return this
+        if (segments.size != 4 || segments[0] != "pic" || '.' !in segments[3]) return this
+        val file = segments[3]
+        return "$baseUrl/mini/${segments[1]}/${file.substringBeforeLast('.')}-500.${file.substringAfterLast('.')}"
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
@@ -238,24 +251,24 @@ class PTorrent :
     }.toTypedArray()
     private fun getCategory(): List<Category> = listOf(
         Category("Home", "0"),
-        Category("3D and VR Movies", "3D%20and%20VR%20Movies"),
-        Category("Adult Anime and Game", "Adult%20Anime%20and%20Game"),
+        Category("3D and VR Movies", "3D and VR Movies"),
+        Category("Adult Anime and Game", "Adult Anime and Game"),
         Category("Anime", "Anime"),
         Category("BDSM", "BDSM"),
         Category("Bisexual", "Bisexual"),
         Category("Bukkake", "Bukkake"),
-        Category("Chinese Movie", "Chinese%20Movie"),
-        Category("Erotic Picture Gallery", "Erotic%20Picture%20Gallery"),
-        Category("Erotic Softcore Movies", "Erotic%20Softcore%20Movies"),
-        Category("Femdom and Strapon", "Femdom%20and%20Strapon"),
+        Category("Chinese Movie", "Chinese Movie"),
+        Category("Erotic Picture Gallery", "Erotic Picture Gallery"),
+        Category("Erotic Softcore Movies", "Erotic Softcore Movies"),
+        Category("Femdom and Strapon", "Femdom and Strapon"),
         Category("Fetish", "Fetish"),
-        Category("Fisting and Dildo", "Fisting%20and%20Dildo"),
+        Category("Fisting and Dildo", "Fisting and Dildo"),
         Category("Game", "Game"),
-        Category("Japanese Movie", "Japanese%20Movie"),
+        Category("Japanese Movie", "Japanese Movie"),
         Category("Peeing", "Peeing"),
-        Category("Porn Movies", "Porn%20Movies"),
+        Category("Porn Movies", "Porn Movies"),
         Category("Pregnant", "Pregnant"),
-        Category("Special Porn Movies", "Special%20Porn%20Movies"),
+        Category("Special Porn Movies", "Special Porn Movies"),
         Category("Transsexual", "Transsexual"),
         Category("Voyeur", "Voyeur"),
     )

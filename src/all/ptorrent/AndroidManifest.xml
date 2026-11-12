@@ -17,6 +17,10 @@
                     android:host="www.ptorrents.com"
                     android:pathPattern="/..*\\.html"
                     android:scheme="https" />
+                <data
+                    android:host="ptorrents.com"
+                    android:pathPattern="/..*\\.html"
+                    android:scheme="https" />
             </intent-filter>
         </activity>
     </application>

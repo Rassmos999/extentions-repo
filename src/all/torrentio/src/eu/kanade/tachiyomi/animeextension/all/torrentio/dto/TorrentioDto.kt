@@ -102,6 +102,9 @@ class EpisodeList(
 class EpisodeMeta(
     val id: String? = null,
     val type: String? = null,
+    val name: String? = null,
+    val poster: String? = null,
+    val description: String? = null,
     val videos: List<EpisodeVideo>? = null,
 )
 

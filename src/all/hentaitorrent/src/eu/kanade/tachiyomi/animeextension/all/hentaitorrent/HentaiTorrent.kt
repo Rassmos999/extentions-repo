@@ -18,6 +18,7 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -93,21 +94,33 @@ class HentaiTorrent :
 
     // =============================== Search ===============================
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        if (query.startsWith("https://")) {
-            val url = query.toHttpUrl()
-            if (url.host != baseUrl.toHttpUrl().host) {
-                throw Exception("Unsupported url")
-            }
-            return client.newCall(GET(query))
+        val url = query.toHttpUrlOrNull()
+        if (url != null && url.host.removePrefix("www.") == baseUrl.toHttpUrl().host.removePrefix("www.")) {
+            val path = url.encodedPath
+            if (!path.endsWith(".html")) throw Exception("Unsupported url")
+            return client.newCall(GET(baseUrl + path, headers))
                 .awaitSuccess()
-                .use(::searchAnimeByIdParse)
+                .use { searchAnimeByUrlParse(it, path) }
         }
         return super.getSearchAnime(page, query, filters)
     }
 
-    private fun searchAnimeByIdParse(response: Response): AnimesPage {
-        val details = animeDetailsParse(response.use { it.asJsoup() })
-        return AnimesPage(listOf(details), false)
+    private fun searchAnimeByUrlParse(response: Response, path: String): AnimesPage {
+        val document = response.asJsoup()
+        val anime = animeDetailsParse(document).apply {
+            url = path
+            title = document.selectFirst("h1")?.text().orEmpty()
+            thumbnail_url = document.selectFirst("div.categories ~ img")?.absUrl("src")?.toListingThumbnail()
+        }
+        return AnimesPage(listOf(anime), false)
+    }
+
+    // ".../pic/<yyyymm>/<dd>/<name>.<ext>" -> the listing's "$baseUrl/mini/<yyyymm>/<name>-500.<ext>"
+    private fun String.toListingThumbnail(): String {
+        val segments = toHttpUrlOrNull()?.pathSegments ?: return this
+        if (segments.size != 4 || segments[0] != "pic" || '.' !in segments[3]) return this
+        val file = segments[3]
+        return "$baseUrl/mini/${segments[1]}/${file.substringBeforeLast('.')}-500.${file.substringAfterLast('.')}"
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
@@ -287,10 +300,10 @@ class HentaiTorrent :
     private fun getCategory(): List<Category> = listOf(
         Category("Home", "0"),
         Category("Cartoons", "Cartoons"),
-        Category("2D video Hentai", "2D%20video%20Hentai"),
-        Category("3D video Hentai", "3D%20video%20Hentai"),
-        Category("Hentai DVD HD", "Hentai%20DVD%20HD"),
-        Category("Main Subsection Hentai", "Main%20Subsection%20Hentai"),
+        Category("2D video Hentai", "2D video Hentai"),
+        Category("3D video Hentai", "3D video Hentai"),
+        Category("Hentai DVD HD", "Hentai DVD HD"),
+        Category("Main Subsection Hentai", "Main Subsection Hentai"),
     )
 
     companion object {
