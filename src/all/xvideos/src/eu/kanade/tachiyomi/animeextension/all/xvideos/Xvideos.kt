@@ -110,7 +110,9 @@ class Xvideos :
 
     override fun popularAnimeNextPageSelector(): String = "a.next-page:not(.disabled), a.no-page.next-page:not(.disabled), " +
         "div.pagination a.next:not(.disabled), a.dir.next:not(.disabled), div.pagination .current + a, " +
-        "div.pagination li.current + li a, a.pagination-next:not(.disabled), a.page-next:not(.disabled), " +
+        "div.pagination li.current + li a, div.pagination li:has(a.active) + li a, " +
+        "div.pagination li.active + li a, div.pagination .active + a, " +
+        "a.pagination-next:not(.disabled), a.page-next:not(.disabled), " +
         ".pagination a[rel=next]:not(.disabled), a[rel=next]:not(.disabled)"
 
     override fun popularAnimeParse(response: Response): AnimesPage {
@@ -170,6 +172,12 @@ class Xvideos :
                 searchUrl(brand, pageIndex, sort, datef, durf, quality, typef = "channel")
             }
 
+            category.isNotBlank() && hasQueryFilters -> {
+                val catName = category.substringBeforeLast("-").replace("_", " ")
+                val combined = if (tag.isNotBlank()) "$catName $tag" else catName
+                searchUrl(combined, pageIndex, sort, datef, durf, quality, typef = null)
+            }
+
             category.isNotBlank() -> {
                 // Category path: /c/{Name-id}[/pageIndex] — site ignores sort/datef/durf here
                 val path = if (pageIndex == 0) {
@@ -178,6 +186,10 @@ class Xvideos :
                     "/c/$category/$pageIndex"
                 }
                 GET("$baseUrl$path", searchHeaders())
+            }
+
+            tag.isNotBlank() && hasQueryFilters -> {
+                searchUrl(tag, pageIndex, sort, datef, durf, quality, typef = null)
             }
 
             tag.isNotBlank() -> {

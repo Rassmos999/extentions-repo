@@ -73,7 +73,7 @@ class MissAV :
         PlaylistUtils(client, docHeaders)
     }
 
-    private fun popularAnimeNextPageSelector() = "a[rel=next], a[aria-label*=Next], a.next, div.pagination a.next, div.pagination span.current + a, button[aria-label*=Next], a:contains(Next)"
+    private fun popularAnimeNextPageSelector() = "a[rel=next], a[aria-label*=Next], a.next, div.pagination a.next, div.pagination span.current + a, div.pagination li:has(a.active) + li a, div.pagination li.active + li a, button[aria-label*=Next], a:contains(Next)"
 
     override fun popularAnimeRequest(page: Int) = GET("$baseUrl/en/today-hot?page=$page", docHeaders)
 
@@ -284,23 +284,34 @@ class MissAV :
             ?: extractMasterPlaylist(packedScript)
             ?: return emptyList()
 
-        val masterHost = masterPlaylist.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}/" } ?: "$baseUrl/"
-        val hlsHeaders = headers.newBuilder().apply {
-            set("Accept", "*/*")
-            set("Accept-Language", "en-US,en;q=0.9")
-            set("Origin", masterHost.removeSuffix("/"))
-            set("Referer", masterHost)
-            if (!cookie.isNullOrBlank()) {
-                set("Cookie", cookie)
-            }
-        }.build()
+        // surrit.com hotlink-checks Referer/Origin against official MissAV site origins (rejects own CDN host and missav.fans).
+        val siteOrigin = baseUrl.removeSuffix("/").let { origin ->
+            if (origin.contains("missav.fans", ignoreCase = true)) STREAM_REFERER_FALLBACK else origin
+        }
+        val candidates = listOf(siteOrigin, STREAM_REFERER_FALLBACK).distinct()
+        for (origin in candidates) {
+            val referer = "$origin/"
+            val hlsHeaders = headers.newBuilder().apply {
+                set("Accept", "*/*")
+                set("Accept-Language", "en-US,en;q=0.9")
+                set("Origin", origin)
+                set("Referer", referer)
+                if (!cookie.isNullOrBlank()) {
+                    set("Cookie", cookie)
+                }
+            }.build()
 
-        return playlistExtractor.extractFromHls(
-            masterPlaylist,
-            referer = masterHost,
-            masterHeaders = hlsHeaders,
-            videoHeaders = hlsHeaders,
-        )
+            val extracted = runCatching {
+                playlistExtractor.extractFromHls(
+                    masterPlaylist,
+                    referer = referer,
+                    masterHeaders = hlsHeaders,
+                    videoHeaders = hlsHeaders,
+                )
+            }.getOrDefault(emptyList())
+            if (extracted.isNotEmpty()) return extracted
+        }
+        return emptyList()
     }
 
     /**
@@ -381,15 +392,17 @@ class MissAV :
         private const val PREF_DOMAIN_KEY = "preferred_domain"
         private const val PREF_DOMAIN_TITLE = "Preferred domain (requires app restart)"
 
-        // missav.fans is currently reachable without a CF interstitial; keep legacy hosts as prefs
-        // for installs that can clear CF in-app.
+        // missav.live and missav123.com are reachable without CF and whitelisted by surrit.com;
+        // keep legacy hosts as prefs for installs that need another mirror or WebView CF clearance.
         private val PREF_DOMAIN_ENTRIES = listOf(
-            "https://missav.fans",
             "https://missav.live",
+            "https://missav123.com",
             "https://missav.ai",
             "https://missav.ws",
+            "https://missav.fans",
         )
         private val PREF_DOMAIN_DEFAULT = PREF_DOMAIN_ENTRIES.first()
+        private const val STREAM_REFERER_FALLBACK = "https://missav.live"
 
         private const val PREF_QUALITY = "preferred_quality"
         private const val PREF_QUALITY_TITLE = "Preferred quality"

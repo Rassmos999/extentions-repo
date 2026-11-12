@@ -95,12 +95,6 @@ class JavDB :
 
     private val missAvUrl get() = preferences.getString(PREF_MISSAV_KEY, PREF_MISSAV_DEFAULT)!!
 
-    private val missAvHeaders
-        get() = headersBuilder()
-            .set("Referer", "$missAvUrl/")
-            .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .build()
-
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
 
     // ============================== Popular ===============================
@@ -331,8 +325,26 @@ class JavDB :
     }
 
     private suspend fun missAvVideos(slug: String, label: String, code: String): List<Video> {
-        val response = client.newCall(GET("$missAvUrl/en/$slug", missAvHeaders)).await()
-        val document = response.use { if (it.isSuccessful) it.asJsoup() else return emptyList() }
+        val hosts = listOf(missAvUrl.removeSuffix("/"), STREAM_MIRROR_DEFAULT, STREAM_MIRROR_ALT).distinct()
+        var document: Document? = null
+        var activeOrigin = missAvUrl.removeSuffix("/")
+        for (host in hosts) {
+            val reqHeaders = headersBuilder()
+                .set("Referer", "$host/")
+                .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .build()
+            val doc = runCatching {
+                client.newCall(GET("$host/en/$slug", reqHeaders)).await().use {
+                    if (it.isSuccessful) it.asJsoup() else null
+                }
+            }.getOrNull()
+            if (doc != null) {
+                document = doc
+                activeOrigin = host
+                break
+            }
+        }
+        if (document == null) return emptyList()
 
         // MissAV falls back to a search/recommendation page for unknown slugs.
         val pageTitle = document.selectFirst("meta[property=og:title]")?.attr("content") ?: document.title()
@@ -346,20 +358,28 @@ class JavDB :
             ?: M3U8_URL_REGEX.findAll(unpacked).map { it.value }.let { all -> all.firstOrNull { "playlist.m3u8" in it } ?: all.firstOrNull() }
             ?: return emptyList()
 
-        val masterUrl = master.toHttpUrl()
-        val origin = "${masterUrl.scheme}://${masterUrl.host}"
-        val hlsHeaders = headersBuilder()
-            .set("Accept", "*/*")
-            .set("Origin", origin)
-            .set("Referer", "$origin/")
-            .build()
-        return playlistUtils.extractFromHls(
-            master,
-            referer = "$origin/",
-            masterHeaders = hlsHeaders,
-            videoHeaders = hlsHeaders,
-            videoNameGen = { "$label - $it" },
-        )
+        // surrit.com hotlink-checks Referer/Origin against official MissAV site origins (rejects CDN host and missav.fans).
+        val streamOrigin = if (activeOrigin.contains("missav.fans", ignoreCase = true)) STREAM_MIRROR_DEFAULT else activeOrigin
+        val refererCandidates = listOf(streamOrigin, STREAM_MIRROR_DEFAULT).distinct()
+        for (origin in refererCandidates) {
+            val referer = "$origin/"
+            val hlsHeaders = headersBuilder()
+                .set("Accept", "*/*")
+                .set("Origin", origin)
+                .set("Referer", referer)
+                .build()
+            val videos = runCatching {
+                playlistUtils.extractFromHls(
+                    master,
+                    referer = referer,
+                    masterHeaders = hlsHeaders,
+                    videoHeaders = hlsHeaders,
+                    videoNameGen = { "$label - $it" },
+                )
+            }.getOrDefault(emptyList())
+            if (videos.isNotEmpty()) return videos
+        }
+        return emptyList()
     }
 
     private fun magnetVideo(item: Element): Video? {
@@ -474,8 +494,10 @@ class JavDB :
         private const val PREF_VARIANTS_KEY = "pref_missav_variants"
         private const val PREF_VARIANTS_DEFAULT = true
         private const val PREF_MISSAV_KEY = "pref_missav_domain"
-        private val MISSAV_DOMAINS = listOf("https://missav.fans", "https://missav.live", "https://missav.ai", "https://missav.ws")
+        private val MISSAV_DOMAINS = listOf("https://missav.live", "https://missav123.com", "https://missav.ai", "https://missav.ws", "https://missav.fans")
         private val PREF_MISSAV_DEFAULT = MISSAV_DOMAINS.first()
+        private const val STREAM_MIRROR_DEFAULT = "https://missav.live"
+        private const val STREAM_MIRROR_ALT = "https://missav123.com"
         private const val PREF_MAGNETS_KEY = "pref_magnets"
         private const val PREF_MAGNETS_DEFAULT = true
         private const val PREF_QUALITY_KEY = "pref_quality"

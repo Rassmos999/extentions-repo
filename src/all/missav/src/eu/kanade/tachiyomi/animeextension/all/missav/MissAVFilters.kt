@@ -38,7 +38,14 @@ class GenreList :
     companion object {
         val GENRES = listOf(
             Pair("<Select>", ""),
+            Pair("New Releases", "en/release"),
+            Pair("Most Viewed Today", "en/today-hot"),
+            Pair("Most Viewed This Week", "en/weekly-hot"),
+            Pair("Most Viewed This Month", "en/monthly-hot"),
             Pair("Uncensored Leak", "en/uncensored-leak"),
+            Pair("English Subtitle", "en/english-subtitle"),
+            Pair("Chinese Subtitle", "en/chinese-subtitle"),
+            Pair("FC2", "en/fc2"),
             Pair("Hd", "en/genres/Hd"),
             Pair("Exclusive", "en/genres/Exclusive"),
             Pair("Creampie", "en/genres/Creampie"),

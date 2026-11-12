@@ -92,8 +92,12 @@ class Xnxx :
         return anime
     }
 
+    @Volatile
+    private var latestArchivePaths: List<String> = emptyList()
+
     override fun popularAnimeNextPageSelector(): String = "div.pagination a.next, a.dir.next, a.next-page, " +
         "div.pagination a.no-page.next, div.pagination .current + a, div.pagination li.current + li a, " +
+        "div.pagination li:has(a.active) + li a, div.pagination li.active + li a, div.pagination .active + a, " +
         "a.pagination-next, a.page-next, .pagination a[rel=next], a[rel=next]"
 
     override fun popularAnimeParse(response: Response): AnimesPage {
@@ -108,17 +112,15 @@ class Xnxx :
 
     /**
      * Real newest-style listing on free XNXX: `/todays-selection` (curated daily).
-     * Further pages walk day archives: `/todays-selection/yyyy-MM-dd`.
-     * (`/new/` is 404; homepage listings are client-rendered stubs without age gate.)
+     * Further pages walk the exact archive dates published on `/todays-selection`
+     * (`/todays-selection/yyyy-MM-dd` in descending order, avoiding timezone drift)
+     * or fall back to `/todays-selection/{page - 1}`.
      */
-    override fun latestUpdatesRequest(page: Int): Request = if (page <= 1) {
-        GET("$baseUrl/todays-selection", headers)
-    } else {
-        val cal = Calendar.getInstance().apply {
-            add(Calendar.DAY_OF_YEAR, -(page - 1))
-        }
-        val date = DAY_FORMAT.format(cal.time)
-        GET("$baseUrl/todays-selection/$date", headers)
+    override fun latestUpdatesRequest(page: Int): Request {
+        if (page <= 1) return GET("$baseUrl/todays-selection", headers)
+        val archivePath = latestArchivePaths.getOrNull(page - 2)
+        val path = archivePath ?: "/todays-selection/${page - 1}"
+        return GET("$baseUrl$path", headers)
     }
 
     override fun latestUpdatesSelector(): String = popularAnimeSelector()
@@ -129,6 +131,14 @@ class Xnxx :
 
     override fun latestUpdatesParse(response: Response): AnimesPage {
         val document = response.asJsoup()
+        val reqPath = response.request.url.encodedPath.trimEnd('/')
+        if (reqPath == "/todays-selection") {
+            latestArchivePaths = document.select("a[href^=/todays-selection/20]")
+                .map { it.attr("href").substringBefore('?') }
+                .filter { ARCHIVE_DATE_PATH_REGEX.matches(it) }
+                .distinct()
+                .sortedDescending()
+        }
         val animes = document.select(latestUpdatesSelector()).map { latestUpdatesFromElement(it) }
             .filter { it.url.isNotBlank() && it.title.isNotBlank() }
         // Day archives: keep paging while the day returned videos (gaps rare)
@@ -410,7 +420,7 @@ class Xnxx :
     companion object {
         private val QUALITY_REGEX = Regex("""(\d{3,4})""")
         private val MONTH_FORMAT = SimpleDateFormat("yyyy-MM", Locale.US)
-        private val DAY_FORMAT = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        private val ARCHIVE_DATE_PATH_REGEX = Regex("""^/todays-selection/\d{4}-\d{2}-\d{2}$""")
 
         private const val PREF_DOMAIN_KEY = "preferred_domain"
         private const val PREF_DOMAIN_TITLE = "Preferred domain (requires app restart)"

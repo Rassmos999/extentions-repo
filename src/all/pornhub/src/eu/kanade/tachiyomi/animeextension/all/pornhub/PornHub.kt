@@ -169,15 +169,28 @@ class PornHub :
             return GET(url, headers)
         }
 
-        // Keyword search.
+        // Keyword search (`/video/search` 404s on `o=ht` and `o=cm`; omission = Relevance, `mr` = Most Recent).
         if (query.isNotBlank()) {
+            val searchSort = when (sort) {
+                "ht" -> ""
+                "cm" -> "mr"
+                else -> sort
+            }
+            val filterCategory = when (category) {
+                "path:teen" -> "37"
+                "path:babe" -> "5"
+                "path:hentai" -> "36"
+                else -> category.takeIf { !it.startsWith("path:") }
+            }
             val url = baseUrl.toHttpUrl().newBuilder()
                 .addPathSegments("video/search")
                 .addQueryParameter("search", query.trim())
-                .addQueryParameter("o", sort)
+                .apply {
+                    if (searchSort.isNotBlank()) addQueryParameter("o", searchSort)
+                }
                 .addQueryParameter("page", page.toString())
                 .apply {
-                    if (category.isNotBlank()) addQueryParameter("filter_category", category)
+                    if (!filterCategory.isNullOrBlank()) addQueryParameter("filter_category", filterCategory)
                     applyDuration(duration)
                     if (hd.isNotBlank()) addQueryParameter("hd", "1")
                 }
@@ -254,10 +267,27 @@ class PornHub :
         val pageUrl = response.request.url.toString()
         val html = response.body.string()
         val videoList = mutableListOf<Video>()
+        val cookieMap = linkedMapOf<String, String>()
+        headers["Cookie"]?.split(';')?.forEach { part ->
+            val eq = part.indexOf('=')
+            if (eq > 0) cookieMap[part.substring(0, eq).trim()] = part.substring(eq + 1).trim()
+        }
+        runCatching { client.cookieJar.loadForRequest(response.request.url) }.getOrNull()?.forEach { c ->
+            cookieMap[c.name] = c.value
+        }
+        response.headers("Set-Cookie").forEach { raw ->
+            val nv = raw.substringBefore(';')
+            val eq = nv.indexOf('=')
+            if (eq > 0) cookieMap[nv.substring(0, eq).trim()] = nv.substring(eq + 1).trim()
+        }
+        val cookieHeader = cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
         val videoHeaders = Headers.Builder()
-            .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .add("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             .add("Referer", "$baseUrl/")
             .add("Origin", baseUrl)
+            .apply {
+                if (cookieHeader.isNotBlank()) add("Cookie", cookieHeader)
+            }
             .build()
 
         // Extract flashvars JSON: search script tags for "mediaDefinitions"
@@ -483,12 +513,16 @@ class PornHub :
             "Category",
             arrayOf(
                 Pair("Any", ""),
+                Pair("18-25 (Teen)", "path:teen"),
+                Pair("60FPS", "105"),
                 Pair("Amateur", "3"),
                 Pair("Anal", "35"),
-                Pair("Arab", "127"),
+                Pair("Arab", "98"),
                 Pair("Asian", "1"),
-                Pair("Babe", "5"),
+                Pair("Babe", "path:babe"),
+                Pair("Babysitter (18+)", "89"),
                 Pair("BBW", "6"),
+                Pair("Behind The Scenes", "141"),
                 Pair("Big Ass", "4"),
                 Pair("Big Dick", "7"),
                 Pair("Big Tits", "8"),
@@ -496,65 +530,86 @@ class PornHub :
                 Pair("Blonde", "9"),
                 Pair("Blowjob", "13"),
                 Pair("Bondage", "10"),
+                Pair("Brazilian", "102"),
+                Pair("British", "96"),
                 Pair("Brunette", "11"),
                 Pair("Bukkake", "14"),
                 Pair("Cartoon", "86"),
                 Pair("Casting", "90"),
                 Pair("Celebrity", "12"),
-                Pair("College", "16"),
+                Pair("Closed Captions", "732"),
+                Pair("College (18+)", "path:college"),
                 Pair("Compilation", "57"),
                 Pair("Cosplay", "241"),
                 Pair("Creampie", "15"),
-                Pair("Cuckold", "140"),
-                Pair("Cumshot", "19"),
-                Pair("Czech", "20"),
+                Pair("Cuckold", "242"),
+                Pair("Cumshot", "16"),
+                Pair("Czech", "100"),
                 Pair("Double Penetration", "72"),
                 Pair("Ebony", "17"),
-                Pair("Euro", "22"),
+                Pair("Euro", "55"),
                 Pair("Exclusive", "115"),
-                Pair("Feet", "25"),
-                Pair("Female Friendly", "95"),
+                Pair("Feet", "93"),
+                Pair("Female Orgasm", "502"),
                 Pair("Fetish", "18"),
-                Pair("Funny", "96"),
-                Pair("Gangbang", "30"),
-                Pair("German", "31"),
+                Pair("Fingering", "592"),
+                Pair("Fisting", "19"),
+                Pair("French", "94"),
+                Pair("Funny", "32"),
+                Pair("Gaming", "881"),
+                Pair("Gangbang", "80"),
+                Pair("German", "95"),
+                Pair("Handjob", "20"),
                 Pair("Hardcore", "21"),
                 Pair("HD Porn", "38"),
-                Pair("Hentai", "36"),
-                Pair("Interactive", "32"),
+                Pair("Hentai", "path:hentai"),
+                Pair("Indian", "101"),
+                Pair("Interracial", "25"),
+                Pair("Italian", "97"),
                 Pair("Japanese", "111"),
+                Pair("Korean", "103"),
                 Pair("Latina", "26"),
                 Pair("Lesbian", "27"),
                 Pair("Massage", "78"),
+                Pair("Masturbation", "22"),
                 Pair("Mature", "28"),
                 Pair("MILF", "29"),
+                Pair("Muscular Men", "512"),
                 Pair("Music", "121"),
-                Pair("Old/Young", "181"),
-                Pair("Orgy", "33"),
-                Pair("Parody", "34"),
+                Pair("Old/Young (18+)", "181"),
+                Pair("Orgy", "2"),
+                Pair("Parody", "201"),
                 Pair("Party", "53"),
-                Pair("Pornstar", "47"),
+                Pair("Pissing", "211"),
+                Pair("Podcast", "891"),
+                Pair("Pornstar", "path:pornstar"),
                 Pair("POV", "41"),
                 Pair("Public", "24"),
-                Pair("Reality", "39"),
+                Pair("Pussy Licking", "131"),
+                Pair("Reality", "31"),
                 Pair("Red Head", "42"),
                 Pair("Role Play", "81"),
+                Pair("Romantic", "522"),
                 Pair("Rough Sex", "67"),
-                Pair("School", "88"),
+                Pair("Russian", "99"),
+                Pair("School (18+)", "88"),
                 Pair("Small Tits", "59"),
+                Pair("Smoking", "91"),
                 Pair("Solo Female", "492"),
-                Pair("Solo Male", "493"),
+                Pair("Solo Male", "92"),
                 Pair("Squirt", "69"),
                 Pair("Step Fantasy", "444"),
-                Pair("Teen (18+)", "37"),
+                Pair("Strap On", "542"),
+                Pair("Striptease", "33"),
+                Pair("Tattooed Women", "562"),
                 Pair("Threesome", "65"),
                 Pair("Toys", "23"),
                 Pair("Transgender", "83"),
                 Pair("Verified Amateurs", "138"),
-                Pair("Verified Couples", "139"),
-                Pair("Verified Models", "125"),
-                Pair("Vintage", "40"),
-                Pair("Webcam", "43"),
+                Pair("Verified Couples", "482"),
+                Pair("Verified Models", "139"),
+                Pair("Vintage", "43"),
+                Pair("Webcam", "61"),
             ),
         )
 
@@ -618,17 +673,21 @@ class PornHub :
         duration: String = "",
         category: String = "",
         hd: String = "",
-    ): String = baseUrl.toHttpUrl().newBuilder()
-        .addPathSegment("video")
-        .addQueryParameter("o", sort)
-        .addQueryParameter("page", page.toString())
-        .apply {
-            if (category.isNotBlank()) addQueryParameter("c", category)
+    ): String {
+        val isPathCategory = category.startsWith("path:")
+        return baseUrl.toHttpUrl().newBuilder().apply {
+            if (isPathCategory) {
+                addPathSegments("categories/${category.removePrefix("path:")}")
+            } else {
+                addPathSegment("video")
+                if (category.isNotBlank()) addQueryParameter("c", category)
+                if (hd.isNotBlank()) addQueryParameter("hd", "1")
+            }
+            addQueryParameter("o", sort)
+            addQueryParameter("page", page.toString())
             applyDuration(duration)
-            if (hd.isNotBlank()) addQueryParameter("hd", "1")
-        }
-        .build()
-        .toString()
+        }.build().toString()
+    }
 
     private fun okhttp3.HttpUrl.Builder.applyDuration(duration: String) {
         when {
