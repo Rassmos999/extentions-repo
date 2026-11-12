@@ -60,9 +60,9 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "all",
-        "lang": "AnimeXin",
-        "id": "6997496346088219177",
+        "name": "AnimeXin",
+        "lang": "all",
+        "id": "4620219025406449669",
         "baseUrl": "https://animexin.dev"
       }
     ]
@@ -94,9 +94,9 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "all",
-        "lang": "ChineseAnime",
-        "id": "5598196608902639566",
+        "name": "ChineseAnime",
+        "lang": "all",
+        "id": "8639880285552928628",
         "baseUrl": "https://www.chineseanime.vip"
       }
     ]
@@ -131,7 +131,7 @@
         "name": "Google Drive",
         "lang": "all",
         "id": "4222017068256633289",
-        "baseUrl": ""
+        "baseUrl": "https://drive.google.com"
       }
     ]
   },
@@ -198,8 +198,8 @@
       {
         "name": "JavDB",
         "lang": "all",
-        "id": "0",
-        "baseUrl": ""
+        "id": "3683993531328349143",
+        "baseUrl": "https://javdb.com"
       }
     ]
   },
@@ -233,7 +233,7 @@
         "name": "Actress",
         "lang": "actress",
         "id": "146895766788814283",
-        "baseUrl": ""
+        "baseUrl": "https://jav.guru"
       },
       {
         "name": "Jav Guru",
@@ -270,9 +270,9 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "all",
-        "lang": "LMAnime",
-        "id": "7495473751561802890",
+        "name": "LMAnime",
+        "lang": "all",
+        "id": "7296222662412524790",
         "baseUrl": "https://lmanime.com"
       }
     ]
@@ -408,8 +408,8 @@
       {
         "name": "SexTB",
         "lang": "all",
-        "id": "0",
-        "baseUrl": ""
+        "id": "2431907627860691507",
+        "baseUrl": "https://sextb.net"
       }
     ]
   },
@@ -443,25 +443,25 @@
         "name": "StreamingUnity (Movie)",
         "lang": "en",
         "id": "665657603807796138",
-        "baseUrl": "https://streamingunity.dog/en"
+        "baseUrl": "https://streamingunity.fun/en"
       },
       {
         "name": "StreamingUnity (Movie)",
         "lang": "it",
         "id": "502708102217708509",
-        "baseUrl": "https://streamingunity.dog/it"
+        "baseUrl": "https://streamingunity.fun/it"
       },
       {
         "name": "StreamingUnity (Tv)",
         "lang": "en",
         "id": "349088835984594821",
-        "baseUrl": "https://streamingunity.dog/en"
+        "baseUrl": "https://streamingunity.fun/en"
       },
       {
         "name": "StreamingUnity (Tv)",
         "lang": "it",
         "id": "7246470104959245892",
-        "baseUrl": "https://streamingunity.dog/it"
+        "baseUrl": "https://streamingunity.fun/it"
       }
     ]
   },
@@ -528,8 +528,8 @@
       {
         "name": "SupJav 2",
         "lang": "all",
-        "id": "0",
-        "baseUrl": ""
+        "id": "2395095572183910953",
+        "baseUrl": "https://supjav.com"
       }
     ]
   },
@@ -834,8 +834,8 @@
       {
         "name": "CimaLight",
         "lang": "ar",
-        "id": "0",
-        "baseUrl": ""
+        "id": "960958835098904366",
+        "baseUrl": "https://e.cimalight.co"
       }
     ]
   },
@@ -885,8 +885,8 @@
       {
         "name": "NxxHentai",
         "lang": "ar",
-        "id": "0",
-        "baseUrl": ""
+        "id": "7131611129370822582",
+        "baseUrl": "https://nxxhentai.net"
       }
     ]
   },
@@ -1036,10 +1036,10 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "en",
-        "lang": "Anikoto",
-        "id": "7474889708537379540",
-        "baseUrl": "https://anikoto.site/#domains and https://megaplay.buzz/domains\n        domainEntries = listOf(\n            "
+        "name": "Anikoto",
+        "lang": "en",
+        "id": "4697393375201558791",
+        "baseUrl": "https://anikototv.to"
       }
     ]
   },
@@ -1087,9 +1087,9 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "en",
-        "lang": "AnimeKhor",
-        "id": "245481248264738239",
+        "name": "AnimeKhor",
+        "lang": "en",
+        "id": "2156984402743841841",
         "baseUrl": "https://animekhor.org"
       }
     ]
@@ -1104,9 +1104,9 @@
     "nsfw": 1,
     "sources": [
       {
-        "name": "en",
-        "lang": "Animenosub",
-        "id": "3248498296388515009",
+        "name": "Animenosub",
+        "lang": "en",
+        "id": "6722573244246256733",
         "baseUrl": "https://animenosub.to"
       }
     ]
@@ -1155,10 +1155,10 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "en",
-        "lang": "AnimeSogo",
-        "id": "666147732493178021",
-        "baseUrl": ""
+        "name": "AnimeSogo",
+        "lang": "en",
+        "id": "8456322126210259639",
+        "baseUrl": "https://animesogo.to"
       }
     ]
   },
@@ -1206,10 +1206,10 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "en",
-        "lang": "AniWave (Unoriginal)",
-        "id": "2468538363602102695",
-        "baseUrl": ""
+        "name": "AniWave (Unoriginal)",
+        "lang": "en",
+        "id": "4383278740715532790",
+        "baseUrl": "https://animewave.to"
       }
     ]
   },
@@ -1243,7 +1243,7 @@
         "name": "AV1Encodes",
         "lang": "en",
         "id": "1014227790860730234",
-        "baseUrl": ""
+        "baseUrl": "https://av1encodes.com"
       }
     ]
   },
@@ -1291,9 +1291,9 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "en",
-        "lang": "DonghuaStream",
-        "id": "1411167302016300545",
+        "name": "DonghuaStream",
+        "lang": "en",
+        "id": "5750955808412743706",
         "baseUrl": "https://donghuastream.org"
       }
     ]
@@ -1495,10 +1495,10 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "en",
-        "lang": "AnimeKai (Unoriginal)",
-        "id": "7996330741606395425",
-        "baseUrl": ""
+        "name": "AnimeKai (Unoriginal)",
+        "lang": "en",
+        "id": "1571236147208399860",
+        "baseUrl": "https://animekaitv.to"
       }
     ]
   },
@@ -1512,9 +1512,9 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "en",
-        "lang": "LuciferDonghua",
-        "id": "4244573715725077139",
+        "name": "LuciferDonghua",
+        "lang": "en",
+        "id": "1480485712825107891",
         "baseUrl": "https://luciferdonghua.in"
       }
     ]
@@ -1635,12 +1635,6 @@
         "lang": "en",
         "id": "9168084761765988435",
         "baseUrl": ""
-      },
-      {
-        "name": "Genre",
-        "lang": "genre[]",
-        "id": "5812248971841876169",
-        "baseUrl": ""
       }
     ]
   },
@@ -1671,9 +1665,9 @@
     "nsfw": 1,
     "sources": [
       {
-        "name": "en",
-        "lang": "PinoyMoviePedia",
-        "id": "2515462548597096887",
+        "name": "PinoyMoviePedia",
+        "lang": "en",
+        "id": "8569022244537791293",
         "baseUrl": "https://pinoymoviepedia.ru"
       }
     ]
@@ -1756,9 +1750,9 @@
     "nsfw": 0,
     "sources": [
       {
-        "name": "en",
-        "lang": "UniqueStream",
-        "id": "2833822908664914550",
+        "name": "UniqueStream",
+        "lang": "en",
+        "id": "1915898919039572670",
         "baseUrl": "https://uniquestream.net"
       }
     ]

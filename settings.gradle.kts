@@ -30,21 +30,15 @@ enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
 
 rootProject.name = "Yuzono-Anime"
 
-val targetModules = listOf(
-    "ar:aflamk1", "ar:anime4up", "ar:animerco", "ar:arabshentai", "ar:arabseed",
-    "ar:arabx", "ar:arabxn", "ar:cimaleek", "ar:cimalight", "ar:egydead",
-    "ar:faselhd", "ar:nxxhentai", "ar:okanime", "ar:sexalarab", "ar:sexmahali",
-    "en:anikage", "en:animeparadise", "en:animetake", "en:hahomoe", "en:hanime", "en:hentaimama", "en:hexawatch",
-    "en:hstream", "en:kayoanime", "en:kimoitv", "en:mapple", "en:myanime", "en:onetwothreeanime",
-    "en:pinoymoviepedia", "en:rule34video", "en:uniquestream",
-    "all:hentaitorrent", "all:jable", "all:javdb", "all:javgg", "all:javguru", "all:missav", "all:nyaatorrent", "all:pornhub", "all:ptorrent",
-    "all:rouvideo", "all:sextb", "all:streamingcommunity", "all:supjav", "all:supjav2", "all:xnxx", "all:xvideos"
-)
+val maintainedLangs = listOf("all", "ar", "en")
 
 include(":core")
 
-for (mod in targetModules) {
-    include(":src:$mod")
+for (lang in maintainedLangs) {
+    File(rootDir, "src/$lang").listFiles()
+        ?.filter { it.isDirectory && (File(it, "build.gradle").exists() || File(it, "build.gradle.kts").exists()) }
+        ?.sortedBy { it.name }
+        ?.forEach { include(":src:$lang:${it.name}") }
 }
 
 // Load all modules under /lib that contain a build file
