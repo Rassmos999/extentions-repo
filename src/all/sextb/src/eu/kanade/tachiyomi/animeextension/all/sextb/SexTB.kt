@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.animeextension.all.sextb
 
 import android.util.Base64
 import aniyomi.lib.doodextractor.DoodExtractor
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
@@ -33,6 +34,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
+import java.net.URLEncoder
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
@@ -64,6 +66,7 @@ class SexTB : ParsedAnimeHttpSource() {
     private val streamTapeExtractor by lazy { StreamTapeExtractor(client) }
     private val uqloadExtractor by lazy { UqloadExtractor(client) }
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
     private val resolvedCatalogPaths = ConcurrentHashMap(CURRENT_CATALOG_PATHS)
 
     // ============================== Popular ===============================
@@ -74,7 +77,7 @@ class SexTB : ParsedAnimeHttpSource() {
     )
 
     // Every listing page now opens with an "ad-card" tray-item linking to /advertise.
-    override fun popularAnimeSelector(): String = "div.tray-item:not(.ad-card):has(a[href])"
+    override fun popularAnimeSelector(): String = "div.tray-item:not(.ad-card):has(a[href]):not(:has(a[href*=\"/advertise\"]))"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
         val link = element.selectFirst("a[href]") ?: element
@@ -142,7 +145,7 @@ class SexTB : ParsedAnimeHttpSource() {
                 .addPathSegment("search")
                 .addPathSegment(query.trim())
                 .apply {
-                    if (page > 1) addQueryParameter("page", page.toString())
+                    if (page > 1) addPathSegment("pg-${page.coerceAtLeast(1)}")
                 }
                 .build()
             return GET(url, headers)
@@ -376,51 +379,94 @@ class SexTB : ParsedAnimeHttpSource() {
         }
 
         val extractorVideos = runCatching {
-            when (label) {
-                "DD" -> doodExtractor.videosFromUrl(target.url, quality = "DD")
-                "ST" -> streamTapeExtractor.videosFromUrl(target.url)
-                "MD" -> mixDropExtractor.videosFromUrl(target.url)
-                "UPN", "US" -> extractUpnVideosBlocking(target)
+            when {
+                label == "DD" -> doodExtractor.videosFromUrl(target.url, quality = "DD")
+
+                label == "ST" -> streamTapeExtractor.videosFromUrl(target.url)
+
+                label == "MD" -> mixDropExtractor.videosFromUrl(target.url)
+
+                label == "UPN" || label == "US" -> extractUpnVideosBlocking(target)
+
+                label == "F4" || "f4scdn" in lowerUrl || "f4jav" in lowerUrl || "f4stream" in lowerUrl ->
+                    extractF4VideosBlocking(target)
+
                 else -> emptyList()
             }
         }.getOrDefault(emptyList())
         if (extractorVideos.isNotEmpty()) return extractorVideos
 
-        return runCatching {
-            client.newCall(GET(target.url, videoHeaders)).execute().use { response ->
-                response.throwIfCloudflareChallenge()
-                val finalUrl = response.request.url.toString()
-                val body = response.body.string().replace("\\/", "/").replace("\\u0026", "&")
-                val document = Jsoup.parse(body, finalUrl)
-                val scripts = document.select("script").joinToString("\n") { script ->
-                    val data = script.data()
-                    if ("eval(function(p,a,c" in data) autoUnpacker(data) ?: data else data
-                }
-                val rawPlaylist = M3U8_URL_REGEX.find(scripts)?.value
-                    ?: document.selectFirst("[data-hash*=m3u8]")?.attr("data-hash")
-                    ?: document.selectFirst("source[src*=m3u8], video[src*=m3u8]")?.attr("src")
-                val playlist = rawPlaylist?.let { normalizePlayerUrl(it, finalUrl) }
-                if (playlist != null) {
-                    return@use listOf(
-                        Video(
-                            playlist,
-                            "$label - HLS",
-                            playlist,
-                            headers = headersFor(finalUrl),
-                        ),
+        val urlsToTry = if ("niramirus.com" in lowerUrl) {
+            listOf(target.url, target.url.replaceFirst("niramirus.com", "medixiru.com"))
+        } else {
+            listOf(target.url)
+        }
+
+        for (candidateUrl in urlsToTry) {
+            val extracted = runCatching {
+                client.newCall(GET(candidateUrl, videoHeaders)).execute().use { response ->
+                    response.throwIfCloudflareChallenge()
+                    val finalUrl = response.request.url.toString()
+                    val body = response.body.string().replace("\\/", "/").replace("\\u0026", "&")
+                    val document = Jsoup.parse(body, finalUrl)
+                    val scripts = document.select("script").joinToString("\n") { script ->
+                        val data = script.data()
+                        if ("eval(function(p,a,c" in data) autoUnpacker(data) ?: data else data
+                    }
+                    val rawPlaylist = M3U8_URL_REGEX.find(scripts)?.value
+                        ?: document.selectFirst("[data-hash*=m3u8]")?.attr("data-hash")
+                        ?: document.selectFirst("source[src*=m3u8], video[src*=m3u8]")?.attr("src")
+                    val playlist = rawPlaylist?.let { normalizePlayerUrl(it, finalUrl) }
+                    if (playlist != null) {
+                        return@use listOf(
+                            Video(
+                                playlist,
+                                "$label - HLS",
+                                playlist,
+                                headers = headersFor(finalUrl),
+                            ),
+                        )
+                    }
+
+                    val nested = extractPlayerUrls(body, finalUrl)
+                        .firstOrNull { it != candidateUrl && it.startsWith("http") }
+                        ?: return@use emptyList()
+                    extractVideosBlocking(
+                        PlayerTarget(normalizeServerLabel(label, nested.lowercase()), nested, finalUrl),
+                        visited,
+                        depth + 1,
                     )
                 }
+            }.getOrDefault(emptyList())
+            if (extracted.isNotEmpty()) return extracted
+        }
+        return emptyList()
+    }
 
-                val nested = extractPlayerUrls(body, finalUrl)
-                    .firstOrNull { it != target.url && it.startsWith("http") }
-                    ?: return@use emptyList()
-                extractVideosBlocking(
-                    PlayerTarget(normalizeServerLabel(label, nested.lowercase()), nested, finalUrl),
-                    visited,
-                    depth + 1,
-                )
-            }
-        }.getOrDefault(emptyList())
+    private fun extractF4VideosBlocking(target: PlayerTarget): List<Video> {
+        val parsedEmbed = target.url.toHttpUrlOrNull() ?: return emptyList()
+        val embedOrigin = "${parsedEmbed.scheme}://${parsedEmbed.host}"
+        val html = client.newCall(GET(target.url, headersFor(target.referer))).execute().use { resp ->
+            resp.throwIfCloudflareChallenge()
+            resp.body.string()
+        }
+        val apiPath = Regex("""data-api=["']([^"']+)["']""").find(html)?.groupValues?.get(1) ?: return emptyList()
+        val apiUrl = parsedEmbed.resolve(apiPath)?.toString() ?: return emptyList()
+        val playUrl = "$apiUrl?ab=0&ad=1&r=${URLEncoder.encode("$baseUrl/", "UTF-8")}"
+        val src = client.newCall(GET(playUrl, headersFor(target.url))).execute().use { resp ->
+            resp.throwIfCloudflareChallenge()
+            if (!resp.isSuccessful) return emptyList()
+            JSONObject(resp.body.string()).optString("src").trim()
+        }
+        if (src.isBlank()) return emptyList()
+        if (!m3u8Server.isRunning()) m3u8Server.startServer()
+        val localUrl = m3u8Server.processM3u8Url(
+            m3u8Url = src,
+            referer = "$embedOrigin/",
+            userAgent = headers["User-Agent"],
+            origin = embedOrigin,
+        ) ?: return emptyList()
+        return listOf(Video(localUrl, "F4 - HLS", localUrl))
     }
 
     private fun extractUpnVideosBlocking(target: PlayerTarget): List<Video> {
@@ -459,7 +505,7 @@ class SexTB : ParsedAnimeHttpSource() {
     private fun String.redirectHgLink(): String {
         val host = toHttpUrlOrNull()?.host ?: return this
         if (HG_LINK_HOSTS.none { host.endsWith(it) }) return this
-        return replaceFirst(host, HG_LINK_MIRRORS.random())
+        return replaceFirst(host, "niramirus.com")
     }
 
     private fun normalizePlayerUrl(rawUrl: String, pageUrl: String): String? {
@@ -826,10 +872,10 @@ class SexTB : ParsedAnimeHttpSource() {
         )
 
         private val CURRENT_CATALOG_PATHS = mapOf(
-            "/jav-censored" to "/jav-censored-6gt09dgi",
-            "/jav-uncensored" to "/jav-uncensored-x7ibgpyt",
-            "/jav-amateur" to "/jav-amateur-b6i6vejs",
-            "/jav-subtitle" to "/jav-subtitle-iye0wdn6",
+            "/jav-censored" to "/jav-censored-4fthm8g6",
+            "/jav-uncensored" to "/jav-uncensored-l16u27mt",
+            "/jav-amateur" to "/jav-amateur-7wcuqoax",
+            "/jav-subtitle" to "/jav-subtitle-uify5eet",
             "/genre/uncensored-leaked" to "/genre/uncensored-leaked-8iodxgmu",
         )
 

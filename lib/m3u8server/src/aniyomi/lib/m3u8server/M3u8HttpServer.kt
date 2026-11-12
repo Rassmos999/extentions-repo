@@ -98,8 +98,9 @@ class M3u8HttpServer(
     private fun handleM3u8Request(session: IHTTPSession): Response {
         val url = session.parameters["url"]?.first()
         val fallbackReferer = session.parameters["referer"]?.first()
+        val fallbackOrigin = session.parameters["origin"]?.first()
         val fallbackUserAgent = session.parameters["useragent"]?.first()
-        val headers = extractHeadersFromSession(session, fallbackReferer, fallbackUserAgent)
+        val headers = extractHeadersFromSession(session, fallbackReferer, fallbackUserAgent, fallbackOrigin)
 
         Log.d(tag, "Processing M3U8 request for URL: $url")
         Log.d(tag, "Headers: $headers")
@@ -128,8 +129,9 @@ class M3u8HttpServer(
         val keyUrl = session.parameters["key"]?.first()
         val iv = session.parameters["iv"]?.first()
         val fallbackReferer = session.parameters["referer"]?.first()
+        val fallbackOrigin = session.parameters["origin"]?.first()
         val fallbackUserAgent = session.parameters["useragent"]?.first()
-        val headers = extractHeadersFromSession(session, fallbackReferer, fallbackUserAgent)
+        val headers = extractHeadersFromSession(session, fallbackReferer, fallbackUserAgent, fallbackOrigin)
 
         Log.d(tag, "Processing segment request for URL: $url (key=${keyUrl != null}, iv=${iv != null})")
         Log.d(tag, "Headers: $headers")
@@ -207,6 +209,7 @@ class M3u8HttpServer(
         session: IHTTPSession,
         fallbackReferer: String? = null,
         fallbackUserAgent: String? = null,
+        fallbackOrigin: String? = null,
     ): Map<String, String> {
         val headers = mutableMapOf<String, String>()
 
@@ -226,8 +229,11 @@ class M3u8HttpServer(
         if (!fallbackReferer.isNullOrBlank()) {
             headers["referer"] = fallbackReferer
         }
+        if (!fallbackOrigin.isNullOrBlank()) {
+            headers["origin"] = fallbackOrigin
+        }
 
-        Log.d(tag, "Extracted headers (referer=${headers["referer"]?.take(80) ?: "none"}, ua=${headers["user-agent"]?.take(40) ?: "none"})")
+        Log.d(tag, "Extracted headers (referer=${headers["referer"]?.take(80) ?: "none"}, origin=${headers["origin"] ?: "none"}, ua=${headers["user-agent"]?.take(40) ?: "none"})")
         return headers
     }
 
@@ -261,8 +267,9 @@ class M3u8HttpServer(
             Log.d(tag, "Original M3U8 content length: ${m3u8Content.length}")
 
             val referer = headers["referer"]
+            val origin = headers["origin"]
             val userAgent = headers["user-agent"]
-            val modifiedContent = modifyM3u8Content(m3u8Content, url, port, referer, userAgent)
+            val modifiedContent = modifyM3u8Content(m3u8Content, url, port, referer, userAgent, origin)
             Log.d(tag, "Modified M3U8 content length: ${modifiedContent.length}")
             Log.d(tag, "M3U8 processing completed successfully")
 
@@ -481,11 +488,15 @@ class M3u8HttpServer(
         m3u8Url: String,
         referer: String? = null,
         userAgent: String? = null,
+        origin: String? = null,
     ): String {
         val sb = StringBuilder("http://localhost:$port/m3u8?url=")
             .append(URLEncoder.encode(m3u8Url, Charsets.UTF_8.name()))
         if (!referer.isNullOrBlank()) {
             sb.append("&referer=").append(URLEncoder.encode(referer, Charsets.UTF_8.name()))
+        }
+        if (!origin.isNullOrBlank()) {
+            sb.append("&origin=").append(URLEncoder.encode(origin, Charsets.UTF_8.name()))
         }
         if (!userAgent.isNullOrBlank()) {
             sb.append("&useragent=").append(URLEncoder.encode(userAgent, Charsets.UTF_8.name()))
@@ -499,6 +510,7 @@ class M3u8HttpServer(
         serverPort: Int,
         referer: String? = null,
         userAgent: String? = null,
+        origin: String? = null,
     ): String {
         Log.d(tag, "Modifying M3U8 content for server port: $serverPort (referer=${referer?.take(80) ?: "none"})")
         val lines = content.lines()
@@ -507,6 +519,7 @@ class M3u8HttpServer(
         var mediaSequence = 0L
         var segmentSequence = mediaSequence
         var currentKey: HlsKey? = null
+        var expectVariantPlaylist = false
 
         val baseHttpUrl = originalUrl.toHttpUrlOrNull()
 
@@ -549,20 +562,28 @@ class M3u8HttpServer(
                     }
                 }
 
+                line.startsWith("#EXT-X-STREAM-INF:") -> {
+                    expectVariantPlaylist = true
+                    modifiedLines.add(line)
+                }
+
                 line.startsWith("#") || line.isBlank() -> {
                     modifiedLines.add(line)
                 }
 
                 else -> {
                     val resolvedUrl = resolveHlsUrl(baseHttpUrl, line)
-                    if (resolvedUrl.contains(".m3u8", ignoreCase = true)) {
-                        val encodedUrl = URLEncoder.encode(resolvedUrl, Charsets.UTF_8.name())
-                        // Forward the caller's referer / UA to sub-playlists so
+                    val isPlaylist = expectVariantPlaylist ||
+                        resolvedUrl.contains(".m3u8", ignoreCase = true) ||
+                        resolvedUrl.substringBefore('?').substringBefore('#').endsWith(".txt", ignoreCase = true)
+                    expectVariantPlaylist = false
+                    if (isPlaylist) {
+                        // Forward the caller's referer / origin / UA to sub-playlists so
                         // the redirect chain keeps browser-fingerprint headers.
-                        modifiedLines.add(buildChildM3u8Url(serverPort, resolvedUrl, referer, userAgent))
+                        modifiedLines.add(buildChildM3u8Url(serverPort, resolvedUrl, referer, userAgent, origin))
                     } else {
                         modifiedLines.add(
-                            createLocalSegmentUrl(serverPort, resolvedUrl, currentKey, referer, userAgent),
+                            createLocalSegmentUrl(serverPort, resolvedUrl, currentKey, referer, userAgent, origin),
                         )
                         segmentCount++
                     }
@@ -580,11 +601,15 @@ class M3u8HttpServer(
         m3u8Url: String,
         referer: String?,
         userAgent: String?,
+        origin: String? = null,
     ): String {
         val sb = StringBuilder("http://localhost:$serverPort/m3u8?url=")
             .append(URLEncoder.encode(m3u8Url, Charsets.UTF_8.name()))
         if (!referer.isNullOrBlank()) {
             sb.append("&referer=").append(URLEncoder.encode(referer, Charsets.UTF_8.name()))
+        }
+        if (!origin.isNullOrBlank()) {
+            sb.append("&origin=").append(URLEncoder.encode(origin, Charsets.UTF_8.name()))
         }
         if (!userAgent.isNullOrBlank()) {
             sb.append("&useragent=").append(URLEncoder.encode(userAgent, Charsets.UTF_8.name()))
@@ -608,6 +633,7 @@ class M3u8HttpServer(
         key: HlsKey?,
         referer: String? = null,
         userAgent: String? = null,
+        origin: String? = null,
     ): String {
         val encodedUrl = URLEncoder.encode(segmentUrl, Charsets.UTF_8.name())
         return buildString {
@@ -621,6 +647,10 @@ class M3u8HttpServer(
             if (!referer.isNullOrBlank()) {
                 append("&referer=")
                 append(URLEncoder.encode(referer, Charsets.UTF_8.name()))
+            }
+            if (!origin.isNullOrBlank()) {
+                append("&origin=")
+                append(URLEncoder.encode(origin, Charsets.UTF_8.name()))
             }
             if (!userAgent.isNullOrBlank()) {
                 append("&useragent=")

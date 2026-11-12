@@ -79,7 +79,8 @@ class DoodExtractor(private val client: OkHttpClient) {
 
     // Método para obtener headers personalizados
     private fun doodHeaders(host: String) = Headers.Builder().apply {
+        val baseUrl = if (host.startsWith("http://") || host.startsWith("https://")) host else "https://$host"
         add("User-Agent", "Aniyomi")
-        add("Referer", "https://$host/")
+        add("Referer", "$baseUrl/")
     }.build()
 }

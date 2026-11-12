@@ -81,7 +81,7 @@ class RouVideo(
 
     override fun popularAnimeRequest(page: Int): Request {
         fetchTagsListOnce()
-        if (page == 0) updateHotSearch()
+        if (!this::hotSearch.isInitialized) updateHotSearch()
 
         return GET(
             videoUrl.toHttpUrl().newBuilder().apply {
@@ -137,7 +137,7 @@ class RouVideo(
 
     override fun latestUpdatesRequest(page: Int): Request {
         fetchTagsListOnce()
-        if (page == 0) updateHotSearch()
+        if (!this::hotSearch.isInitialized) updateHotSearch()
 
         return GET(
             videoUrl.toHttpUrl().newBuilder().apply {
@@ -186,7 +186,7 @@ class RouVideo(
 
         // For other search/browse types, ensure tags and hot searches are fetched
         fetchTagsListOnce()
-        if (page == 0) updateHotSearch()
+        if (!this::hotSearch.isInitialized) updateHotSearch()
 
         val categoryFilter = filters.filterIsInstance<RouVideoFilter.CategoryFilter>().firstOrNull()
         val sortFilter = filters.filterIsInstance<RouVideoFilter.SortFilter>().firstOrNull()
@@ -194,8 +194,9 @@ class RouVideo(
         val hotSearchFilter = filters.filterIsInstance<RouVideoFilter.HotSearchFilter>().firstOrNull()
 
         val categoryUriPart = categoryFilter?.toUriPart()
+        val hasTagOrHot = tagFilter?.isEmpty() == false || hotSearchFilter?.isEmpty() == false
 
-        if (query.isBlank() || categoryUriPart == FEATURED) {
+        if (query.isBlank() || (categoryUriPart == FEATURED && !hasTagOrHot)) {
             // Browsing scenarios (no text query)
             return when (categoryUriPart) {
                 WATCHING -> {
@@ -204,9 +205,14 @@ class RouVideo(
                     }
                 }
 
-                FEATURED, null, "" -> { // "Featured", "No category", or "All Categories" -> Show featured content
-                    handleSearchAnime(featuredURL, docHeaders) {
-                        asJsoup().parseFeaturedPage(sortFilter)
+                FEATURED, null, "" -> {
+                    if (hasTagOrHot) {
+                        val url = buildBrowseUrl(page, ALL_VIDEOS, sortFilter, tagFilter, hotSearchFilter)
+                        handleSearchAnime(url, docHeaders, ::popularAnimeParse)
+                    } else {
+                        handleSearchAnime(featuredURL, docHeaders) {
+                            asJsoup().parseFeaturedPage(sortFilter)
+                        }
                     }
                 }
 

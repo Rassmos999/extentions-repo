@@ -19,6 +19,7 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.addListPreference
@@ -30,8 +31,12 @@ import keiyoushi.utils.useAsJsoup
 import okhttp3.Call
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import org.json.JSONArray
+import org.json.JSONObject
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 import java.text.SimpleDateFormat
@@ -89,7 +94,9 @@ class JavGuru :
                     getIDFromUrl(a)?.let { url = it }
                         ?: setUrlWithoutDomain(a.attr("href"))
 
-                    val rawTitle = a.text()
+                    val rawTitle = element.selectFirst("a.rank-thumb-link")?.attr("title")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: a.text()
                     val duration = element.selectFirst("span.duration, span.time, div.duration, time, .time, .duration, span.runtime")
                         ?.text()?.trim()
                         ?.takeIf { d -> d.contains(":") }
@@ -406,19 +413,24 @@ class JavGuru :
 
     private suspend fun getVideos(hosterUrl: String): List<Video> = when {
         listOf("javplaya", "javclan").any { it in hosterUrl } -> {
-            streamWishExtractor.videosFromUrl(hosterUrl).map { video ->
-                val newHeaders = (video.headers ?: headers).newBuilder()
-                    .set("Referer", "$baseUrl/")
-                    .set("Origin", baseUrl)
-                    .build()
-                Video(
-                    url = video.url,
-                    quality = video.quality,
-                    videoUrl = video.videoUrl,
-                    headers = newHeaders,
-                    subtitleTracks = video.subtitleTracks,
-                    audioTracks = video.audioTracks,
-                )
+            val direct = extractPackedM3u8(hosterUrl, prefix = "StreamWish")
+            if (direct.isNotEmpty()) {
+                direct
+            } else {
+                streamWishExtractor.videosFromUrl(hosterUrl).map { video ->
+                    val newHeaders = (video.headers ?: headers).newBuilder()
+                        .set("Referer", "$baseUrl/")
+                        .set("Origin", baseUrl)
+                        .build()
+                    Video(
+                        url = video.url,
+                        quality = video.quality,
+                        videoUrl = video.videoUrl,
+                        headers = newHeaders,
+                        subtitleTracks = video.subtitleTracks,
+                        audioTracks = video.audioTracks,
+                    )
+                }
             }
         }
 
@@ -443,17 +455,125 @@ class JavGuru :
             emTurboExtractor.getVideos(hosterUrl)
         }
 
-        // javlesbians.com redirects to rotating VOE mirror domains
-        listOf("voe", "javlesbians").any { it in hosterUrl } -> {
+        listOf("vidara", "mxzhxco8dft").any { it in hosterUrl } -> {
+            extractVidaraVideos(hosterUrl)
+        }
+
+        // Rotating VOE mirror domains (e.g. susanexpectcare.com, javlesbians.com)
+        listOf("voe", "javlesbians", "susanexpectcare").any { it in hosterUrl } -> {
             voeExtractor.videosFromUrl(hosterUrl)
         }
 
         // LuluStream mirror (packed JWPlayer, same layout as StreamWish)
         listOf("streamhihi", "lulu").any { it in hosterUrl } -> {
-            streamWishExtractor.videosFromUrl(hosterUrl, videoNameGen = { "LuluStream - $it" })
+            extractPackedM3u8(hosterUrl, prefix = "LuluStream")
+                .ifEmpty { streamWishExtractor.videosFromUrl(hosterUrl, videoNameGen = { "LuluStream - $it" }) }
         }
 
-        else -> emptyList()
+        else -> {
+            extractUnknownMirror(hosterUrl)
+        }
+    }
+
+    private suspend fun extractUnknownMirror(hosterUrl: String): List<Video> {
+        val body = runCatching {
+            client.newCall(GET(hosterUrl, headersBuilder().set("Referer", "$baseUrl/").build()))
+                .awaitSuccess()
+                .use { it.body.string() }
+        }.getOrNull() ?: return emptyList()
+
+        return when {
+            body.contains("MKGMa") || body.contains("""type="application/json"""") || body.contains("""type='application/json'""") ->
+                voeExtractor.videosFromUrl(hosterUrl)
+
+            body.contains("'/pass_md5/'") ->
+                doodExtractor.videosFromUrl(hosterUrl)
+
+            body.contains("/api/stream") || body.contains("mxzhxco8dft") ->
+                extractVidaraVideos(hosterUrl)
+
+            else -> extractPackedM3u8FromBody(hosterUrl, body)
+        }
+    }
+
+    private fun extractVidaraVideos(embedUrl: String): List<Video> {
+        val parsed = embedUrl.toHttpUrlOrNull() ?: return emptyList()
+        val filecode = parsed.pathSegments.lastOrNull { it.isNotBlank() } ?: return emptyList()
+        val embedOrigin = "${parsed.scheme}://${parsed.host}"
+        val payload = JSONObject().apply {
+            put("filecode", filecode)
+            put("device", "desktop")
+            put("codecs", JSONArray(listOf("avc1", "hev1", "vp9")))
+        }.toString()
+
+        for (origin in listOf(embedOrigin, "https://vidara.to", "https://mxzhxco8dft.com").distinct()) {
+            val streamUrl = runCatching {
+                val apiHeaders = headersBuilder()
+                    .set("Referer", "$origin/e/$filecode")
+                    .set("Origin", origin)
+                    .set("Content-Type", "application/json")
+                    .build()
+                client.newCall(POST("$origin/api/stream", apiHeaders, payload.toRequestBody(JSON_MEDIA_TYPE)))
+                    .execute()
+                    .use { resp ->
+                        if (!resp.isSuccessful) return@use null
+                        JSONObject(resp.body.string()).optString("streaming_url").takeIf { it.startsWith("http") }
+                    }
+            }.getOrNull()
+            if (!streamUrl.isNullOrBlank()) {
+                return listOf(Video(streamUrl, "Vidara - HLS", streamUrl, headers))
+            }
+        }
+        return emptyList()
+    }
+
+    private suspend fun extractPackedM3u8(embedUrl: String, prefix: String = "HLS"): List<Video> {
+        val body = runCatching {
+            client.newCall(GET(embedUrl, headersBuilder().set("Referer", "$baseUrl/").build()))
+                .awaitSuccess()
+                .use { it.body.string() }
+        }.getOrNull() ?: return emptyList()
+        return extractPackedM3u8FromBody(embedUrl, body, prefix)
+    }
+
+    private fun extractPackedM3u8FromBody(embedUrl: String, rawBody: String, prefix: String = "HLS"): List<Video> {
+        val unpacked = unpackPackedJs(rawBody).ifBlank { rawBody }.replace("\\/", "/")
+        val m3u8Url = M3U8_URL_REGEX.find(unpacked)?.value ?: return emptyList()
+        val origin = embedUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" }
+        val videoHeaders = headersBuilder().apply {
+            if (origin != null) {
+                set("Referer", "$origin/")
+                set("Origin", origin)
+            }
+        }.build()
+        return listOf(Video(m3u8Url, prefix, m3u8Url, videoHeaders))
+    }
+
+    private fun unpackPackedJs(html: String): String {
+        val out = StringBuilder()
+        for (match in PACKED_JS_REGEX.findAll(html)) {
+            val payload = match.groupValues[1]
+            val radix = match.groupValues[2].toIntOrNull() ?: continue
+            val dict = match.groupValues[4].split("|")
+            val decoded = WORD_REGEX.replace(payload) { m ->
+                val idx = parseBaseN(m.value, radix)
+                if (idx != null && idx in dict.indices && dict[idx].isNotEmpty()) dict[idx] else m.value
+            }
+            out.append(decoded).append('\n')
+        }
+        return out.toString()
+    }
+
+    private fun parseBaseN(token: String, radix: Int): Int? {
+        if (radix !in 2..62) return null
+        val alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        var acc = 0
+        for (ch in token) {
+            val v = alphabet.indexOf(ch)
+            if (v < 0 || v >= radix) return null
+            acc = acc * radix + v
+        }
+        return acc
     }
 
     override fun List<Video>.sort(): List<Video> {
@@ -515,6 +635,10 @@ class JavGuru :
         private val RTYPE_REGEX = Regex("""rtype:\s*['"]([^'"]+)['"]""")
         private val KEYS_REGEX = Regex("""keys:\s*\[([^]]+)]""")
         private val PAGINATION_REGEX = Regex("""/page/(\d+)""")
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private val M3U8_URL_REGEX = Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""")
+        private val PACKED_JS_REGEX = Regex("""eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)""", RegexOption.DOT_MATCHES_ALL)
+        private val WORD_REGEX = Regex("""\b\w+\b""")
 
         private val DATE_FORMATTER by lazy {
             SimpleDateFormat("MMMM d, yyyy", Locale.US)

@@ -1,13 +1,14 @@
 ext {
     extName = 'JavGG'
     extClass = '.Javgg'
-    extVersionCode = 30
+    extVersionCode = 31
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
+    implementation(project(":lib:m3u8server"))
     implementation(project(':lib:okruextractor'))
     implementation(project(':lib:streamwishextractor'))
     implementation(project(':lib:vidhideextractor'))
