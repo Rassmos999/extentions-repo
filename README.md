@@ -4,19 +4,23 @@ A maintained **Aniyomi-compatible anime extension repository** for AR, EN, and l
 
 ## Add the repository
 
-### One tap on Android
-
-[Open the repository in Aniyomi / Tadami](aniyomi://add-repo?url=https%3A%2F%2Fraw.githubusercontent.com%2FRassmos999%2Fextentions-repo%2Fmain%2Findex.min.json)
-
-The link opens the app's own confirmation screen. It does not silently install extensions, grant trust, or bypass Android permission prompts.
-
-### Manual URL
-
-Copy this URL into the app's **Anime extension repositories** setting:
-
+### Stable (`main`)
+- **One tap on Android:** [Open `main` in Aniyomi / Tadami](aniyomi://add-repo?url=https%3A%2F%2Fraw.githubusercontent.com%2FRassmos999%2Fextentions-repo%2Fmain%2Findex.min.json)
+- **Manual URL:**
 ```text
 https://raw.githubusercontent.com/Rassmos999/extentions-repo/main/index.min.json
 ```
+
+### Testing (`dev`)
+- **One tap on Android:** [Open `dev` in Aniyomi / Tadami](aniyomi://add-repo?url=https%3A%2F%2Fraw.githubusercontent.com%2FRassmos999%2Fextentions-repo%2Fdev%2Findex.min.json)
+- **Manual URL:**
+```text
+https://raw.githubusercontent.com/Rassmos999/extentions-repo/dev/index.min.json
+```
+
+> **Note:** Both `main` and `dev` share the same signing key so Android updates installed extensions seamlessly without signature conflicts or data loss. If your app blocks adding both URLs simultaneously because of duplicate `signingKeyFingerprint`, switch between the two URLs in **Anime extension repos** or test `dev` on a second app/profile.
+
+The links open the app's own confirmation screen. They do not silently install extensions, grant trust, or bypass Android permission prompts.
 
 - Aniyomi: **Settings → Browse → Anime extension repos**
 - Tadami: **More → Settings → Browse → Extension Stores (Anime)**

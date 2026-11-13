@@ -214,12 +214,28 @@ def main():
 
     min_json_bytes = json.dumps(entries, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     full_json_bytes = (json.dumps(entries, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    repo_name = "Omar AR+EN+ALL (14.x)"
+    repo_website = "https://github.com/Rassmos999/extentions-repo"
+    branch = ""
+    try:
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        branch = ""
+    if branch and branch not in ("main", "HEAD"):
+        repo_name = f"Omar AR+EN+ALL ({branch.upper()} - 14.x)"
+        repo_website = f"https://github.com/Rassmos999/extentions-repo/tree/{branch}"
+
     repo_json_str = (
         json.dumps(
             {
                 "meta": {
-                    "name": "Omar AR+EN+ALL (14.x)",
-                    "website": "https://github.com/Rassmos999/extentions-repo",
+                    "name": repo_name,
+                    "website": repo_website,
                     "signingKeyFingerprint": "84300648046b4e4d24e940d892207fc94d6c723c120fddb5450b222c4e8d3a4d",
                 }
             },
