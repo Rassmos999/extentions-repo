@@ -27,6 +27,7 @@ import keiyoushi.utils.delegate
 import keiyoushi.utils.getPreferencesLazy
 import okhttp3.FormBody
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
@@ -354,12 +355,38 @@ open class MyReadingManga(override val lang: String, private val siteLang: Strin
         val videoUrl = videoUrlParse(document)
         if (videoUrl.isEmpty()) return emptyList()
 
+        val cookieMap = linkedMapOf<String, String>()
+        listOf(
+            response.request.url,
+            videoUrl.toHttpUrlOrNull(),
+            baseUrl.toHttpUrlOrNull(),
+        ).filterNotNull().forEach { url ->
+            client.cookieJar.loadForRequest(url).forEach { cookie ->
+                cookieMap[cookie.name] = "${cookie.name}=${cookie.value}"
+            }
+        }
         val cookieManager = CookieManager.getInstance()
-        val cookies = cookieManager.getCookie(videoUrl) ?: ""
+        listOfNotNull(
+            cookieManager.getCookie(videoUrl),
+            cookieManager.getCookie(baseUrl),
+        ).forEach { rawCookies ->
+            rawCookies.split(";").forEach { part ->
+                val trimmed = part.trim()
+                val eqIdx = trimmed.indexOf('=')
+                if (eqIdx > 0) {
+                    cookieMap[trimmed.substring(0, eqIdx).trim()] = trimmed
+                }
+            }
+        }
+        val mergedCookies = cookieMap.values.joinToString("; ")
 
         val baseHeaders = headersBuilder().build()
         val customHeaders = baseHeaders.newBuilder().apply {
-            set("Cookie", cookies)
+            if (mergedCookies.isNotBlank()) {
+                set("Cookie", mergedCookies)
+            }
+            set("Referer", "$baseUrl/")
+            set("Origin", baseUrl)
         }.build()
 
         return listOf(Video(videoUrl, "Default", videoUrl, customHeaders))
@@ -392,7 +419,7 @@ open class MyReadingManga(override val lang: String, private val siteLang: Strin
         if (!filtersCached) {
             mainPage = filterAssist(baseUrl)
             searchPage = filterAssist("$baseUrl/?s=")
-            filtersCached = true
+            filtersCached = mainPage.isNotBlank() && searchPage.isNotBlank()
         }
     }
 

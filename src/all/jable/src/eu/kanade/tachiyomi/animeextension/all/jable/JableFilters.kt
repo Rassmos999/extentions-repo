@@ -20,4 +20,6 @@ open class UriPartFilter(name: String, private val pairs: Array<Pair<String, Str
 
 class SortFilter(name: String, pairs: Array<Pair<String, String>>) : UriPartFilter(name, pairs)
 
+class CategoryFilter(name: String, pairs: Array<Pair<String, String>>) : UriPartFilter(name, pairs)
+
 class TagFilter(name: String, pairs: Array<Pair<String, String>>) : UriPartFilter(name, pairs)

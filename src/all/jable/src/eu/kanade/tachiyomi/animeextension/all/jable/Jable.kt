@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.all.jable
 
 import android.content.SharedPreferences
+import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimeUpdateStrategy
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -17,6 +18,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import uy.kohesive.injekt.injectLazy
+import java.io.IOException
 
 class Jable(override val lang: String) : AnimeHttpSource() {
     override val baseUrl: String
@@ -28,6 +30,7 @@ class Jable(override val lang: String) : AnimeHttpSource() {
 
     private val preferences by getPreferencesLazy()
     private val json by injectLazy<Json>()
+    private val playlistUtils by lazy { PlaylistUtils(client, headers) }
     private var tagsUpdated = false
 
     override fun animeDetailsRequest(anime: SAnime): Request = GET("$baseUrl${anime.url}?lang=${lang.toRequestLang()}", headers)
@@ -57,9 +60,24 @@ class Jable(override val lang: String) : AnimeHttpSource() {
 
     override fun videoListParse(response: Response): List<Video> {
         val doc = response.asJsoup()
-        val videoUrl = doc.selectFirst("script:containsData(var hlsUrl)")!!.data()
-            .substringAfter("var hlsUrl = '").substringBefore("'")
-        return listOf(Video(videoUrl, "Default", videoUrl))
+        val videoUrl = doc.select("script:containsData(hlsUrl)")
+            .asSequence()
+            .mapNotNull { HLS_URL_REGEX.find(it.data())?.groupValues?.getOrNull(1) }
+            .firstOrNull()
+            ?: throw IOException("Video URL not found (if Cloudflare blocked Jable, open in WebView once and retry).")
+        val videoHeaders = headersBuilder()
+            .set("Referer", "$baseUrl/")
+            .set("Origin", baseUrl)
+            .build()
+        return runCatching {
+            playlistUtils.extractFromHls(
+                videoUrl,
+                referer = "$baseUrl/",
+                videoNameGen = { quality -> if (quality == "Video") "Default" else quality },
+            )
+        }.getOrDefault(emptyList()).ifEmpty {
+            listOf(Video(videoUrl, "Default", videoUrl, headers = videoHeaders))
+        }
     }
 
     override fun latestUpdatesParse(response: Response): AnimesPage {
@@ -111,8 +129,11 @@ class Jable(override val lang: String) : AnimeHttpSource() {
             query = query,
         )
     } else {
-        val path = filters.list.filterIsInstance<TagFilter>()
-            .firstOrNull()?.selected?.second?.takeUnless { it.isEmpty() } ?: "hot"
+        val categoryPath = filters.list.filterIsInstance<CategoryFilter>()
+            .firstOrNull()?.selected?.second.orEmpty()
+        val tagPath = filters.list.filterIsInstance<TagFilter>()
+            .firstOrNull()?.selected?.second.orEmpty()
+        val path = categoryPath.ifEmpty { tagPath }.ifEmpty { "hot" }
         searchRequest(path, page, AnimeFilterList(filters.list + commonVideoListFuncFilter))
     }
 
@@ -129,6 +150,7 @@ class Jable(override val lang: String) : AnimeHttpSource() {
             // load whole page for update filter tags info
             urlBuilder.addQueryParameter("mode", "async")
         }
+        var sortBy: String? = null
         filters.list.forEach {
             when (it) {
                 is BlockFunctionFilter -> {
@@ -138,7 +160,7 @@ class Jable(override val lang: String) : AnimeHttpSource() {
 
                 is SortFilter -> {
                     if (it.selected.second.isNotEmpty()) {
-                        urlBuilder.addQueryParameter("sort_by", it.selected.second)
+                        sortBy = it.selected.second
                     }
                 }
 
@@ -151,45 +173,71 @@ class Jable(override val lang: String) : AnimeHttpSource() {
                 else -> {}
             }
         }
+        sortBy?.let { urlBuilder.addQueryParameter("sort_by", it) }
         if (query.isNotEmpty()) {
             urlBuilder.addQueryParameter("q", query)
         }
         urlBuilder.addQueryParameter("from", "%02d".format(page))
             .addQueryParameter("_", System.currentTimeMillis().toString())
-        return GET(urlBuilder.build())
+        return GET(urlBuilder.build(), headers)
     }
 
-    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        SortFilter(
-            intl.filterPopularSortTitle,
-            arrayOf(
-                "" to "",
-                intl.hotMonth to "video_viewed_month",
-                intl.hotWeek to "video_viewed_week",
-                intl.hotDay to "video_viewed_today",
-                intl.hotAll to "video_viewed",
+    override fun getFilterList(): AnimeFilterList {
+        val tagEntries = buildList {
+            add("" to "")
+            val cachedTags = preferences.getTags()
+            if (!cachedTags.isNullOrEmpty()) {
+                cachedTags.forEach { add(it.key to it.value) }
+            } else {
+                DEFAULT_TAGS.forEach { add(it) }
+            }
+        }.toTypedArray()
+
+        return AnimeFilterList(
+            CategoryFilter(
+                intl.filterCategoryTitle,
+                arrayOf(
+                    "" to "",
+                    intl.catBdsm to "categories/bdsm",
+                    intl.catSexOnly to "categories/sex-only",
+                    intl.catChineseSubtitle to "categories/chinese-subtitle",
+                    intl.catInsult to "categories/insult",
+                    intl.catUniform to "categories/uniform",
+                    intl.catRoleplay to "categories/roleplay",
+                    intl.catPrivateCam to "categories/private-cam",
+                    intl.catUncensored to "categories/uncensored",
+                    intl.catPov to "categories/pov",
+                    intl.catGroupsex to "categories/groupsex",
+                    intl.catPantyhose to "categories/pantyhose",
+                    intl.catLesbian to "categories/lesbian",
+                ),
             ),
-        ),
-        TagFilter(
-            intl.filterTagTitle,
-            buildList {
-                add("" to "")
-                preferences.getTags()?.forEach {
-                    add(it.key to it.value)
-                }
-            }.toTypedArray(),
-        ),
-        SortFilter(
-            intl.filterTagsSortTitle,
-            arrayOf(
-                "" to "",
-                intl.sortLatestUpdate to "post_date",
-                intl.sortMostView to "video_viewed",
-                intl.sortMostFavorite to "most_favourited",
-                intl.sortRecentBest to "post_date_and_popularity",
+            SortFilter(
+                intl.filterPopularSortTitle,
+                arrayOf(
+                    "" to "",
+                    intl.hotMonth to "video_viewed_month",
+                    intl.hotWeek to "video_viewed_week",
+                    intl.hotDay to "video_viewed_today",
+                    intl.hotAll to "video_viewed",
+                ),
             ),
-        ),
-    )
+            TagFilter(
+                intl.filterTagTitle,
+                tagEntries,
+            ),
+            SortFilter(
+                intl.filterTagsSortTitle,
+                arrayOf(
+                    "" to "",
+                    intl.sortLatestUpdate to "post_date",
+                    intl.sortMostView to "video_viewed",
+                    intl.sortMostFavorite to "most_favourited",
+                    intl.sortRecentBest to "post_date_and_popularity",
+                ),
+            ),
+        )
+    }
 
     private fun SharedPreferences.getTags(): Map<String, String>? {
         val savedStr = getString("${lang}_$PREF_KEY_TAGS", null)
@@ -252,5 +300,46 @@ class Jable(override val lang: String) : AnimeHttpSource() {
 
     companion object {
         const val PREF_KEY_TAGS = "pref_key_tags"
+
+        private val HLS_URL_REGEX = Regex("""\bhlsUrl\s*=\s*["']([^"']+)["']""")
+
+        private val DEFAULT_TAGS = listOf(
+            "Big tits" to "tags/big-tits",
+            "Creampie" to "tags/creampie",
+            "Blowjob" to "tags/blowjob",
+            "Anal sex" to "tags/anal-sex",
+            "School uniform" to "tags/school-uniform",
+            "Swimsuit" to "tags/swimsuit",
+            "Maid" to "tags/maid",
+            "Nurse" to "tags/nurse",
+            "Teacher" to "tags/teacher",
+            "Housewife" to "tags/housewife",
+            "Mature woman" to "tags/mature-woman",
+            "Wife" to "tags/wife",
+            "Widow" to "tags/widow",
+            "Affair" to "tags/affair",
+            "NTR" to "tags/ntr",
+            "Bondage" to "tags/bondage",
+            "Gangbang" to "tags/groupsex",
+            "3P" to "tags/3p",
+            "Chikan" to "tags/chikan",
+            "Massage" to "tags/massage",
+            "Squirting" to "tags/squirting",
+            "Deep throat" to "tags/deep-throat",
+            "Facial" to "tags/facial",
+            "Tit Wank" to "tags/tit-wank",
+            "Stockings" to "tags/stockings",
+            "Fishnets" to "tags/fishnets",
+            "Black pantyhose" to "tags/black-pantyhose",
+            "OL" to "tags/ol",
+            "Anime character" to "tags/Cosplay",
+            "Bunny girl" to "tags/bunny-girl",
+            "Kimono" to "tags/kimono",
+            "Cheongsam" to "tags/cheongsam",
+            "Glasses" to "tags/glasses",
+            "Hot spring" to "tags/hot-spring",
+            "Time stop" to "tags/time-stop",
+            "Hypnosis" to "tags/hypnosis",
+        )
     }
 }

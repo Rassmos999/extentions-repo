@@ -20,13 +20,12 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.lib.jsunpacker.JsUnpacker
-import keiyoushi.utils.bodyString
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.useAsJsoup
+import kotlinx.coroutines.runBlocking
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -427,15 +426,21 @@ class SupJav2(override val lang: String = "en") :
             url.contains("turbovid", true) -> "TV"
 
             url.contains("fc2stream", true) || url.contains("streamwish", true) ||
-                url.contains("fastshow", true) -> "FST"
+                url.contains("fastshow", true) || url.contains("wish", true) -> "FST"
 
             url.contains("streamtape", true) -> "ST"
 
             url.contains("voe", true) -> "VOE"
 
-            url.contains("dood", true) || url.contains("ds2play", true) -> "DOOD"
+            url.contains("dood", true) || url.contains("ds2play", true) ||
+                url.contains("myvidplay", true) || url.contains("playmogo", true) ||
+                url.contains("d000d", true) || url.contains("doood", true) -> "DOOD"
 
             url.contains("mixdrop", true) -> "MIXDROP"
+
+            url.contains("uqload", true) -> "UQLOAD"
+
+            url.contains("vidhide", true) -> "VIDHIDE"
 
             else -> player.label
         }
@@ -450,11 +455,33 @@ class SupJav2(override val lang: String = "en") :
 
                 "MIXDROP" -> mixdropExtractor.videosFromUrl(url)
 
+                "UQLOAD" -> runBlocking { uqloadExtractor.videosFromUrl(url) }
+
                 "VOE" -> VoeExtractor(client, embedHeaders(player.pageReferer)).videosFromUrl(url)
 
                 "VAS" -> extractVasBlocking(url)
 
-                // EVS (EarnVids), LUC (LuluStream), FST, ...: packed jwplayer pages
+                "FST" -> {
+                    extractPackedHlsBlocking(url, player.pageReferer, hoster).ifEmpty {
+                        if (url.contains("fc2stream", ignoreCase = true)) {
+                            emptyList()
+                        } else {
+                            runBlocking {
+                                StreamWishExtractor(client, embedHeaders(player.pageReferer)).videosFromUrl(url)
+                            }
+                        }
+                    }
+                }
+
+                "VIDHIDE", "EVS", "LUC" -> {
+                    extractPackedHlsBlocking(url, player.pageReferer, hoster).ifEmpty {
+                        runBlocking {
+                            VidHideExtractor(client, embedHeaders(player.pageReferer)).videosFromUrl(url) { "$hoster - $it" }
+                        }
+                    }
+                }
+
+                // Other mirrors: packed jwplayer pages
                 else -> extractPackedHlsBlocking(url, player.pageReferer, hoster)
             }
         }.getOrDefault(emptyList())
@@ -500,8 +527,19 @@ class SupJav2(override val lang: String = "en") :
             ?: FST_M3U8_REGEX.find(body)?.value
             ?: return emptyList()
         val playlist = normalizePlayerUrl(rawPlaylist, url) ?: return emptyList()
-        if (isBrowserWrappedTvPlaylist(playlist, url)) return emptyList()
-        return listOf(Video(playlist, "TV - HLS", playlist, headers = playbackHeaders(url)))
+        if (!isReachableHlsPlaylist(playlist, url) || isBrowserWrappedTvPlaylist(playlist, url)) return emptyList()
+        val playerHeaders = playbackHeaders(url)
+        return runCatching {
+            playlistUtils.extractFromHls(
+                playlistUrl = playlist,
+                referer = url,
+                masterHeaders = playerHeaders,
+                videoHeaders = playerHeaders,
+                videoNameGen = { if (it == "Video") "TV - HLS" else "TV - $it" },
+            ).distinctBy { it.videoUrl }
+        }.getOrDefault(emptyList()).ifEmpty {
+            listOf(Video(playlist, "TV - HLS", playlist, headers = playerHeaders))
+        }
     }
 
     /**
@@ -557,7 +595,18 @@ class SupJav2(override val lang: String = "en") :
             ?.let { normalizePlayerUrl(it, url) }
             ?: return emptyList()
         if (!isReachableHlsPlaylist(playlist, url)) return emptyList()
-        return listOf(Video(playlist, "$label - HLS", playlist, headers = playbackHeaders(url)))
+        val playerHeaders = playbackHeaders(url)
+        return runCatching {
+            playlistUtils.extractFromHls(
+                playlistUrl = playlist,
+                referer = url,
+                masterHeaders = playerHeaders,
+                videoHeaders = playerHeaders,
+                videoNameGen = { if (it == "Video") "$label - HLS" else "$label - $it" },
+            ).distinctBy { it.videoUrl }
+        }.getOrDefault(emptyList()).ifEmpty {
+            listOf(Video(playlist, "$label - HLS", playlist, headers = playerHeaders))
+        }
     }
 
     /** VAS (vvaassjjav.xyz/e/{filecode}) serves its HLS master from a JSON API instead of the page. */
@@ -578,12 +627,23 @@ class SupJav2(override val lang: String = "en") :
             ?.replace("\\/", "/")
             ?: return emptyList()
         if (!isReachableHlsPlaylist(playlist, "$origin/")) return emptyList()
-        return listOf(Video(playlist, "VAS - HLS", playlist, headers = playbackHeaders("$origin/")))
+        val playerHeaders = playbackHeaders("$origin/")
+        return runCatching {
+            playlistUtils.extractFromHls(
+                playlistUrl = playlist,
+                referer = "$origin/",
+                masterHeaders = playerHeaders,
+                videoHeaders = playerHeaders,
+                videoNameGen = { if (it == "Video") "VAS - HLS" else "VAS - $it" },
+            ).distinctBy { it.videoUrl }
+        }.getOrDefault(emptyList()).ifEmpty {
+            listOf(Video(playlist, "VAS - HLS", playlist, headers = playerHeaders))
+        }
     }
 
     private fun isReachableHlsPlaylist(playlist: String, referer: String): Boolean = runCatching {
         client.newCall(GET(playlist, playbackHeaders(referer))).execute().use { response ->
-            response.isSuccessful && response.body.string().startsWith("#EXTM3U")
+            response.isSuccessful && response.body.string().trimStart().startsWith("#EXTM3U")
         }
     }.getOrDefault(false)
 
@@ -614,171 +674,6 @@ class SupJav2(override val lang: String = "en") :
 
     private val noRedirectClient by lazy {
         client.newBuilder().followRedirects(false).build()
-    }
-
-    private suspend fun resolveProtectorRedirect(id: String): String? {
-        if (id.isBlank()) return null
-        if (id.startsWith("http://") || id.startsWith("https://")) {
-            if (!id.contains("supjav", ignoreCase = true)) {
-                return id
-            }
-            return fetchRedirect(id)
-        }
-        if (id.startsWith("//")) {
-            return "https:$id"
-        }
-
-        return fetchRedirect(id.reversed()) ?: fetchRedirect(id)
-    }
-
-    private suspend fun fetchRedirect(code: String): String? = runCatching {
-        val targetUrl = if (
-            code.startsWith("http://") ||
-            code.startsWith("https://") ||
-            code.contains("supjav.php")
-        ) {
-            code
-        } else {
-            "$PROTECTOR_URL/supjav.php?c=$code"
-        }
-
-        noRedirectClient.newCall(GET(targetUrl, protectorHeaders))
-            .await()
-            .use { redirectResponse ->
-                redirectResponse.throwIfCloudflareChallenge()
-                val location = redirectResponse.header("Location")?.trim().orEmpty()
-                if (location.isBlank()) return@use null
-                redirectResponse.request.url.resolve(location)?.toString()
-            }
-    }.getOrNull()
-
-    private suspend fun videosFromPlayer(player: PlayerRequest): List<Video> {
-        val url = resolveProtectorRedirect(player.id) ?: return emptyList()
-        val hoster = player.label
-        val embedHeaders = embedHeaders(player.pageReferer)
-
-        val normalizedHoster = when {
-            hoster in SUPPORTED_SERVERS -> hoster
-
-            url.contains("streamtape", ignoreCase = true) -> "ST"
-
-            url.contains("voe", ignoreCase = true) -> "VOE"
-
-            url.contains("streamwish", ignoreCase = true) ||
-                url.contains("wish", ignoreCase = true) ||
-                url.contains("fastshow", ignoreCase = true) ||
-                url.contains("fc2stream", ignoreCase = true) -> "FST"
-
-            url.contains("turbovid", ignoreCase = true) -> "TV"
-
-            url.contains("dood", ignoreCase = true) || url.contains("ds2play", ignoreCase = true) -> "DOOD"
-
-            url.contains("mixdrop", ignoreCase = true) -> "MIXDROP"
-
-            url.contains("uqload", ignoreCase = true) -> "UQLOAD"
-
-            url.contains("vidhide", ignoreCase = true) -> "VIDHIDE"
-
-            else -> hoster
-        }
-
-        return runCatching {
-            when (normalizedHoster) {
-                "ST" -> streamtapeExtractor.videosFromUrl(url)
-
-                "VOE" -> VoeExtractor(client, embedHeaders).videosFromUrl(url)
-
-                "FST" -> {
-                    if (url.contains("fc2stream", ignoreCase = true)) {
-                        extractFstFallback(url, player.pageReferer)
-                    } else {
-                        StreamWishExtractor(client, embedHeaders).videosFromUrl(url)
-                            .ifEmpty { extractFstFallback(url, player.pageReferer) }
-                    }
-                }
-
-                "DOOD" -> doodExtractor.videosFromUrl(url)
-
-                "MIXDROP" -> mixdropExtractor.videosFromUrl(url)
-
-                "UQLOAD" -> uqloadExtractor.videosFromUrl(url)
-
-                "VIDHIDE" -> VidHideExtractor(client, embedHeaders).videosFromUrl(url)
-
-                "TV" -> extractTvVideos(url, player.pageReferer)
-
-                else -> emptyList()
-            }
-        }.getOrElse { emptyList() }
-    }
-
-    /**
-     * turbovidhls currently returns HTTP 500 while still serving a valid
-     * player body. Do not use awaitSuccess here; parse the body when the
-     * expected player marker is present.
-     */
-    private suspend fun extractTvVideos(url: String, pageReferer: String): List<Video> {
-        val response = client.newCall(GET(url, embedHeaders(pageReferer))).await()
-        val body = response.use {
-            it.throwIfCloudflareChallenge()
-            it.bodyString()
-        }.replace("\\/", "/")
-
-        val document = Jsoup.parse(body, url)
-        val rawPlaylist = TV_URL_PLAY_REGEX.find(body)?.groupValues?.get(1)
-            ?: TV_DATA_HASH_REGEX.find(body)?.groupValues?.get(1)
-            ?: document.selectFirst("source[src*=m3u8], video[src*=m3u8]")?.attr("src")
-            ?: TV_FILE_URL_REGEX.find(body)?.groupValues?.get(1)
-            ?: FST_M3U8_REGEX.find(body)?.value
-            ?: return emptyList()
-        val playlistUrl = normalizePlayerUrl(rawPlaylist, url) ?: return emptyList()
-        val playerHeaders = playbackHeaders(url)
-
-        return playlistUtils.extractFromHls(
-            playlistUrl = playlistUrl,
-            referer = url,
-            masterHeaders = playerHeaders,
-            videoHeaders = playerHeaders,
-            videoNameGen = { "TV - $it" },
-        ).distinctBy { it.videoUrl }
-    }
-
-    /**
-     * Some FST clones expose a valid packed player only on the host returned
-     * by the protector. StreamWishExtractor intentionally rewrites /e/{id} to
-     * its canonical domains, so retain an absolute-host fallback here.
-     */
-    private suspend fun extractFstFallback(url: String, pageReferer: String): List<Video> {
-        val playerHeaders = playbackHeaders(url)
-        val response = client.newCall(GET(url, embedHeaders(pageReferer))).await()
-        val body = response.use {
-            it.throwIfCloudflareChallenge()
-            it.bodyString()
-        }
-        val document = Jsoup.parse(body, url)
-        val scripts = document.select("script").map { it.data() }
-        val expandedScripts = scripts.map { script ->
-            if ("eval(function(p,a,c" in script) {
-                runCatching { JsUnpacker.unpackAndCombine(script) }.getOrDefault(script)
-            } else {
-                script
-            }
-        }
-        val normalizedScript = expandedScripts.joinToString("\n")
-            .replace("\\/", "/")
-            .replace("\\u0026", "&")
-        val rawPlaylist = FST_M3U8_REGEX.find(normalizedScript)?.value
-            ?: document.selectFirst("source[src*=m3u8], video[src*=m3u8]")?.attr("src")
-            ?: return emptyList()
-        val playlistUrl = normalizePlayerUrl(rawPlaylist, url) ?: return emptyList()
-
-        return playlistUtils.extractFromHls(
-            playlistUrl = playlistUrl,
-            referer = url,
-            masterHeaders = playerHeaders,
-            videoHeaders = playerHeaders,
-            videoNameGen = { "FST - $it" },
-        ).distinctBy { it.videoUrl }
     }
 
     private fun playbackHeaders(referer: String): okhttp3.Headers = headers.newBuilder()
@@ -880,8 +775,6 @@ class SupJav2(override val lang: String = "en") :
             Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""", RegexOption.IGNORE_CASE)
 
         private val VAS_STREAM_REGEX = Regex(""""streaming_url"\s*:\s*"([^"]+)"""")
-
-        private val SUPPORTED_SERVERS = setOf("TV", "FST", "VOE", "ST", "DOOD", "MIXDROP", "UQLOAD", "VIDHIDE")
 
         private const val PREF_QUALITY_KEY = "pref_quality"
         private const val PREF_QUALITY_TITLE = "Preferred video quality"
