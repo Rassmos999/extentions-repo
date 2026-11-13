@@ -22,52 +22,52 @@ Repository structure and usage-based partitioning for the **108 published extens
 ### Group A1 — Anime & Donghua Streaming (9)
 | Extension | Package Suffix | Usage / Type | Current Status |
 |---|---|---|---|
-| `animeonsen` | `all.animeonsen` | Anime streaming (OAuth + Meilisearch API) | Pending live audit |
-| `animetsu` | `all.animetsu` | Anime streaming (`m3u8server`, +18 toggle) | Pending live audit (domains suspected dead) |
-| `animeworldindia` | `all.animeworldindia` | Multi-lang anime (`anime-world.co` -> `watchanimeworld.one`) | Pending live audit |
-| `animexin` | `all.animexin` | Donghua (`themePkg: animestream`) | Pending live audit |
-| `anizone` | `all.anizone` | Anime (`anizone.to`, Livewire) | Pending live audit |
-| `chineseanime` | `all.chineseanime` | Donghua (`themePkg: animestream`) | Pending live audit |
-| `lmanime` | `all.lmanime` | Donghua/Anime (`themePkg: animestream`) | Pending live audit |
-| `streamingcommunity` | `all.streamingcommunity` | Movies & TV EN/IT (`StreamingUnity`) | Pending live audit |
-| `subsplease` | `all.subsplease` | Anime releases (Torrent magnet / Debrid) | Pending live audit |
+| `animeonsen` | `all.animeonsen` | Anime streaming (OAuth + Meilisearch API) | Verified live (`v14.10`, unchanged) |
+| `animetsu` | `all.animetsu` | Anime streaming (`m3u8server`, +18 toggle) | **Dead** (site shut down / removed upstream; kept at `v14.7` pending removal confirmation) |
+| `animeworldindia` | `all.animeworldindia` | Multi-lang anime (`watchanimeworld.one`) | **Fixed & Rebuilt** (`v14.23`, `bdb8b5b`: `ZephyrixExtractor` + updated domain/filters) |
+| `animexin` | `all.animexin` | Donghua (`themePkg: animestream`) | **Fixed & Rebuilt** (`v14.30`, `bdb8b5b`: restored `animestream` theme) |
+| `anizone` | `all.anizone` | Anime (`anizone.to`, Livewire) | **Fixed & Rebuilt** (`v14.12`, `bdb8b5b`: updated Livewire / `AnizoneDto`) |
+| `chineseanime` | `all.chineseanime` | Donghua (`themePkg: animestream`) | **Dead / Broken Site** (`chineseanime.vip` parked `"Redirecting..."` stub, TLS/HTTP2 reset; `v14.32` idx vs `src=33` `VER_DRIFT` left unbuilt pending removal confirmation) |
+| `lmanime` | `all.lmanime` | Donghua/Anime (`themePkg: animestream`) | **Fixed & Rebuilt** (`v14.28`, `bdb8b5b`) |
+| `streamingcommunity` | `all.streamingcommunity` | Movies & TV EN/IT (`StreamingUnity`) | **Fixed & Rebuilt** (`v14.22`, `bdb8b5b`) |
+| `subsplease` | `all.subsplease` | Anime releases (Torrent magnet / Debrid) | **Fixed & Rebuilt** (`v14.6`, `bdb8b5b`: `AndroidManifest.xml` torrent flag) |
 
 ### Group A2 — Media Servers, Cloud & General Portals (6)
 | Extension | Package Suffix | Usage / Type | Current Status |
 |---|---|---|---|
-| `googledrive` | `all.googledrive` | Google Drive folder player | Pending audit |
-| `googledriveindex` | `all.googledriveindex` | Cloudflare Worker GD Index client | Pending audit |
-| `jellyfin` | `all.jellyfin` | Self-hosted Jellyfin media server client | Pending audit |
-| `newgrounds` | `all.newgrounds` | Newgrounds animations/movies | Pending audit |
-| `shabakatycinemana` | `all.shabakatycinemana` | Shabakaty Cinemana portal (Iraq ISP scoped) | Pending audit |
-| `stremio` | `all.stremio` | Stremio addon client (HTTP / Torrent / Debrid) | Pending audit |
+| `googledrive` | `all.googledrive` | Google Drive folder player | User-configured URL portal (`v14.18`, unchanged) |
+| `googledriveindex` | `all.googledriveindex` | Cloudflare Worker GD Index client | User-configured URL portal (`v14.7`, unchanged) |
+| `jellyfin` | `all.jellyfin` | Self-hosted Jellyfin media server client | **Fixed & Rebuilt** (`v14.31`, `b695535`: ProGuard rules, subpath, login) |
+| `newgrounds` | `all.newgrounds` | Newgrounds animations/movies | **Fixed & Rebuilt** (`v14.2`, `b695535`: NG Guard) |
+| `shabakatycinemana` | `all.shabakatycinemana` | Shabakaty Cinemana portal (Iraq ISP scoped) | **Dead / Geo-locked** (removed upstream / Iraq ISP scoped; kept at `v14.3` pending confirmation) |
+| `stremio` | `all.stremio` | Stremio addon client (HTTP / Torrent / Debrid) | **Fixed & Rebuilt** (`v14.10`, `b695535`: torrent manifest + login) |
 
 ### Group A3 — Torrent & Debrid Indexers (6)
 | Extension | Package Suffix | Usage / Type | Current Status |
 |---|---|---|---|
-| `debridindex` | `all.debridindex` | Torrentio Debrid Index (requires Debrid key) | Pending audit |
-| `hentaitorrent` | `all.hentaitorrent` | Hentai Torrent (`isTorrent = true`, +18) | Pending audit |
-| `nyaatorrent` | `all.nyaatorrent` | Nyaa & Sukebei (`isTorrent = true`, `TorrentUtils`) | Pending audit |
-| `ptorrent` | `all.ptorrent` | PTorrent (`isTorrent = true`, +18) | Pending audit |
-| `torrentio` | `all.torrentio` | Torrentio Movies/TV (Torrent / Debrid) | Pending audit |
-| `torrentioanime` | `all.torrentioanime` | Torrentio Anime (Torrent / Debrid) | Pending audit |
+| `debridindex` | `all.debridindex` | Torrentio Debrid Index (requires Debrid key) | Requires user Debrid API key (`v14.2`, unchanged) |
+| `hentaitorrent` | `all.hentaitorrent` | Hentai Torrent (`isTorrent = true`, +18) | **Fixed & Rebuilt** (`v14.17`, `8da0dc3`/`419657b`: torrent manifest, deeplinks, categories) |
+| `nyaatorrent` | `all.nyaatorrent` | Nyaa & Sukebei (`isTorrent = true`, `TorrentUtils`) | **Fixed & Rebuilt** (`v14.7`, `8da0dc3`/`419657b`: torrent manifest + resolved `VER_DRIFT`) |
+| `ptorrent` | `all.ptorrent` | PTorrent (`isTorrent = true`, +18) | **Fixed & Rebuilt** (`v14.18`, `8da0dc3`/`419657b`: torrent manifest, deeplinks, categories) |
+| `torrentio` | `all.torrentio` | Torrentio Movies/TV (Torrent / Debrid) | **Fixed & Rebuilt** (`v14.9`, `8da0dc3`/`419657b`: torrent manifest, deeplinks, DTO) |
+| `torrentioanime` | `all.torrentioanime` | Torrentio Anime (Torrent / Debrid) | **Fixed & Rebuilt** (`v14.20`, `8da0dc3`/`419657b`: torrent manifest, deeplinks) |
 
 ### Group A4 — Adult / JAV +18 (13)
 | Extension | Package Suffix | Usage / Type | Current Status |
 |---|---|---|---|
-| `jable` | `all.jable` | JAV HLS streaming | Pending audit |
-| `javdb` | `all.javdb` | JAV index + MissAV HLS + magnets (`isTorrent = true`) | Pending audit |
-| `javgg` | `all.javgg` | JAV multi-embed streaming | Pending audit |
-| `javguru` | `all.javguru` | JAV multi-embed + Actress catalog | Pending audit |
-| `missav` | `all.missav` | JAV HLS streaming (`src` v65 vs `apk` v77 drift) | Pending audit |
-| `myreadingmanga` | `all.myreadingmanga` | Bara/Yaoi video/gallery scraper (multi-lang factory) | Pending audit |
-| `pornhub` | `all.pornhub` | Adult tube (HLS / MP4) | Pending audit |
-| `rouvideo` | `all.rouvideo` | Asian adult (TanStack Start + PNG-HLS proxy) | Pending audit |
-| `sextb` | `all.sextb` | JAV multi-embed streaming | Pending audit |
-| `supjav` | `all.supjav` | JAV multi-embed streaming (CF protected) | Pending audit |
-| `supjav2` | `all.supjav2` | JAV multi-embed streaming | Pending audit |
-| `xnxx` | `all.xnxx` | Adult tube | Pending audit |
-| `xvideos` | `all.xvideos` | Adult tube | Pending audit |
+| `jable` | `all.jable` | JAV HLS streaming | **Fixed & Rebuilt** (`v14.15`, `156cfd5`: `/categories/*` + seeded tags, single `sort_by`, headers, HLS `PlaylistUtils` + `Referer`, live-verified) |
+| `javdb` | `all.javdb` | JAV index + MissAV HLS + magnets (`isTorrent = true`) | **Fixed & Rebuilt** (`v14.2`, `3b51b4a`: `missav.live` default + MissAV `Referer` fixing `surrit.com` 403, `isTorrent = true` verified) |
+| `javgg` | `all.javgg` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.31`, `9d2e370`) |
+| `javguru` | `all.javguru` | JAV multi-embed + Actress catalog | **Fixed & Rebuilt** (`v14.56`, `9d2e370`) |
+| `missav` | `all.missav` | JAV HLS streaming | **Fixed & Rebuilt** (`v14.78`, `3b51b4a`: `missav.live` default + site `Origin`/`Referer` fixing `surrit.com` 403, top categories, pagination, `VER_DRIFT` resolved) |
+| `myreadingmanga` | `all.myreadingmanga` | Bara/Yaoi video/gallery scraper (multi-lang factory) | **Fixed & Rebuilt** (`v14.3`, `156cfd5`: merged CookieJar + WebView cookies + `Referer`/`Origin` headers, `cacheAssistant` retry guard; CF Turnstile gated) |
+| `pornhub` | `all.pornhub` | Adult tube (HLS / MP4) | **Fixed & Rebuilt** (`v14.64`, `3b51b4a`: search `o=ht`/`cm` 404 fix, 99 live categories, `videoHeaders` cookies) |
+| `rouvideo` | `all.rouvideo` | Asian adult (TanStack Start + PNG-HLS proxy) | **Fixed & Rebuilt** (`v14.26`, `9d2e370`: `/home` parsing + `m3u8server` PNG-HLS proxy) |
+| `sextb` | `all.sextb` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.17`, `9d2e370`) |
+| `supjav` | `all.supjav` | JAV multi-embed streaming (CF protected) | **Fixed & Rebuilt** (`v14.100`, `156cfd5`: `supportsLatest`, pagination, synchronous extractors + `TV`/`DOOD`/`MIXDROP`/`UQLOAD`/`FST`/`EVS`/`LUC`/`VAS` + filters; CF Turnstile gated) |
+| `supjav2` | `all.supjav2` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.29`, `156cfd5`: wired `uqloadExtractor`, `DOOD` mirrors, `StreamWishExtractor`/`VidHideExtractor` fallbacks, multi-variant HLS, removed dead suspend block; CF Turnstile gated) |
+| `xnxx` | `all.xnxx` | Adult tube | **Fixed & Rebuilt** (`v14.22`, `3b51b4a`: dynamic `/todays-selection/` archive date pagination + next-page selectors) |
+| `xvideos` | `all.xvideos` | Adult tube | **Fixed & Rebuilt** (`v14.23`, `3b51b4a`: next-page selectors + category/tag + filter search routing) |
 
 ---
 
