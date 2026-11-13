@@ -21,6 +21,7 @@ import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.awaitSuccess
+import eu.kanade.tachiyomi.network.interceptor.rateLimitHost
 import keiyoushi.lib.jsunpacker.JsUnpacker
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parallelCatchingFlatMapBlocking
@@ -37,6 +38,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 import java.io.IOException
+import kotlin.time.Duration.Companion.seconds
 
 class SupJav(override val lang: String = "en") :
     ParsedAnimeHttpSource(),
@@ -47,6 +49,10 @@ class SupJav(override val lang: String = "en") :
     override val baseUrl = "https://supjav.com"
 
     override val supportsLatest = true
+
+    override val client = network.client.newBuilder()
+        .rateLimitHost(baseUrl.toHttpUrl(), 2, 1.seconds)
+        .build()
 
     /*
      * Keep NetworkHelper's Android UA and cookie jar so Cloudflare WebView clearance cookies match.
@@ -64,7 +70,14 @@ class SupJav(override val lang: String = "en") :
     private val preferences by getPreferencesLazy()
 
     // ============================== Popular ===============================
-    override fun popularAnimeRequest(page: Int) = GET("$baseUrl$langPath/popular${if (page > 1) "/page/$page" else ""}", headers)
+    override fun popularAnimeRequest(page: Int): Request {
+        val url = when {
+            page <= 3 -> "$baseUrl$langPath/popular${if (page > 1) "/page/$page" else ""}"
+            page <= 6 -> "$baseUrl$langPath/popular${if (page > 4) "/page/${page - 3}" else ""}?sort=week"
+            else -> "$baseUrl$langPath/popular${if (page > 7) "/page/${page - 6}" else ""}?sort=month"
+        }
+        return GET(url, headers)
+    }
 
     override fun popularAnimeSelector() = "div.posts > div.post > a"
 
@@ -101,11 +114,19 @@ class SupJav(override val lang: String = "en") :
 
     override fun popularAnimeParse(response: Response): AnimesPage {
         response.throwIfCloudflareChallenge()
-        return super.popularAnimeParse(response)
+        val page = super.popularAnimeParse(response)
+        if (page.animes.isEmpty()) return page
+        val sortParam = response.request.url.queryParameter("sort")
+        val localPage = Regex("""/page/(\d+)""").find(response.request.url.encodedPath)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+        val hasNext = page.hasNextPage || (sortParam != "month" && localPage <= 3)
+        return AnimesPage(page.animes, hasNext)
     }
 
     // =============================== Latest ===============================
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl$langPath${if (page > 1) "/page/$page" else "/"}", headers)
+    override fun latestUpdatesRequest(page: Int): Request = GET(
+        "$baseUrl$langPath/category/censored-jav${if (page > 1) "/page/$page" else ""}",
+        headers,
+    )
 
     override fun latestUpdatesSelector(): String = popularAnimeSelector()
 
@@ -171,7 +192,7 @@ class SupJav(override val lang: String = "en") :
 
             sort == "popular" -> "$baseUrl$langPath/popular${if (page > 1) "/page/$page" else ""}"
 
-            else -> "$baseUrl$langPath${if (page > 1) "/page/$page" else "/"}"
+            else -> "$baseUrl$langPath/category/censored-jav${if (page > 1) "/page/$page" else ""}"
         }
         return GET(url, headers)
     }
@@ -239,6 +260,16 @@ class SupJav(override val lang: String = "en") :
             url = anime.url
         }
 
+        return listOf(episode)
+    }
+
+    override fun episodeListParse(response: Response): List<SEpisode> {
+        response.throwIfCloudflareChallenge()
+        val episode = SEpisode.create().apply {
+            name = "JAV"
+            episode_number = 1F
+            url = response.request.url.encodedPath
+        }
         return listOf(episode)
     }
 
@@ -353,7 +384,7 @@ class SupJav(override val lang: String = "en") :
         if (id.isBlank()) return null
         if (id.startsWith("//")) return "https:$id"
         if (id.startsWith("http://") || id.startsWith("https://")) {
-            if (!id.contains("supjav", true)) return id
+            if (!id.contains("supjav", true) && !id.contains("supremejav", true)) return id
             return fetchRedirectBlocking(id)
         }
         return fetchRedirectBlocking(id.reversed()) ?: fetchRedirectBlocking(id)
@@ -370,9 +401,10 @@ class SupJav(override val lang: String = "en") :
             "$PROTECTOR_URL/supjav.php?c=$code"
         }
         noRedirectClient.newCall(GET(targetUrl, protectorHeaders)).execute().use { response ->
-            response.throwIfCloudflareChallenge()
-            response.header("Location")?.trim()?.takeIf(String::isNotBlank)
+            val loc = response.header("Location")?.trim()?.takeIf(String::isNotBlank)
                 ?.let { response.request.url.resolve(it)?.toString() }
+            response.throwIfCloudflareChallenge()
+            loc
         }
     }.getOrNull()
 

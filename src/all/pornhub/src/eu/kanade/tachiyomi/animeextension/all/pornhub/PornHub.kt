@@ -46,8 +46,22 @@ class PornHub :
     private val preferences by getPreferencesLazy()
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addNetworkInterceptor(::ensureDesktopCookies)
         .addInterceptor(::retryRefusedPages)
         .build()
+
+    private fun ensureDesktopCookies(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (!request.url.host.endsWith("pornhub.com")) return chain.proceed(request)
+        val merged = linkedMapOf<String, String>()
+        request.header("Cookie")?.split(';')?.forEach { part ->
+            val eq = part.indexOf('=')
+            if (eq > 0) merged[part.substring(0, eq).trim()] = part.substring(eq + 1).trim()
+        }
+        REQUIRED_COOKIES.forEach { (k, v) -> merged[k] = v }
+        val cookieHeader = merged.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        return chain.proceed(request.newBuilder().header("Cookie", cookieHeader).build())
+    }
 
     /**
      * Behind VPNs such as Cloudflare WARP, www.pornhub.com answers some egress IPs with
@@ -131,6 +145,15 @@ class PornHub :
     override fun popularAnimeParse(response: Response): AnimesPage {
         val document = response.asJsoup()
         val animes = document.select(popularAnimeSelector())
+            .filter { el ->
+                el.parents().none { parent ->
+                    parent.id() in EXCLUDED_LIST_IDS ||
+                        parent.hasClass("dropdownHottestVideos") ||
+                        parent.hasClass("dropdownReccomendedVideos") ||
+                        parent.hasClass("dropdownPlaylistVideos") ||
+                        parent.hasClass("premiumStyle")
+                }
+            }
             .map { popularAnimeFromElement(it) }
             .filter { it.url.isNotBlank() && it.title.isNotBlank() }
             .distinctBy { it.url }
@@ -163,7 +186,9 @@ class PornHub :
         if (pornstar.isNotBlank()) {
             val url = baseUrl.toHttpUrl().newBuilder()
                 .addPathSegments("pornstar/$pornstar/videos")
-                .addQueryParameter("o", sort)
+                .apply {
+                    if (sort in PORNSTAR_SORTS) addQueryParameter("o", sort)
+                }
                 .addQueryParameter("page", page.toString())
                 .build()
             return GET(url, headers)
@@ -332,24 +357,25 @@ class PornHub :
                     null
                 }
 
-                if (format == "hls" && videoUrl != null) {
-                    if ("/get_media" in videoUrl) {
-                        // Fetch get_media JSON and recursively process definitions.
-                        try {
-                            client.newCall(GET(videoUrl, videoHeaders)).execute().use { resp ->
-                                if (!resp.isSuccessful) return@use
-                                val body = resp.body.string().trim()
-                                if (!body.startsWith("[")) return@use
-                                val arr = try {
-                                    json.parseToJsonElement(body).jsonArray
-                                } catch (_: Exception) {
-                                    null
-                                }
-                                if (arr != null) processDefinitions(arr, depth + 1)
+                if (videoUrl != null && "/get_media" in videoUrl) {
+                    // Fetch get_media JSON and recursively process definitions for both HLS and MP4.
+                    try {
+                        client.newCall(GET(videoUrl, videoHeaders)).execute().use { resp ->
+                            if (!resp.isSuccessful) return@use
+                            val body = resp.body.string().trim()
+                            if (!body.startsWith("[")) return@use
+                            val arr = try {
+                                json.parseToJsonElement(body).jsonArray
+                            } catch (_: Exception) {
+                                null
                             }
-                        } catch (_: Exception) {}
-                        continue
-                    }
+                            if (arr != null) processDefinitions(arr, depth + 1)
+                        }
+                    } catch (_: Exception) {}
+                    continue
+                }
+
+                if (format == "hls" && videoUrl != null) {
                     if (".m3u8" in videoUrl) {
                         // Master playlist: fetch and parse variants.
                         try {
@@ -675,6 +701,11 @@ class PornHub :
         hd: String = "",
     ): String {
         val isPathCategory = category.startsWith("path:")
+        val effectiveSort = when {
+            category.isNotBlank() && (sort == "ht" || sort == "mr") -> ""
+            category.isBlank() && sort == "mr" -> "ht"
+            else -> sort
+        }
         return baseUrl.toHttpUrl().newBuilder().apply {
             if (isPathCategory) {
                 addPathSegments("categories/${category.removePrefix("path:")}")
@@ -683,7 +714,7 @@ class PornHub :
                 if (category.isNotBlank()) addQueryParameter("c", category)
                 if (hd.isNotBlank()) addQueryParameter("hd", "1")
             }
-            addQueryParameter("o", sort)
+            if (effectiveSort.isNotBlank()) addQueryParameter("o", effectiveSort)
             addQueryParameter("page", page.toString())
             applyDuration(duration)
         }.build().toString()
@@ -755,6 +786,24 @@ class PornHub :
         private val REFUSED_CODES = setOf(403, 429)
         private const val REFUSED_RETRIES = 2
         private const val REFUSED_BACKOFF_MS = 700L
+
+        private val REQUIRED_COOKIES = mapOf(
+            "platform" to "pc",
+            "age_verified" to "1",
+            "accessAgeDisclaimerPH" to "1",
+            "accessAgeDisclaimerUK" to "1",
+            "accessPH" to "1",
+            "hasVisited" to "1",
+            "cookiesBannerSeen" to "1",
+            "cookieConsent" to "3",
+        )
+        private val EXCLUDED_LIST_IDS = setOf(
+            "hottestMenuSection",
+            "recommMenuSection",
+            "bottomVideos",
+            "uploadedVideosSection",
+        )
+        private val PORNSTAR_SORTS = setOf("mv", "tr", "lg")
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_TITLE = "Preferred quality"

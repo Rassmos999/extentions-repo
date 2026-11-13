@@ -1,6 +1,14 @@
-#-dontobfuscate
+-dontobfuscate
 -dontoptimize
 -dontpreverify
+
+# Preserve Source/AnimeSource overrides and Kotlin coroutine/function ABI types
+# so dynamically loaded extension APKs match host-app suspend method signatures.
+-keep class kotlin.** { *; }
+-keep class kotlin.coroutines.** { *; }
+-keep class kotlin.jvm.functions.** { *; }
+-keepclassmembers class * implements eu.kanade.tachiyomi.animesource.AnimeSource { *; }
+-keepclassmembers class * implements eu.kanade.tachiyomi.source.Source { *; }
 
 ## Partially based on https://android.googlesource.com/platform/tools/base/+/refs/heads/mirror-goog-studio-main/build-system/gradle-core/src/main/resources/com/android/build/gradle/proguard-common.txt
 

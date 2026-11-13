@@ -277,7 +277,7 @@ class Hanime :
         }
     }
 
-    private fun parseHitsToAnimeList(hits: List<HitsModel>): List<SAnime> = hits.groupBy { getTitle(it.name) }.map { (_, items) -> items.first() }.map { item ->
+    private fun parseHitsToAnimeList(hits: List<HitsModel>): List<SAnime> = hits.map { item ->
         SAnime.create().apply {
             val baseTitle = getTitle(item.name)
             val durationStr = formatDuration(item.durationInMs)
@@ -317,6 +317,7 @@ class Hanime :
             val lowerQuery = query.lowercase(Locale.US)
             filtered = filtered.filter { hit ->
                 hit.name.lowercase(Locale.US).contains(lowerQuery) ||
+                    (hit.searchTitles?.lowercase(Locale.US)?.contains(lowerQuery) == true) ||
                     hit.tags.any { tag -> tag.lowercase(Locale.US).contains(lowerQuery) } ||
                     (hit.brand?.lowercase(Locale.US)?.contains(lowerQuery) == true)
             }
@@ -346,10 +347,14 @@ class Hanime :
         // Censored content filter
         val censoredFilter = preferences.getString(PREF_CENSORED_KEY, PREF_CENSORED_DEFAULT) ?: PREF_CENSORED_DEFAULT
         filtered = when (censoredFilter) {
-            "uncensored" -> filtered.filter { it.isCensored != true }
+            "uncensored" -> filtered.filter { hit ->
+                hit.isCensored != true && hit.tags.none { it.equals("censored", ignoreCase = true) }
+            }
 
             // != true includes null/unknown items as potentially uncensored
-            "censored" -> filtered.filter { it.isCensored == true }
+            "censored" -> filtered.filter { hit ->
+                hit.isCensored == true || hit.tags.any { it.equals("censored", ignoreCase = true) }
+            }
 
             else -> filtered
         }
@@ -372,12 +377,13 @@ class Hanime :
             else -> compareByDescending { it.likes ?: 0L }
         }
         val sorted = if (ordering == "asc") filtered.sortedWith(comparator.reversed()) else filtered.sortedWith(comparator)
+        val uniqueSeries = sorted.distinctBy { getTitle(it.name) }
 
         // Paginate
         val fromIndex = (page - 1) * pageSize
-        val toIndex = minOf(fromIndex + pageSize, sorted.size)
-        val pageItems = if (fromIndex < sorted.size) sorted.subList(fromIndex, toIndex) else emptyList()
-        val hasNextPage = toIndex < sorted.size
+        val toIndex = minOf(fromIndex + pageSize, uniqueSeries.size)
+        val pageItems = if (fromIndex < uniqueSeries.size) uniqueSeries.subList(fromIndex, toIndex) else emptyList()
+        val hasNextPage = toIndex < uniqueSeries.size
 
         return AnimesPage(parseHitsToAnimeList(pageItems), hasNextPage)
     }
@@ -705,7 +711,7 @@ class Hanime :
     )
 
     internal class Tag(val id: String, name: String) : AnimeFilter.TriState(name)
-    internal class Brand(val id: String, name: String) : AnimeFilter.CheckBox(name)
+    internal class Brand(name: String, val id: String) : AnimeFilter.CheckBox(name)
     private class TagList(tags: List<Tag>) : AnimeFilter.Group<Tag>("Tags", tags)
     private class BrandList(brands: List<Brand>) : AnimeFilter.Group<Brand>("Brands", brands)
     private class TagInclusionMode : AnimeFilter.Select<String>("Included tags mode", arrayOf("And", "Or"), 0)
@@ -756,11 +762,8 @@ class Hanime :
                 is BrandList -> {
                     filter.state.forEach { brand ->
                         if (brand.state) {
-                            brands.add(
-                                brand.id.lowercase(
-                                    Locale.US,
-                                ),
-                            )
+                            brands.add(brand.name.lowercase(Locale.US))
+                            brands.add(brand.id.lowercase(Locale.US))
                         }
                     }
                 }
