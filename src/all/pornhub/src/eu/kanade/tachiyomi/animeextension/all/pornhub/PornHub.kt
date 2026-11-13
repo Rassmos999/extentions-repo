@@ -10,6 +10,7 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.interceptor.rateLimitHost
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.getPreferencesLazy
@@ -24,12 +25,18 @@ import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
+import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.time.Duration.Companion.seconds
 
 class PornHub :
     ParsedAnimeHttpSource(),
@@ -43,52 +50,168 @@ class PornHub :
 
     override val supportsLatest = true
 
+    override val disableRelatedAnimesBySearch = true
+
     private val preferences by getPreferencesLazy()
 
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+    private val htmlCache = ConcurrentHashMap<String, Pair<Long, String>>()
+    private val freshThumbnails = ConcurrentHashMap<String, String>()
+    private val sessionCookies = ConcurrentHashMap<String, String>(REQUIRED_COOKIES)
+
+    override val client: OkHttpClient = network.client.newBuilder()
+        .addInterceptor(::cacheAndRetryPages)
+        .rateLimitHost(baseUrl.toHttpUrl(), 1, 1.seconds)
         .addNetworkInterceptor(::ensureDesktopCookies)
-        .addInterceptor(::retryRefusedPages)
         .build()
 
     private fun ensureDesktopCookies(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        if (!request.url.host.endsWith("pornhub.com")) return chain.proceed(request)
-        val merged = linkedMapOf<String, String>()
-        request.header("Cookie")?.split(';')?.forEach { part ->
-            val eq = part.indexOf('=')
-            if (eq > 0) merged[part.substring(0, eq).trim()] = part.substring(eq + 1).trim()
+        val host = request.url.host
+        if (host.endsWith("phncdn.com")) {
+            val builder = request.newBuilder()
+            if (request.header("Referer") == null) {
+                builder.header("Referer", "$baseUrl/")
+            }
+            return chain.proceed(builder.build())
         }
-        REQUIRED_COOKIES.forEach { (k, v) -> merged[k] = v }
-        val cookieHeader = merged.entries.joinToString("; ") { "${it.key}=${it.value}" }
-        return chain.proceed(request.newBuilder().header("Cookie", cookieHeader).build())
+        if (!host.endsWith("pornhub.com")) return chain.proceed(request)
+
+        REQUIRED_COOKIES.forEach { (k, v) -> sessionCookies[k] = v }
+        val cookieHeader = sessionCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+        val response = chain.proceed(
+            request.newBuilder()
+                .header("Cookie", cookieHeader)
+                .build(),
+        )
+
+        val rawSetCookies = response.headers("Set-Cookie")
+        for (sc in rawSetCookies) {
+            val pair = sc.substringBefore(';').trim()
+            val eq = pair.indexOf('=')
+            if (eq <= 0) continue
+            val name = pair.substring(0, eq).trim()
+            val value = pair.substring(eq + 1).trim()
+            val lower = name.lowercase()
+            if (lower in BLOCKED_COOKIES || value.equals("deleted", ignoreCase = true) || value.isBlank()) {
+                continue
+            }
+            if (name !in REQUIRED_COOKIES) {
+                sessionCookies[name] = value
+            }
+        }
+
+        // Strip challenge cookies so the host CookieJar cannot lock subsequent requests into the JS gate.
+        val cleanSetCookies = rawSetCookies.filterNot { sc ->
+            val lowerName = sc.substringBefore('=').trim().lowercase()
+            lowerName in BLOCKED_COOKIES
+        }
+        val newHeaders = response.headers.newBuilder().removeAll("Set-Cookie").apply {
+            cleanSetCookies.forEach { add("Set-Cookie", it) }
+        }.build()
+        return response.newBuilder().headers(newHeaders).build()
     }
 
     /**
-     * Behind VPNs such as Cloudflare WARP, www.pornhub.com answers some egress IPs with
-     * 403/429 while others pass, so browsing and opening videos fail at random. Retry on
-     * a fresh connection (which may leave through another IP), then fail with a message
-     * that names the cause instead of a bare "HTTP error 403".
+     * Caches full HTML responses for video details and listing/search pages, retries transient
+     * HTTP 403/429 and ~1.4 KB JS challenge cutoffs with clean session rotation, and refreshes
+     * expired phncdn thumbnails.
      */
-    private fun retryRefusedPages(chain: Interceptor.Chain): Response {
+    private fun cacheAndRetryPages(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        var response = chain.proceed(request)
-        if (!request.url.host.endsWith("pornhub.com")) return response
+        val host = request.url.host
 
+        if (host.contains("pix-") && host.endsWith("phncdn.com")) {
+            val reqUrl = request.url.toString()
+            val freshUrl = extractThumbnailKey(reqUrl)?.let { freshThumbnails[it] }
+            val initialReq = if (freshUrl != null && freshUrl != reqUrl && isThumbnailExpired(reqUrl)) {
+                request.newBuilder().url(freshUrl).header("Referer", "$baseUrl/").build()
+            } else {
+                request.newBuilder().header("Referer", "$baseUrl/").build()
+            }
+            var resp = chain.proceed(initialReq)
+            if ((resp.code == 403 || resp.code == 410 || resp.code == 470 || resp.code == 472) &&
+                freshUrl != null &&
+                freshUrl != initialReq.url.toString()
+            ) {
+                resp.close()
+                resp = chain.proceed(request.newBuilder().url(freshUrl).header("Referer", "$baseUrl/").build())
+            }
+            return resp
+        }
+
+        if (!host.endsWith("pornhub.com")) return chain.proceed(request)
+
+        val urlStr = request.url.toString()
+        val isVideoPage = "/view_video.php" in urlStr
+        val isCacheable = request.method == "GET" && "/get_media" !in urlStr
+        val cacheTtl = if (isVideoPage) HTML_CACHE_TTL_MS else BROWSE_CACHE_TTL_MS
+        if (isCacheable) {
+            htmlCache[urlStr]?.let { (ts, cachedHtml) ->
+                if (System.currentTimeMillis() - ts < cacheTtl) {
+                    return Response.Builder()
+                        .request(request)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(cachedHtml.toResponseBody("text/html; charset=UTF-8".toMediaType()))
+                        .build()
+                }
+                htmlCache.remove(urlStr)
+            }
+        }
+
+        var response = chain.proceed(request)
         repeat(REFUSED_RETRIES) { attempt ->
-            if (response.code !in REFUSED_CODES) return response
+            val shouldRetry = response.code in REFUSED_CODES || isChallengePage(response)
+            if (!shouldRetry) return@repeat
             response.close()
-            network.cloudflareClient.connectionPool.evictAll()
+            sessionCookies.clear()
+            sessionCookies.putAll(REQUIRED_COOKIES)
+            network.client.connectionPool.evictAll()
             Thread.sleep(REFUSED_BACKOFF_MS * (attempt + 1))
             response = chain.proceed(request)
         }
         if (response.code in REFUSED_CODES) {
+            val code = response.code
             response.close()
             throw IOException(
-                "PornHub refused this connection (HTTP ${response.code}). " +
+                "PornHub refused this connection (HTTP $code). " +
                     "If a VPN or WARP is on, turn it off (or switch the 1.1.1.1 app to DNS-only mode) and retry.",
             )
         }
+        if (isChallengePage(response)) {
+            response.close()
+            throw IOException(
+                "PornHub temporarily rate-limited this connection. Wait a few seconds and tap Retry.",
+            )
+        }
+        if (isCacheable && response.isSuccessful) {
+            val bodyStr = response.body.string()
+            if (bodyStr.length > 5000) {
+                if (htmlCache.size > 60) htmlCache.clear()
+                htmlCache[urlStr] = System.currentTimeMillis() to bodyStr
+            }
+            return response.newBuilder()
+                .body(bodyStr.toResponseBody("text/html; charset=UTF-8".toMediaType()))
+                .build()
+        }
         return response
+    }
+
+    private fun isChallengePage(response: Response): Boolean {
+        val contentType = response.header("Content-Type").orEmpty()
+        if (contentType.isNotEmpty() && !contentType.contains("html", ignoreCase = true)) return false
+        val preview = runCatching { response.peekBody(4096).string() }.getOrNull() ?: return false
+        return preview.length < 4000 &&
+            (preview.contains("leastFactor") || preview.contains("onload=\"go()\""))
+    }
+
+    private fun extractThumbnailKey(url: String): String? = THUMB_KEY_REGEX.find(url)?.value
+
+    private fun isThumbnailExpired(url: String): Boolean {
+        val exp = THUMB_EXP_REGEX.find(url)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: return false
+        return exp <= (System.currentTimeMillis() / 1000L) + 60L
     }
 
     override fun headersBuilder(): Headers.Builder = Headers.Builder()
@@ -138,6 +261,9 @@ class PornHub :
                 ?: img.attr("data-smallthumb").ifBlank { null }
                 ?: img.attr("src").ifBlank { null }
         }
+        thumbnail_url?.let { thumb ->
+            extractThumbnailKey(thumb)?.let { key -> freshThumbnails[key] = thumb }
+        }
     }
 
     override fun popularAnimeNextPageSelector(): String = "li.page_next:not(.page_disabled):not(.disabled) a, a.page_next:not(.disabled), a[rel=next]:not(.disabled), link[rel=next], a:has(i.ph-icon-chevron-right):not(.disabled), div.pagination li.active + li a"
@@ -175,12 +301,24 @@ class PornHub :
 
     // =============================== Search ===============================
 
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val cleanQuery = query.replace(DURATION_PREFIX_REGEX, "").trim()
+        if (
+            cleanQuery.equals("view video.php", ignoreCase = true) ||
+            cleanQuery.equals("view_video.php", ignoreCase = true)
+        ) {
+            return AnimesPage(emptyList(), false)
+        }
+        return super.getSearchAnime(page, cleanQuery, filters)
+    }
+
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val sort = filters.firstInstanceOrNull<SortFilter>()?.selected ?: "ht"
         val category = filters.firstInstanceOrNull<CategoryFilter>()?.selected.orEmpty()
         val pornstar = filters.firstInstanceOrNull<PornstarFilter>()?.selected.orEmpty()
         val duration = filters.firstInstanceOrNull<DurationFilter>()?.selected.orEmpty()
         val hd = filters.firstInstanceOrNull<HDFilter>()?.selected.orEmpty()
+        val cleanQuery = query.replace(DURATION_PREFIX_REGEX, "").trim().lowercase()
 
         // Pornstar takes precedence (path-based browse).
         if (pornstar.isNotBlank()) {
@@ -195,7 +333,7 @@ class PornHub :
         }
 
         // Keyword search (`/video/search` 404s on `o=ht` and `o=cm`; omission = Relevance, `mr` = Most Recent).
-        if (query.isNotBlank()) {
+        if (cleanQuery.isNotBlank()) {
             val searchSort = when (sort) {
                 "ht" -> ""
                 "cm" -> "mr"
@@ -209,12 +347,10 @@ class PornHub :
             }
             val url = baseUrl.toHttpUrl().newBuilder()
                 .addPathSegments("video/search")
-                .addQueryParameter("search", query.trim())
+                .addEncodedQueryParameter("search", URLEncoder.encode(cleanQuery, "UTF-8"))
                 .apply {
                     if (searchSort.isNotBlank()) addQueryParameter("o", searchSort)
-                }
-                .addQueryParameter("page", page.toString())
-                .apply {
+                    if (page > 1) addQueryParameter("page", page.toString())
                     if (!filterCategory.isNullOrBlank()) addQueryParameter("filter_category", filterCategory)
                     applyDuration(duration)
                     if (hd.isNotBlank()) addQueryParameter("hd", "1")
@@ -267,12 +403,26 @@ class PornHub :
             .joinToString()
             .ifBlank { null }
 
-        thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
+        thumbnail_url = document.selectFirst("meta[name=twitter:image], meta[property=twitter:image]")
+            ?.attr("content")?.takeIf { it.isNotBlank() }
+            ?: document.selectFirst("meta[property=og:image]")?.attr("content")
+        thumbnail_url?.let { thumb ->
+            extractThumbnailKey(thumb)?.let { key -> freshThumbnails[key] = thumb }
+        }
 
         status = SAnime.COMPLETED
     }
 
     // ============================== Episodes ==============================
+
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = listOf(
+        SEpisode.create().apply {
+            name = "Video"
+            url = anime.url
+            episode_number = 1F
+            date_upload = System.currentTimeMillis()
+        },
+    )
 
     override fun episodeListParse(response: Response): List<SEpisode> = listOf(
         SEpisode.create().apply {
@@ -292,27 +442,20 @@ class PornHub :
         val pageUrl = response.request.url.toString()
         val html = response.body.string()
         val videoList = mutableListOf<Video>()
-        val cookieMap = linkedMapOf<String, String>()
-        headers["Cookie"]?.split(';')?.forEach { part ->
-            val eq = part.indexOf('=')
-            if (eq > 0) cookieMap[part.substring(0, eq).trim()] = part.substring(eq + 1).trim()
-        }
-        runCatching { client.cookieJar.loadForRequest(response.request.url) }.getOrNull()?.forEach { c ->
-            cookieMap[c.name] = c.value
-        }
-        response.headers("Set-Cookie").forEach { raw ->
-            val nv = raw.substringBefore(';')
-            val eq = nv.indexOf('=')
-            if (eq > 0) cookieMap[nv.substring(0, eq).trim()] = nv.substring(eq + 1).trim()
-        }
-        val cookieHeader = cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val userAgent = headers["User-Agent"]
+            ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         val videoHeaders = Headers.Builder()
-            .add("User-Agent", headers["User-Agent"] ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .add("User-Agent", userAgent)
+            .add("Accept-Encoding", "identity")
             .add("Referer", "$baseUrl/")
             .add("Origin", baseUrl)
-            .apply {
-                if (cookieHeader.isNotBlank()) add("Cookie", cookieHeader)
-            }
+            .add("Cookie", REQUIRED_COOKIE_HEADER)
+            .build()
+        val playerHeaders = Headers.Builder()
+            .add("User-Agent", userAgent)
+            .add("Accept-Encoding", "identity")
+            .add("Referer", "$baseUrl/")
+            .add("Origin", baseUrl)
             .build()
 
         // Extract flashvars JSON: search script tags for "mediaDefinitions"
@@ -337,6 +480,7 @@ class PornHub :
 
         fun processDefinitions(defs: JsonArray, depth: Int = 0) {
             if (depth > 2) return
+            val remoteMediaUrls = mutableListOf<String>()
             for (item in defs) {
                 val obj: JsonObject = try {
                     item.jsonObject
@@ -358,20 +502,7 @@ class PornHub :
                 }
 
                 if (videoUrl != null && "/get_media" in videoUrl) {
-                    // Fetch get_media JSON and recursively process definitions for both HLS and MP4.
-                    try {
-                        client.newCall(GET(videoUrl, videoHeaders)).execute().use { resp ->
-                            if (!resp.isSuccessful) return@use
-                            val body = resp.body.string().trim()
-                            if (!body.startsWith("[")) return@use
-                            val arr = try {
-                                json.parseToJsonElement(body).jsonArray
-                            } catch (_: Exception) {
-                                null
-                            }
-                            if (arr != null) processDefinitions(arr, depth + 1)
-                        }
-                    } catch (_: Exception) {}
+                    remoteMediaUrls.add(videoUrl)
                     continue
                 }
 
@@ -396,20 +527,25 @@ class PornHub :
                                             next.startsWith("/") -> "$baseUrl$next"
                                             else -> "$basePrefix/$next"
                                         }
-                                        val label = if (h != null) "${h}p (HLS)" else "HLS ${qualityStr ?: "720"}p"
-                                        videoList.add(Video(variantUrl, label, variantUrl, videoHeaders))
+                                        val label = if (h != null) "${h}p (HLS)" else "${qualityStr ?: "720"}p (HLS)"
+                                        videoList.add(Video(variantUrl, label, variantUrl, playerHeaders))
                                         found = true
                                     }
                                 }
                                 if (!found) throw Exception("no variants")
                             }
                         } catch (_: Exception) {
-                            videoList.add(Video(videoUrl, "HLS ${qualityStr ?: "720"}p", videoUrl, videoHeaders))
+                            val fallbackUrl = if ("/master.m3u8" in videoUrl && !qualityStr.isNullOrBlank()) {
+                                videoUrl.replace("/master.m3u8", "/index-v1-a1.m3u8")
+                            } else {
+                                videoUrl
+                            }
+                            videoList.add(Video(fallbackUrl, "${qualityStr ?: "720"}p (HLS)", fallbackUrl, playerHeaders))
                         }
                         continue
                     }
                     // Non-m3u8 hls entry: add directly.
-                    videoList.add(Video(videoUrl, "HLS ${qualityStr ?: "720"}p", videoUrl, videoHeaders))
+                    videoList.add(Video(videoUrl, "HLS ${qualityStr ?: "720"}p", videoUrl, playerHeaders))
                 }
 
                 if (format == "mp4" && videoUrl != null && "/get_media" !in videoUrl) {
@@ -420,7 +556,25 @@ class PornHub :
                     } else {
                         "MP4"
                     }
-                    videoList.add(Video(videoUrl, "MP4 $label", videoUrl, videoHeaders))
+                    videoList.add(Video(videoUrl, "MP4 $label", videoUrl, playerHeaders))
+                }
+            }
+
+            if (videoList.isEmpty() && depth == 0) {
+                for (remoteUrl in remoteMediaUrls) {
+                    try {
+                        client.newCall(GET(remoteUrl, videoHeaders)).execute().use { resp ->
+                            if (!resp.isSuccessful) return@use
+                            val body = resp.body.string().trim()
+                            if (!body.startsWith("[")) return@use
+                            val arr = try {
+                                json.parseToJsonElement(body).jsonArray
+                            } catch (_: Exception) {
+                                null
+                            }
+                            if (arr != null) processDefinitions(arr, depth + 1)
+                        }
+                    } catch (_: Exception) {}
                 }
             }
         }
@@ -461,7 +615,7 @@ class PornHub :
                 .distinct()
                 .forEach { url ->
                     val resolved = resolveUrl(url) ?: return@forEach
-                    videoList.add(Video(resolved, "HLS 720p", resolved, videoHeaders))
+                    videoList.add(Video(resolved, "HLS 720p", resolved, playerHeaders))
                 }
         }
 
@@ -782,11 +936,24 @@ class PornHub :
 
     companion object {
         private val QUALITY_REGEX = Regex("""(\d{3,4})""")
+        private val DURATION_PREFIX_REGEX = Regex("""^\[[^\]]+\]\s*""")
+        private val THUMB_KEY_REGEX = Regex("""/videos/\d+/\d+/\d+/""")
+        private val THUMB_EXP_REGEX = Regex("""(?:validto|exp)=(\d+)""")
+
+        private const val HTML_CACHE_TTL_MS = 5 * 60 * 1000L
+        private const val BROWSE_CACHE_TTL_MS = 90 * 1000L
 
         private val REFUSED_CODES = setOf(403, 429)
-        private const val REFUSED_RETRIES = 2
-        private const val REFUSED_BACKOFF_MS = 700L
+        private const val REFUSED_RETRIES = 3
+        private const val REFUSED_BACKOFF_MS = 2500L
 
+        private val BLOCKED_COOKIES = setOf(
+            "htjschalref",
+            "rp",
+            "key",
+            "htjf-mobile",
+            "accessagedisclaimerph",
+        )
         private val REQUIRED_COOKIES = mapOf(
             "platform" to "pc",
             "age_verified" to "1",
@@ -797,6 +964,7 @@ class PornHub :
             "cookiesBannerSeen" to "1",
             "cookieConsent" to "3",
         )
+        private val REQUIRED_COOKIE_HEADER = REQUIRED_COOKIES.entries.joinToString("; ") { "${it.key}=${it.value}" }
         private val EXCLUDED_LIST_IDS = setOf(
             "hottestMenuSection",
             "recommMenuSection",
