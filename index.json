@@ -399,10 +399,10 @@
   {
     "name": "Aniyomi: SexTB",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.sextb",
-    "apk": "aniyomi-all.sextb-v14.17.apk",
+    "apk": "aniyomi-all.sextb-v14.18.apk",
     "lang": "all",
-    "code": 17,
-    "version": "14.17",
+    "code": 18,
+    "version": "14.18",
     "nsfw": 1,
     "sources": [
       {
@@ -502,10 +502,10 @@
   {
     "name": "Aniyomi: SupJav",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.supjav",
-    "apk": "aniyomi-all.supjav-v14.101.apk",
+    "apk": "aniyomi-all.supjav-v14.102.apk",
     "lang": "all",
-    "code": 101,
-    "version": "14.101",
+    "code": 102,
+    "version": "14.102",
     "nsfw": 1,
     "sources": [
       {
