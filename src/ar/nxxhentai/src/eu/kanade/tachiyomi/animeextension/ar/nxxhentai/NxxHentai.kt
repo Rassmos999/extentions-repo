@@ -17,24 +17,35 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.multisrc.dooplay.DooPlay
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 
 /**
  * NxxHentai — https://nxxhentai.net/
  *
  * DooPlay / Vortex theme: series under `/anime/`, episodes under `/episodes/`,
- * multi-server via `doo_player_ajax`. Filters: sort, year (`release`), genre.
- *
- * Cloudflare: use app NetworkHelper client + default UA (do not force desktop UA).
+ * multi-server via `doo_player_ajax` / `wp-json/dooplayer/v2/` extracted in parallel.
+ * Prioritizes VIPServer (`player.nxxhentai.net` -> BunnyCDN multi-quality MP4) and
+ * routes `playmogo` mirrors to DoodExtractor.
  */
 class NxxHentai :
     DooPlay(
@@ -43,19 +54,39 @@ class NxxHentai :
         "https://nxxhentai.net",
     ) {
 
+    override val disableRelatedAnimes = true
+
+    override val disableRelatedAnimesBySearch = true
+
     override fun headersBuilder() = super.headersBuilder()
         .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         .set("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
         .set("Referer", "$baseUrl/")
 
-    private val playlistUtils by lazy { PlaylistUtils(client, headers) }
-    private val doodExtractor by lazy { DoodExtractor(client) }
-    private val mixDropExtractor by lazy { MixDropExtractor(client) }
-    private val streamWishExtractor by lazy { StreamWishExtractor(client, headers) }
-    private val streamTapeExtractor by lazy { StreamTapeExtractor(client) }
-    private val voeExtractor by lazy { VoeExtractor(client, headers) }
-    private val uqloadExtractor by lazy { UqloadExtractor(client) }
-    private val universalExtractor by lazy { UniversalExtractor(client) }
+    private val fastExtractorClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(7, TimeUnit.SECONDS)
+            .writeTimeout(5, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val noRedirectClient: OkHttpClient by lazy {
+        fastExtractorClient.newBuilder()
+            .followRedirects(false)
+            .build()
+    }
+
+    private val playlistUtils by lazy { PlaylistUtils(fastExtractorClient, headers) }
+    private val doodExtractor by lazy { DoodExtractor(fastExtractorClient) }
+    private val mixDropExtractor by lazy { MixDropExtractor(fastExtractorClient) }
+    private val streamWishExtractor by lazy { StreamWishExtractor(fastExtractorClient, headers) }
+    private val streamTapeExtractor by lazy { StreamTapeExtractor(fastExtractorClient) }
+    private val voeExtractor by lazy { VoeExtractor(fastExtractorClient, headers) }
+    private val uqloadExtractor by lazy { UqloadExtractor(fastExtractorClient) }
+    private val universalExtractor by lazy { UniversalExtractor(fastExtractorClient) }
+    private val pageCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
     // ============================== Popular ===============================
     override fun popularAnimeRequest(page: Int): Request {
@@ -63,7 +94,6 @@ class NxxHentai :
         return GET(url, headers)
     }
 
-    /** Catalog cards: series (tvshows) + movies + generic items. */
     private fun catalogSelector() = "article.item.tvshows div.poster, article.item.movies div.poster, " +
         "article.item div.poster, div.content article div.poster, div.items article div.poster"
 
@@ -72,7 +102,7 @@ class NxxHentai :
     override fun popularAnimeNextPageSelector() = "div.pagination span.current + a, div.pagination a.arrow_pag, " +
         "div.resppages a > i#nextpagination, div.resppages a > span.fa-chevron-left, " +
         "div.resppages a > i.fa-chevron-left, div.resppages a > span.fa-chevron-right, " +
-        "div.resppages a > i.fa-caret-left, div.pagination a.inactive"
+        "div.resppages a > i.fa-caret-left, a[rel=next]"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
         val link = element.selectFirst("a[href]")
@@ -101,8 +131,22 @@ class NxxHentai :
     // =============================== Search ===============================
     override val fetchGenres = false
 
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val selectedGenres = filters.filterIsInstance<GenreGroup>()
+            .firstOrNull()?.state?.filter { it.state }?.map { it.value }.orEmpty()
+        if (query.isBlank() && selectedGenres.size > 1) {
+            val sort = filters.filterIsInstance<SortFilter>().firstOrNull()?.toUriPart().orEmpty()
+            val year = filters.filterIsInstance<YearFilter>().firstOrNull()?.toUriPart().orEmpty()
+            val requests = selectedGenres.take(MAX_PARALLEL_FILTERS).map { genre ->
+                buildCatalogRequest(page, sort, year, genre)
+            }
+            return fetchAndMergePages(requests)
+        }
+        val response = client.newCall(searchAnimeRequest(page, query, filters)).awaitSuccess()
+        return searchAnimeParse(response)
+    }
+
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        // Text query always wins (filters ignored).
         if (query.isNotBlank()) {
             val encoded = java.net.URLEncoder.encode(query.trim(), Charsets.UTF_8.name())
             val url = if (page <= 1) "$baseUrl/?s=$encoded" else "$baseUrl/page/$page/?s=$encoded"
@@ -111,7 +155,8 @@ class NxxHentai :
 
         val sort = filters.filterIsInstance<SortFilter>().firstOrNull()?.toUriPart().orEmpty()
         val year = filters.filterIsInstance<YearFilter>().firstOrNull()?.toUriPart().orEmpty()
-        val genre = filters.filterIsInstance<GenreFilter>().firstOrNull()?.toUriPart().orEmpty()
+        val genre = filters.filterIsInstance<GenreGroup>()
+            .firstOrNull()?.state?.firstOrNull { it.state }?.value.orEmpty()
         val browse = filters.filterIsInstance<BrowseFilter>().firstOrNull()?.toUriPart().orEmpty()
 
         when (browse) {
@@ -126,27 +171,18 @@ class NxxHentai :
             }
         }
 
-        // Genre-only → cleaner /genre/{slug}/ archive (site supports both).
+        return buildCatalogRequest(page, sort, year, genre)
+    }
+
+    private fun buildCatalogRequest(page: Int, sort: String, year: String, genre: String): Request {
         if (genre.isNotBlank() && sort.isBlank() && year.isBlank()) {
-            val path = if (page <= 1) {
-                "$baseUrl/genre/$genre/"
-            } else {
-                "$baseUrl/genre/$genre/page/$page/"
-            }
+            val path = if (page <= 1) "$baseUrl/genre/$genre/" else "$baseUrl/genre/$genre/page/$page/"
             return GET(path, headers)
         }
-
-        // Year-only archive also exists as /release/{year}/
         if (year.isNotBlank() && genre.isBlank() && sort.isBlank()) {
-            val path = if (page <= 1) {
-                "$baseUrl/release/$year/"
-            } else {
-                "$baseUrl/release/$year/page/$page/"
-            }
+            val path = if (page <= 1) "$baseUrl/release/$year/" else "$baseUrl/release/$year/page/$page/"
             return GET(path, headers)
         }
-
-        // Combined / default catalog under /anime/ with query params.
         val path = if (page <= 1) "$baseUrl/anime/" else "$baseUrl/anime/page/$page/"
         val builder = path.toHttpUrl().newBuilder()
         if (sort.isNotBlank()) builder.addQueryParameter("sort", sort)
@@ -155,23 +191,20 @@ class NxxHentai :
         return GET(builder.build(), headers)
     }
 
-    /**
-     * DooPlay parent parse uses latestUpdatesSelector for non-?s= URLs and
-     * mis-handles filter catalog pages. Always parse as catalog / search cards.
-     */
-    override fun searchAnimeParse(response: Response): AnimesPage {
-        val document = response.asJsoup()
+    override fun searchAnimeParse(response: Response): AnimesPage = parseSearchDoc(response.asJsoup())
+
+    private fun parseSearchDoc(document: Document): AnimesPage {
         val elements = document.select(catalogSelector()).ifEmpty {
             document.select("div.result-item div.image a, .search-page .result-item article a")
         }
         val animes = elements.map { el ->
-            if (el.tagName() == "a") {
-                searchResultFromLink(el)
-            } else {
-                popularAnimeFromElement(el)
-            }
-        }.distinctBy { it.url }
-        val hasNext = document.selectFirst(popularAnimeNextPageSelector()) != null
+            if (el.tagName() == "a") searchResultFromLink(el) else popularAnimeFromElement(el)
+        }.filter { it.url.isNotBlank() && it.title.isNotBlank() }.distinctBy { it.url }
+
+        val current = document.selectFirst("div.pagination span.current, div.pagination a.current")
+            ?.text()?.toIntOrNull() ?: 1
+        val hasHigher = document.select("div.pagination a").any { (it.text().toIntOrNull() ?: -1) > current }
+        val hasNext = (document.selectFirst(popularAnimeNextPageSelector()) != null || hasHigher) && animes.isNotEmpty()
         return AnimesPage(animes, hasNext)
     }
 
@@ -186,6 +219,57 @@ class NxxHentai :
             ?: img?.attr("alt")
             ?: element.attr("title").ifBlank { element.text() }
         thumbnail_url = img?.getImageUrl()
+    }
+
+    private suspend fun fetchAndMergePages(requests: List<Request>): AnimesPage = withContext(Dispatchers.IO) {
+        val pool = Executors.newFixedThreadPool(requests.size.coerceAtMost(MAX_PARALLEL_FILTERS))
+        try {
+            val futures = requests.map { req ->
+                pool.submit<AnimesPage?> {
+                    runCatching {
+                        client.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) return@use null
+                            parseSearchDoc(resp.asJsoup())
+                        }
+                    }.getOrNull()
+                }
+            }
+            val pages = futures.mapNotNull { runCatching { it.get(12, TimeUnit.SECONDS) }.getOrNull() }
+            mergePages(pages)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    private fun mergePages(pages: List<AnimesPage>): AnimesPage {
+        if (pages.isEmpty()) return AnimesPage(emptyList(), false)
+        val counts = LinkedHashMap<String, Int>()
+        val byUrl = LinkedHashMap<String, SAnime>()
+        for (page in pages) {
+            val seen = HashSet<String>()
+            for (item in page.animes) {
+                if (seen.add(item.url)) {
+                    counts[item.url] = (counts[item.url] ?: 0) + 1
+                    byUrl.putIfAbsent(item.url, item)
+                }
+            }
+        }
+        val merged = mutableListOf<SAnime>()
+        val added = HashSet<String>()
+        counts.entries.filter { it.value > 1 }.sortedByDescending { it.value }.forEach { (url, _) ->
+            byUrl[url]?.let {
+                merged += it
+                added += url
+            }
+        }
+        val maxLen = pages.maxOfOrNull { it.animes.size } ?: 0
+        for (i in 0 until maxLen) {
+            for (page in pages) {
+                val item = page.animes.getOrNull(i) ?: continue
+                if (added.add(item.url)) merged += item
+            }
+        }
+        return AnimesPage(merged, pages.any { it.hasNextPage })
     }
 
     // =========================== Anime Details ============================
@@ -218,13 +302,11 @@ class NxxHentai :
     }
 
     // ============================== Episodes ==============================
-
-    /**
-     * Flat episodios list + any /episodes/ links (card UI). Prefer real episode
-     * URLs so videoListParse hits the player page, not the series shell.
-     */
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val doc = getRealAnimeDoc(response.asJsoup())
+        val url = response.request.url.toString()
+        val html = response.body.string()
+        cachePage(url, html)
+        val doc = getRealAnimeDoc(Jsoup.parse(html, url))
         val byUrl = LinkedHashMap<String, SEpisode>()
 
         fun addEpisode(a: Element, fallbackIndex: Int) {
@@ -265,7 +347,6 @@ class NxxHentai :
             return seasonList.flatMap(::getSeasonEpisodes).reversed()
         }
 
-        // Single movie / episode page opened as "anime"
         if (doc.selectFirst("ul#playeroptionsul, li.dooplay_player_option, video source, iframe.metaframe") != null) {
             return listOf(
                 SEpisode.create().apply {
@@ -293,46 +374,45 @@ class NxxHentai :
     }
 
     // ============================ Video Links =============================
-    override fun videoListParse(response: Response): List<Video> {
-        val document = response.asJsoup()
-        val pageUrl = document.location()
-        val html = document.html()
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+        val fullUrl = toAbsoluteUrl(episode.url)
+        val html = fetchPageCached(fullUrl)
+        parseVideosFromHtml(html, fullUrl).sort()
+    }
 
-        // Cloudflare challenge page — no player markup
+    override fun videoListParse(response: Response): List<Video> {
+        val url = response.request.url.toString()
+        val html = response.body.string()
+        cachePage(url, html)
+        return parseVideosFromHtml(html, url)
+    }
+
+    private fun parseVideosFromHtml(html: String, pageUrl: String): List<Video> {
         if (html.contains("Just a moment", ignoreCase = true) ||
             html.contains("Verifying you are human", ignoreCase = true) ||
             html.contains("cf-browser-verification", ignoreCase = true)
         ) {
-            throw Exception(
+            throw IOException(
                 "Cloudflare blocked the episode page. Open WebView on this episode once, then retry play.",
             )
         }
 
+        val document = Jsoup.parse(html, pageUrl)
         val videos = mutableListOf<Video>()
 
-        // 1) Direct HTML5 / CDN sources (highest reliability)
+        // 1) Direct HTML5 sources already on page
         document.select(
             "video source[src], video#wpst-video source, #player source, " +
                 ".responsive-player source, #dooplay_player_response source, source[src]",
         ).forEach { source ->
-            val src = source.absUrl("src").ifBlank { source.attr("src") }.trim()
-                .replace("\\/", "/")
+            val src = source.absUrl("src").ifBlank { source.attr("src") }.trim().replace("\\/", "/")
             if (src.startsWith("http") && isMediaUrl(src)) {
-                val label = source.attr("label").ifBlank {
-                    QUALITY_IN_URL.find(src)?.value ?: "Player"
-                }
+                val label = source.attr("label").ifBlank { QUALITY_IN_URL.find(src)?.value ?: "Player" }
                 val tag = if (isBadProgressiveCdn(src)) "CDN fallback" else "Direct - $label"
                 videos += streamFromUrl(src, tag)
             }
         }
-        document.select("video[src]").forEach { v ->
-            val src = v.absUrl("src").ifBlank { v.attr("src") }.trim()
-            if (src.startsWith("http") && isMediaUrl(src) && !isBadProgressiveCdn(src)) {
-                videos += streamFromUrl(src, "Direct")
-            }
-        }
 
-        // Regex fallback for mp4/m3u8 in scripts / HTML
         MP4_OR_M3U8.findAll(html).map { it.value.replace("\\/", "/").replace("&amp;", "&") }
             .distinct()
             .filter { u ->
@@ -349,20 +429,19 @@ class NxxHentai :
                 }
             }
 
-        // 2) Iframes already on page (first DooPlay tab often preloaded)
-        val pageIframes = document.select(
+        // 2) Parallel extraction for preloaded iframes + DooPlay player tabs (VIPServer first).
+        val tasks = mutableListOf<Pair<Int, () -> List<Video>>>()
+
+        document.select(
             "iframe.metaframe, iframe.rptss, .playex iframe, " +
                 "#dooplay_player_response iframe, #pframe iframe, iframe[src]",
         ).mapNotNull { iframe ->
-            val src = iframe.absUrl("src").ifBlank { iframe.attr("src") }.trim()
-                .replace("&amp;", "&")
-            src.takeIf { isUsefulEmbed(it) }
-        }.distinct()
-        pageIframes.forEach { embed ->
-            videos += runCatching { runBlocking { extractFromEmbed(embed, "Embed") } }.getOrDefault(emptyList())
+            iframe.absUrl("src").ifBlank { iframe.attr("src") }.trim().replace("&amp;", "&")
+                .takeIf { isUsefulEmbed(it) }
+        }.distinct().forEach { embed ->
+            tasks += 1 to { runCatching { runBlocking { extractFromEmbed(embed, "Embed") } }.getOrDefault(emptyList()) }
         }
 
-        // 3) DooPlay ajax tabs
         val players = document.select(
             "ul#playeroptionsul li.dooplay_player_option, " +
                 "ul#playeroptionsul li[data-post], li.dooplay_player_option",
@@ -370,48 +449,66 @@ class NxxHentai :
         players.forEach { player ->
             val name = player.selectFirst("span.title")?.text()?.trim()
                 ?: player.ownText().trim().ifBlank { "Server ${player.attr("data-nume")}" }
-            getPlayerUrl(player, pageUrl)?.let { embed ->
-                videos += runCatching { runBlocking { extractFromEmbed(embed, name) } }.getOrDefault(emptyList())
+            val prio = when {
+                name.contains("vip", true) || player.hasClass("nxx-vip-server") -> 0
+                name.contains("dood", true) || name.contains("playmogo", true) -> 2
+                else -> 3
+            }
+            tasks += prio to {
+                val embed = getPlayerUrl(player, pageUrl)
+                if (embed != null) {
+                    runCatching { runBlocking { extractFromEmbed(embed, name) } }.getOrDefault(emptyList())
+                } else {
+                    emptyList()
+                }
             }
         }
 
-        // 4) Download table /links/
-        val downloads = document.select(
-            "#download a[href*='/links/'], .links_table a[href*='/links/'], " +
-                "table a[href*='/links/'], a.nxx-download-ad-trigger[href], " +
-                ".box_links a[href*='/links/']",
-        ).mapNotNull { a ->
-            val href = a.absUrl("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val label = a.parent()?.selectFirst(".link-server-name, .server-name, .title")?.text()
-                ?: a.selectFirst(".link-server-name")?.text()
-                ?: a.attr("title").ifBlank { "Download" }
-            href to label.trim()
-        }.distinctBy { it.first }
-        downloads.forEach { (href, label) ->
-            val extracted = runCatching {
-                runBlocking {
-                    val finalUrl = resolveRedirect(href)
-                    if (finalUrl.isBlank() || (finalUrl == href && "/links/" in href)) {
-                        // Try parsing a link page if its redirect is protected or absent.
-                        extractFromLinkPage(href, label)
-                    } else {
-                        extractFromEmbed(finalUrl, label)
-                    }
-                }
-            }.getOrDefault(emptyList())
-            videos += extracted
+        if (tasks.isNotEmpty()) {
+            videos += runTasksInParallel(tasks.sortedBy { it.first }.map { it.second })
         }
 
-        var distinct = videos.distinctBy { it.url }
+        // 3) Only probe /links/ download table if primary servers returned nothing (saves 5-10s!).
+        val primaryValid = videos.filterNot { isBadProgressiveCdn(it.url) }
+        if (primaryValid.isEmpty()) {
+            val downloads = document.select(
+                "#download a[href*='/links/'], .links_table a[href*='/links/'], " +
+                    "table a[href*='/links/'], a.nxx-download-ad-trigger[href], " +
+                    ".box_links a[href*='/links/']",
+            ).mapNotNull { a ->
+                val href = a.absUrl("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val label = a.parent()?.selectFirst(".link-server-name, .server-name, .title")?.text()
+                    ?: a.selectFirst(".link-server-name")?.text()
+                    ?: a.attr("title").ifBlank { "Download" }
+                href to label.trim()
+            }.distinctBy { it.first }.take(4)
 
-        // sacdnssedge progressive MP4 has moov-at-end → ExoPlayer often jumps to last second.
+            if (downloads.isNotEmpty()) {
+                videos += runTasksInParallel(
+                    downloads.map { (href, label) ->
+                        {
+                            runCatching {
+                                runBlocking {
+                                    val finalUrl = resolveRedirect(href)
+                                    if (finalUrl.isBlank() || (finalUrl == href && "/links/" in href)) {
+                                        extractFromLinkPage(href, label)
+                                    } else {
+                                        extractFromEmbed(finalUrl, label)
+                                    }
+                                }
+                            }.getOrDefault(emptyList())
+                        }
+                    },
+                )
+            }
+        }
+
+        var distinct = videos.distinctBy { it.videoUrl ?: it.url }
         val hosters = distinct.filterNot { isBadProgressiveCdn(it.url) }
-        if (hosters.isNotEmpty()) {
-            distinct = hosters
-        }
+        if (hosters.isNotEmpty()) distinct = hosters
 
         if (distinct.isEmpty()) {
-            throw Exception(
+            throw IOException(
                 "No playable streams (empty player or Cloudflare). " +
                     "Open WebView on this episode URL, wait for the page, then retry Start.",
             )
@@ -419,11 +516,39 @@ class NxxHentai :
         return distinct
     }
 
-    /** Non-faststart CDN stubs that cause scrubber-at-end / unplayable streams. */
-    private fun isBadProgressiveCdn(url: String): Boolean {
-        val u = url.lowercase()
-        return "sacdnssedge" in u
+    private fun runTasksInParallel(jobs: List<() -> List<Video>>): List<Video> {
+        if (jobs.size == 1) return runCatching { jobs[0]() }.getOrDefault(emptyList())
+        val pool = Executors.newFixedThreadPool(jobs.size.coerceAtMost(4))
+        val completion = ExecutorCompletionService<List<Video>>(pool)
+        val futures = mutableListOf<Future<List<Video>>>()
+        val collected = mutableListOf<Video>()
+        try {
+            jobs.forEach { job -> futures += completion.submit { runCatching(job).getOrDefault(emptyList()) } }
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(MAX_EXTRACTION_WAIT_MS)
+            var softDeadline = deadline
+            var done = 0
+            while (done < futures.size) {
+                val rem = (if (collected.isNotEmpty()) softDeadline else deadline) - System.nanoTime()
+                if (rem <= 0L) break
+                val fut = completion.poll(rem, TimeUnit.NANOSECONDS) ?: break
+                done++
+                val batch = runCatching { fut.get() }.getOrDefault(emptyList())
+                if (batch.isNotEmpty()) {
+                    val wasFirst = collected.isEmpty()
+                    collected += batch
+                    if (wasFirst) {
+                        softDeadline = minOf(deadline, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(EXTRA_WAIT_AFTER_FIRST_MS))
+                    }
+                }
+            }
+        } finally {
+            futures.forEach { it.cancel(true) }
+            pool.shutdownNow()
+        }
+        return collected
     }
+
+    private fun isBadProgressiveCdn(url: String): Boolean = "sacdnssedge" in url.lowercase(Locale.ROOT)
 
     override fun List<Video>.sort(): List<Video> {
         val pref = preferences.getString(videoSortPrefKey, videoSortPrefDefault)!!
@@ -434,17 +559,16 @@ class NxxHentai :
         )
     }
 
-    /** Lower score = preferred (played first). */
+    /** Lower score = preferred (played first). VIPServer / BunnyCDN MP4 is fastest & cleanest. */
     private fun hosterScore(video: Video): Int {
-        val q = (video.quality + " " + video.url).lowercase()
+        val q = (video.quality + " " + video.url).lowercase(Locale.ROOT)
         return when {
-            "dood" in q || "streamhg" in q || "hgcloud" in q || "streamwish" in q -> 0
-            "mixdrop" in q || "mxdrop" in q -> 1
-            "m3u8" in q || "hls" in q -> 1
-            "streamtape" in q || "voe" in q || "uqload" in q -> 2
-            "upns" in q || "rubyvidhub" in q || "playmogo" in q -> 3
-            "embed" in q || "server" in q || "nxx" in q || "fast" in q -> 4
-            "direct" in q || "page" in q -> 8
+            "b-cdn.net" in q || "vipserver" in q || "player.nxxhentai" in q -> 0
+            "dood" in q || "playmogo" in q || "streamhg" in q || "hgcloud" in q || "streamwish" in q -> 1
+            "mixdrop" in q || "mxdrop" in q || "m3u8" in q || "hls" in q -> 2
+            "streamtape" in q || "voe" in q || "uqload" in q -> 3
+            "upns" in q || "rubyvidhub" in q -> 4
+            "direct" in q || "page" in q -> 7
             isBadProgressiveCdn(video.url) || "cdn fallback" in q -> 9
             else -> 5
         }
@@ -459,7 +583,7 @@ class NxxHentai :
 
     private fun isUsefulEmbed(src: String): Boolean {
         if (!src.startsWith("http") && !src.startsWith("//")) return false
-        val s = src.lowercase()
+        val s = src.lowercase(Locale.ROOT)
         return "google" !in s && "exoclick" !in s && "animeapp.org" !in s &&
             "doubleclick" !in s && "about:blank" !in s && s.length > 12
     }
@@ -468,6 +592,17 @@ class NxxHentai :
         val post = player.attr("data-post").ifBlank { return null }
         val nume = player.attr("data-nume").ifBlank { return null }
         val type = player.attr("data-type").ifBlank { "tv" }
+
+        // Prefer lightweight REST v2 GET first, fall back to admin-ajax POST.
+        val restRaw = runCatching {
+            fastExtractorClient.newCall(
+                GET(
+                    "$baseUrl/wp-json/dooplayer/v2/$post/$type/$nume",
+                    headers.newBuilder().set("Referer", pageUrl).set("Accept", "application/json,*/*").build(),
+                ),
+            ).execute().use { if (it.isSuccessful) it.body.string() else "" }
+        }.getOrDefault("")
+        parseEmbedUrlFromResponse(restRaw)?.let { return it }
 
         val body = FormBody.Builder()
             .add("action", "doo_player_ajax")
@@ -485,15 +620,15 @@ class NxxHentai :
             .build()
 
         val raw = runCatching {
-            client.newCall(POST("$baseUrl/wp-admin/admin-ajax.php", postHeaders, body))
+            fastExtractorClient.newCall(POST("$baseUrl/wp-admin/admin-ajax.php", postHeaders, body))
                 .execute().use { it.body.string() }
         }.getOrNull().orEmpty()
+        return parseEmbedUrlFromResponse(raw)
+    }
 
+    private fun parseEmbedUrlFromResponse(raw: String): String? {
         if (raw.isBlank() || raw.contains("Just a moment", ignoreCase = true)) return null
-
-        // {"embed_url":"https:\/\/...","type":"mp4"} or empty
-        val embedMatch = EMBED_URL_JSON.find(raw)
-        val fromJson = embedMatch?.groupValues?.get(1)
+        val fromJson = EMBED_URL_JSON.find(raw)?.groupValues?.get(1)
             ?.replace("\\/", "/")
             ?.replace("\\u0026", "&")
             ?.replace("\\\"", "\"")
@@ -518,33 +653,19 @@ class NxxHentai :
         } else {
             "$baseUrl/"
         }
-        val req = GET(
-            url,
-            headers.newBuilder()
-                .set("Referer", referer)
-                .build(),
-        )
+        val req = GET(url, headers.newBuilder().set("Referer", referer).build())
         return runCatching {
-            val noRedirectClient = client.newBuilder().followRedirects(false).build()
             noRedirectClient.newCall(req).execute().use { resp ->
                 val loc = resp.header("Location")
-                if (!loc.isNullOrBlank()) {
-                    return@use loc
-                }
+                if (!loc.isNullOrBlank()) return@use loc
                 val final = resp.request.url.toString()
-                if (final != url && final.startsWith("http") && "/links/" !in final) {
-                    return@use final
-                }
+                if (final != url && final.startsWith("http") && "/links/" !in final) return@use final
                 val body = resp.body.string()
-                val doc = org.jsoup.Jsoup.parse(body, url)
+                val doc = Jsoup.parse(body, url)
                 doc.selectFirst("a[href^=http], a.button, .download-link a")?.absUrl("href")
                     ?.takeIf { it.startsWith("http") && "/links/" !in it }
-                    ?: run {
-                        val m = Regex(
-                            """(?:location|window\.location|href)\s*=\s*['"](https?://[^'"]+)['"]""",
-                        ).find(body)
-                        m?.groupValues?.get(1)
-                    }
+                    ?: Regex("""(?:location|window\.location|href)\s*=\s*['"](https?://[^'"]+)['"]""")
+                        .find(body)?.groupValues?.get(1)
                     ?: MP4_OR_M3U8.find(body)?.value
                     ?: final
             }
@@ -553,26 +674,17 @@ class NxxHentai :
 
     private suspend fun extractFromLinkPage(url: String, label: String): List<Video> {
         val resolved = resolveRedirect(url)
-        if (resolved != url && isUsefulEmbed(resolved)) {
-            return extractFromEmbed(resolved, label)
-        }
+        if (resolved != url && isUsefulEmbed(resolved)) return extractFromEmbed(resolved, label)
         val doc = runCatching {
-            client.newCall(GET(url, headers.newBuilder().set("Referer", "$baseUrl/").build()))
+            fastExtractorClient.newCall(GET(url, headers.newBuilder().set("Referer", "$baseUrl/").build()))
                 .execute().asJsoup()
         }.getOrNull() ?: return emptyList()
         val out = mutableListOf<Video>()
         doc.select("iframe[src], a[href*='http']").forEach { el ->
-            val u = when {
-                el.hasAttr("src") -> el.absUrl("src")
-                else -> el.absUrl("href")
-            }
-            if (isUsefulEmbed(u) && "/links/" !in u) {
-                out += extractFromEmbed(u, label)
-            }
+            val u = if (el.hasAttr("src")) el.absUrl("src") else el.absUrl("href")
+            if (isUsefulEmbed(u) && "/links/" !in u) out += extractFromEmbed(u, label)
         }
-        MP4_OR_M3U8.findAll(doc.html()).map { it.value }.distinct().forEach {
-            out += streamFromUrl(it, label)
-        }
+        MP4_OR_M3U8.findAll(doc.html()).map { it.value }.distinct().forEach { out += streamFromUrl(it, label) }
         return out
     }
 
@@ -580,11 +692,11 @@ class NxxHentai :
         var clean = url.trim().replace("&amp;", "&").replace("\\/", "/")
         if (clean.startsWith("//")) clean = "https:$clean"
         if (!clean.startsWith("http")) return emptyList()
-        val lower = clean.lowercase()
+        val lower = clean.lowercase(Locale.ROOT)
 
         return when {
             lower.contains("dood") || lower.contains("d0o0d") || lower.contains("ds2play") ||
-                lower.contains("ds2video") || lower.contains("doodstream") ->
+                lower.contains("ds2video") || lower.contains("doodstream") || lower.contains("playmogo") ->
                 doodExtractor.videoFromUrl(clean, prefix = "$label - ")?.let(::listOf).orEmpty()
 
             lower.contains("mixdrop") || lower.contains("mxdrop") ->
@@ -602,21 +714,16 @@ class NxxHentai :
             lower.contains("uqload") ->
                 uqloadExtractor.videosFromUrl(clean, "$label -")
 
-            lower.contains(".m3u8") || lower.contains(".mp4") ||
-                lower.contains("sacdnssedge") ->
+            lower.contains(".m3u8") || lower.contains(".mp4") || lower.contains("sacdnssedge") ->
                 streamFromUrl(clean, label)
 
             lower.contains("upns") ->
                 extractUpns(clean, label)
 
-            lower.contains("player.nxxhentai.net/player/") -> {
-                val dl = clean.replace("/player/", "/download/")
-                val dlVideos = extractFromPlayerPage(dl, label)
-                if (dlVideos.isNotEmpty()) dlVideos else extractFromPlayerPage(clean, label)
-            }
+            lower.contains("player.nxxhentai.net/player/") ->
+                extractVipNxxPlayer(clean, label)
 
-            lower.contains("rubyvidhub") || lower.contains("playmogo") ||
-                lower.contains("vidhub") ->
+            lower.contains("rubyvidhub") || lower.contains("vidhub") ->
                 extractFromPlayerPage(clean, label)
 
             else -> {
@@ -629,17 +736,54 @@ class NxxHentai :
         }
     }
 
+    /**
+     * Resolves `player.nxxhentai.net/download/{key}` -> `/file` 302 redirects to signed BunnyCDN MP4s in parallel.
+     */
+    private suspend fun extractVipNxxPlayer(playerUrl: String, label: String): List<Video> {
+        val dlUrl = playerUrl.replace("/player/", "/download/")
+        val doc = runCatching {
+            fastExtractorClient.newCall(
+                GET(dlUrl, headers.newBuilder().set("Referer", playerUrl).build()),
+            ).execute().asJsoup()
+        }.getOrNull() ?: return extractFromPlayerPage(playerUrl, label)
+
+        val fileLinks = doc.select("a[href*='/file']").mapNotNull { a ->
+            val href = a.absUrl("href").ifBlank { a.attr("href") }
+            if (!href.startsWith("http") || "/file" !in href) return@mapNotNull null
+            val q = QUALITY_IN_URL.find(href)?.value
+                ?: a.text().trim().ifBlank { "MP4" }
+            href to q
+        }.distinctBy { it.first }
+
+        if (fileLinks.isEmpty()) return extractFromPlayerPage(playerUrl, label)
+
+        val pool = Executors.newFixedThreadPool(fileLinks.size.coerceAtMost(4))
+        return try {
+            val futures = fileLinks.map { (href, q) ->
+                pool.submit<List<Video>> {
+                    val resolved = resolveRedirect(href, customReferer = dlUrl)
+                    if (resolved.startsWith("http") && isMediaUrl(resolved)) {
+                        streamFromUrl(resolved, "$label - $q")
+                    } else {
+                        emptyList()
+                    }
+                }
+            }
+            futures.flatMap { runCatching { it.get(7, TimeUnit.SECONDS) }.getOrDefault(emptyList()) }
+                .distinctBy { it.videoUrl ?: it.url }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
     private suspend fun extractUpns(url: String, label: String): List<Video> {
         val id = url.substringAfterLast('#').substringBefore('?').trim()
-        if (id.isBlank() || id.startsWith("http")) {
-            return extractFromPlayerPage(url, label)
-        }
-        val host = runCatching { url.toHttpUrl().host }.getOrNull()
-            ?: return extractFromPlayerPage(url, label)
+        if (id.isBlank() || id.startsWith("http")) return extractFromPlayerPage(url, label)
+        val host = runCatching { url.toHttpUrl().host }.getOrNull() ?: return extractFromPlayerPage(url, label)
         val scheme = runCatching { url.toHttpUrl().scheme }.getOrDefault("https")
         val api = "$scheme://$host/api/v1/video?id=$id"
         val body = runCatching {
-            client.newCall(
+            fastExtractorClient.newCall(
                 GET(
                     api,
                     headers.newBuilder()
@@ -657,20 +801,14 @@ class NxxHentai :
                 found += streamFromUrl(it, "$label Upns")
             }
         }
-        if (found.isNotEmpty()) return found.distinctBy { it.url }
-        return extractFromPlayerPage(url, label)
+        return found.distinctBy { it.url }.ifEmpty { extractFromPlayerPage(url, label) }
     }
 
     private suspend fun extractFromPlayerPage(url: String, label: String): List<Video> {
         val pageReferer = if (url.contains("player.nxxhentai.net")) url else "$baseUrl/"
         val doc = runCatching {
-            client.newCall(
-                GET(
-                    url,
-                    headers.newBuilder()
-                        .set("Referer", pageReferer)
-                        .build(),
-                ),
+            fastExtractorClient.newCall(
+                GET(url, headers.newBuilder().set("Referer", pageReferer).build()),
             ).execute().asJsoup()
         }.getOrNull() ?: return emptyList()
 
@@ -679,48 +817,21 @@ class NxxHentai :
 
         doc.select("source[src], video[src], video source").forEach { el ->
             val src = el.absUrl("src").ifBlank { el.attr("src") }
-            if (src.startsWith("http") && isMediaUrl(src)) {
-                nested += streamFromUrl(src, label)
-            }
-        }
-        doc.select("a[href*='/file'], a[href*='/download/']").forEach { a ->
-            val href = a.absUrl("href").ifBlank { a.attr("href") }
-            if (href.startsWith("http") && href != url && "/file" in href) {
-                val q = a.text().trim().ifBlank {
-                    QUALITY_IN_URL.find(href)?.value ?: "MP4"
-                }
-                val resolved = resolveRedirect(href, customReferer = url)
-                if (resolved.startsWith("http") && isMediaUrl(resolved)) {
-                    nested += streamFromUrl(resolved, "$label $q")
-                }
-            }
+            if (src.startsWith("http") && isMediaUrl(src)) nested += streamFromUrl(src, label)
         }
         MP4_OR_M3U8.findAll(body).map { it.value.replace("\\/", "/") }.distinct().forEach {
             nested += streamFromUrl(it, "$label CDN")
         }
-        // JWPlayer / Clappr style file:"..."
         Regex("""["']file["']\s*:\s*["'](https?://[^"']+)["']""")
             .findAll(body).map { it.groupValues[1] }.distinct().forEach {
                 nested += streamFromUrl(it, label)
             }
-        Regex("""["']sources?["']\s*:\s*\[\s*\{\s*["']file["']\s*:\s*["'](https?://[^"']+)["']""")
-            .findAll(body).map { it.groupValues[1] }.distinct().forEach {
-                nested += streamFromUrl(it, label)
-            }
-
         doc.select("iframe[src]").forEach { el ->
             val src = el.absUrl("src").ifBlank { el.attr("src") }
-            if (isUsefulEmbed(src) && src != url && "upns" !in src.lowercase()) {
+            if (isUsefulEmbed(src) && src != url && "upns" !in src.lowercase(Locale.ROOT)) {
                 nested += extractFromEmbed(src, label)
             }
         }
-
-        // Last resort: hash-based players sometimes put stream in query
-        if (nested.isEmpty() && url.contains("#")) {
-            val hash = url.substringAfter("#")
-            if (hash.startsWith("http")) nested += streamFromUrl(hash, label)
-        }
-
         return nested.distinctBy { it.url }
     }
 
@@ -733,7 +844,11 @@ class NxxHentai :
                 runCatching {
                     playlistUtils.extractFromHls(
                         clean,
-                        referer = if (clean.contains("b-cdn.net") || clean.contains("player.nxxhentai.net")) "https://player.nxxhentai.net/" else "$baseUrl/",
+                        referer = if (clean.contains("b-cdn.net") || clean.contains("player.nxxhentai.net")) {
+                            "https://player.nxxhentai.net/"
+                        } else {
+                            "$baseUrl/"
+                        },
                         videoNameGen = { q -> "$quality - $q" },
                     )
                 }.getOrElse { listOf(Video(clean, quality, clean, headers = vHeaders)) }
@@ -762,15 +877,37 @@ class NxxHentai :
         return builder.build()
     }
 
+    private fun toAbsoluteUrl(url: String): String = when {
+        url.startsWith("http://") || url.startsWith("https://") -> url
+        url.startsWith("//") -> "https:$url"
+        else -> "$baseUrl/${url.trimStart('/')}"
+    }
+
+    private fun fetchPageCached(url: String): String {
+        val now = System.currentTimeMillis()
+        pageCache[url]?.let { (ts, body) ->
+            if (now - ts < PAGE_CACHE_TTL_MS) return body
+        }
+        val html = client.newCall(GET(url, headers)).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
+            resp.body.string()
+        }
+        cachePage(url, html)
+        return html
+    }
+
+    private fun cachePage(url: String, html: String) {
+        if (pageCache.size > 30) pageCache.clear()
+        pageCache[url] = System.currentTimeMillis() to html
+    }
+
     // ============================== Filters ===============================
-    // Search tab + empty query → filters apply. Popular tab ignores filters.
     override fun getFilterList() = AnimeFilterList(
-        AnimeFilter.Header("استخدم تبويب البحث (اترك المربع فارغاً) لتطبيق الفلاتر"),
-        AnimeFilter.Header("البحث النصي يتجاهل الفلاتر"),
+        AnimeFilter.Header("يمكنك اختيار أكثر من تصنيف في نفس الوقت"),
         BrowseFilter(),
         SortFilter(),
         YearFilter(),
-        GenreFilter(),
+        GenreGroup(),
     )
 
     private class BrowseFilter :
@@ -800,84 +937,20 @@ class NxxHentai :
                 (2026 downTo 2000).map { Pair(it.toString(), it.toString()) }.toTypedArray(),
         )
 
-    private class GenreFilter :
-        UriPartFilter(
-            "التصنيف",
-            arrayOf(
-                Pair("الكل", ""),
-                Pair("بدون حجب", "بدون-حجب"),
-                Pair("محارم", "محارم"),
-                Pair("حريم", "حريم"),
-                Pair("ميلف", "ميلف"),
-                Pair("معلمة", "معلمة"),
-                Pair("معلم", "معلم"),
-                Pair("طالبة مدرسة", "طالبة-مدرسة"),
-                Pair("اثداء كبيرة", "اثداء-كبيرة"),
-                Pair("اغتصاب", "اغتصاب"),
-                Pair("اغتصاب جماعي", "اغتصاب-جماعي"),
-                Pair("تحكم بالعقل", "تحكم-بالعقل"),
-                Pair("تحطم العقل", "تحطم-العقل"),
-                Pair("تنويم المغناطيسي", "تنويم-المغناطيسي"),
-                Pair("تصوير", "تصوير"),
-                Pair("تعابير منحرفة", "تعابير-منحرفة"),
-                Pair("جنس فموي", "جنس-فموي"),
-                Pair("جنس ثلاثي", "جنس-ثلاثي"),
-                Pair("جنس جماعي", "جنس-جماعي"),
-                Pair("جنس بالثدي", "جنس-بالثدي"),
-                Pair("جنس بالعام", "جنس-بالعام"),
-                Pair("خيانة", "خيانة"),
-                Pair("دياثة", "دياثة"),
-                Pair("يوري", "يوري"),
-                Pair("ياوي", "ياوي"),
-                Pair("فوتا", "فوتا"),
-                Pair("لولي", "لولي"),
-                Pair("شوتا", "شوتا"),
-                Pair("حمل", "حمل"),
-                Pair("عبودية", "عبودية"),
-                Pair("كوميدي", "كوميدي"),
-                Pair("رومانسي", "رومانسي"),
-                Pair("دراما", "دراما"),
-                Pair("فانتازيا", "فانتازيا"),
-                Pair("فانيلا", "فانيلا"),
-                Pair("هنتاي", "هنتاي"),
-                Pair("وحوش", "وحوش"),
-                Pair("مجسات", "مجسات"),
-                Pair("خادمات", "خادمات"),
-                Pair("ممرضة", "ممرضة"),
-                Pair("كوسبلاي", "كوسبلاي"),
-                Pair("فتاة قطة", "فتاة-قطة"),
-                Pair("إبتزاز", "إبتزاز"),
-                Pair("إذلال", "إذلال"),
-                Pair("إلف", "إلف"),
-                Pair("إيسيكاي", "إيسيكاي-isekai"),
-                Pair("اخ و أخت", "اخ-و-أخت"),
-                Pair("استمناء", "استمناء"),
-                Pair("التحكم بالأشخاص", "التحكم-بالأشخاص"),
-                Pair("العاب جنسية", "العاب-جنسية"),
-                Pair("الفتاة السحرية", "الفتاة-السحرية"),
-                Pair("بشرة سوداء", "بشرة-سوداء"),
-                Pair("تبادل الزوجات", "تبادل-الزوجات"),
-                Pair("تحرش في المواصلات", "تحرش-في-المواصلات"),
-                Pair("تسوندري", "تسوندري"),
-                Pair("خيال", "خيال"),
-                Pair("ربات البيوت", "ربات-البيوت"),
-                Pair("رعب", "رعب"),
-                Pair("رياضة", "رياضة"),
-                Pair("سيصدر قريباً", "سيصدر-قريباً"),
-                Pair("شريحة من الحياة", "شريحة-من-الحياة"),
-                Pair("شياطين", "شياطين"),
-                Pair("عاهرات", "عاهرات"),
-                Pair("عذرية", "عذرية"),
-                Pair("قوة خارقة", "قوة-خارقة"),
-                Pair("ملابس داخلية", "ملابس-داخلية"),
-                Pair("ملابس سباحة", "ملابس-سباحة"),
-                Pair("موظفات المكاتب", "موظفات-المكاتب"),
-                Pair("وغد قبيح", "وغد-قبيح"),
-                Pair("عنف و رطب حبال", "عنف-و-رطب-حبال"),
-            ),
+    private class GenreCheckBox(name: String, val value: String) : AnimeFilter.CheckBox(name)
+
+    private class GenreGroup :
+        AnimeFilter.Group<GenreCheckBox>(
+            "التصنيفات (اختيار متعدد)",
+            GENRES.map { (label, slug) -> GenreCheckBox(label, slug) },
         )
 
     companion object {
+        private const val MAX_PARALLEL_FILTERS = 4
+        private const val MAX_EXTRACTION_WAIT_MS = 10_000L
+        private const val EXTRA_WAIT_AFTER_FIRST_MS = 1_800L
+        private const val PAGE_CACHE_TTL_MS = 3 * 60 * 1000L
+
         private val EP_NUM = Regex("""(\d{1,4})""")
         private val EMBED_URL_JSON = Regex(""""embed_url"\s*:\s*"([^"]*)"""")
         private val MP4_OR_M3U8 = Regex(
@@ -890,6 +963,78 @@ class NxxHentai :
             "streamwish", "ahvsh", "wishfast", "sfastwish", "flaswish", "awish",
             "dwish", "playerwish", "streamhg", "hgcloud", "hglink", "vidhide",
             "streamhide", "filelions", "vidmoly", "smoothpre",
+        )
+
+        private val GENRES = listOf(
+            "بدون حجب" to "بدون-حجب",
+            "محارم" to "محارم",
+            "حريم" to "حريم",
+            "ميلف" to "ميلف",
+            "معلمة" to "معلمة",
+            "معلم" to "معلم",
+            "طالبة مدرسة" to "طالبة-مدرسة",
+            "اثداء كبيرة" to "اثداء-كبيرة",
+            "اغتصاب" to "اغتصاب",
+            "اغتصاب جماعي" to "اغتصاب-جماعي",
+            "تحكم بالعقل" to "تحكم-بالعقل",
+            "تحطم العقل" to "تحطم-العقل",
+            "تنويم المغناطيسي" to "تنويم-المغناطيسي",
+            "تصوير" to "تصوير",
+            "تعابير منحرفة" to "تعابير-منحرفة",
+            "جنس فموي" to "جنس-فموي",
+            "جنس ثلاثي" to "جنس-ثلاثي",
+            "جنس جماعي" to "جنس-جماعي",
+            "جنس بالثدي" to "جنس-بالثدي",
+            "جنس بالعام" to "جنس-بالعام",
+            "خيانة" to "خيانة",
+            "دياثة" to "دياثة",
+            "يوري" to "يوري",
+            "ياوي" to "ياوي",
+            "فوتا" to "فوتا",
+            "لولي" to "لولي",
+            "شوتا" to "شوتا",
+            "حمل" to "حمل",
+            "عبودية" to "عبودية",
+            "كوميدي" to "كوميدي",
+            "رومانسي" to "رومانسي",
+            "دراما" to "دراما",
+            "فانتازيا" to "فانتازيا",
+            "فانيلا" to "فانيلا",
+            "هنتاي" to "هنتاي",
+            "وحوش" to "وحوش",
+            "مجسات" to "مجسات",
+            "خادمات" to "خادمات",
+            "ممرضة" to "ممرضة",
+            "كوسبلاي" to "كوسبلاي",
+            "فتاة قطة" to "فتاة-قطة",
+            "إبتزاز" to "إبتزاز",
+            "إذلال" to "إذلال",
+            "إلف" to "إلف",
+            "إيسيكاي" to "إيسيكاي-isekai",
+            "اخ و أخت" to "اخ-و-أخت",
+            "استمناء" to "استمناء",
+            "التحكم بالأشخاص" to "التحكم-بالأشخاص",
+            "العاب جنسية" to "العاب-جنسية",
+            "الفتاة السحرية" to "الفتاة-السحرية",
+            "بشرة سوداء" to "بشرة-سوداء",
+            "تبادل الزوجات" to "تبادل-الزوجات",
+            "تحرش في المواصلات" to "تحرش-في-المواصلات",
+            "تسوندري" to "تسوندري",
+            "خيال" to "خيال",
+            "ربات البيوت" to "ربات-البيوت",
+            "رعب" to "رعب",
+            "رياضة" to "رياضة",
+            "سيصدر قريباً" to "سيصدر-قريباً",
+            "شريحة من الحياة" to "شريحة-من-الحياة",
+            "شياطين" to "شياطين",
+            "عاهرات" to "عاهرات",
+            "عذرية" to "عذرية",
+            "قوة خارقة" to "قوة-خارقة",
+            "ملابس داخلية" to "ملابس-داخلية",
+            "ملابس سباحة" to "ملابس-سباحة",
+            "موظفات المكاتب" to "موظفات-المكاتب",
+            "وغد قبيح" to "وغد-قبيح",
+            "عنف و رطب حبال" to "عنف-و-رطب-حبال",
         )
     }
 }

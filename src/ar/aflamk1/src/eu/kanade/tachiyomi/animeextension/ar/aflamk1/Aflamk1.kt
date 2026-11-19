@@ -10,14 +10,22 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.getPreferencesLazy
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 /**
@@ -25,7 +33,7 @@ import kotlin.math.abs
  *
  * Listings: most-popular / latest-updates / top-rated
  * Search: /search/?q=…&from_videos=N
- * Categories: /categories/{slug}/[page]/
+ * Categories: /categories/{slug}/[page]/ (multi-select supported)
  * Streams: flashvars video_url (plain get_file + v-acctoken; function/0 if present)
  */
 class Aflamk1 :
@@ -40,10 +48,14 @@ class Aflamk1 :
 
     override val supportsLatest = true
 
+    override val disableRelatedAnimes = true
+
+    override val disableRelatedAnimesBySearch = true
+
     private val preferences by getPreferencesLazy()
+    private val pageCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
     override fun headersBuilder() = super.headersBuilder()
-        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
         .set("Referer", "$baseUrl/")
 
     // ============================== Popular ===============================
@@ -78,13 +90,21 @@ class Aflamk1 :
 
     override fun popularAnimeNextPageSelector(): String = "div.pagination li.next a, a[rel=next], div.pagination a.next"
 
-    override fun popularAnimeParse(response: Response): AnimesPage {
-        val document = response.asJsoup()
+    override fun popularAnimeParse(response: Response): AnimesPage = parseListing(
+        response.asJsoup(),
+        hasFromVideos = response.request.url.queryParameter("from_videos") != null,
+    )
+
+    private fun parseListing(document: Document, hasFromVideos: Boolean): AnimesPage {
         val animes = document.select(popularAnimeSelector())
             .map { popularAnimeFromElement(it) }
             .filter { it.url.isNotBlank() && it.title.isNotBlank() }
             .distinctBy { it.url }
-        val hasNext = document.selectFirst(popularAnimeNextPageSelector()) != null && animes.isNotEmpty()
+        val hasNext = when {
+            document.selectFirst(popularAnimeNextPageSelector()) != null -> true
+            hasFromVideos -> animes.size >= 16
+            else -> false
+        } && animes.isNotEmpty()
         return AnimesPage(animes, hasNext)
     }
 
@@ -102,37 +122,57 @@ class Aflamk1 :
 
     // =============================== Search ===============================
 
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        if (query.isBlank()) {
+            val sort = filters.firstInstanceOrNull<SortFilter>()?.selected.orEmpty()
+            val reqs = collectFilterRequests(page, sort, filters)
+            if (reqs.size > 1) {
+                return fetchAndMergePages(reqs.take(MAX_PARALLEL_FILTERS))
+            }
+        }
+        val response = client.newCall(searchAnimeRequest(page, query, filters)).awaitSuccess()
+        return searchAnimeParse(response)
+    }
+
+    private fun collectFilterRequests(page: Int, sort: String, filters: AnimeFilterList): List<Request> {
+        val sortBy = mapSortBy(sort)
+        val tagReqs = splitMulti(filters.firstInstanceOrNull<TagFilter>()?.state).map { tag ->
+            val slug = slugify(tag)
+            val base = if (page <= 1) "$baseUrl/tags/$slug/" else "$baseUrl/tags/$slug/$page/"
+            val url = if (sortBy.isNotBlank()) base.toHttpUrl().newBuilder().addQueryParameter("sort_by", sortBy).build().toString() else base
+            GET(url, headers)
+        }
+        val catReqs = filters.firstInstanceOrNull<CategoryGroup>()
+            ?.state?.filter { it.state }
+            ?.map { cat ->
+                val base = if (page <= 1) "$baseUrl/${cat.value}/" else "$baseUrl/${cat.value}/$page/"
+                val url = if (sortBy.isNotBlank()) base.toHttpUrl().newBuilder().addQueryParameter("sort_by", sortBy).build().toString() else base
+                GET(url, headers)
+            }.orEmpty()
+        return tagReqs + catReqs
+    }
+
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val sort = filters.firstInstanceOrNull<SortFilter>()?.selected.orEmpty()
-        val category = filters.firstInstanceOrNull<CategoryFilter>()?.selected.orEmpty()
-        val tag = filters.firstInstanceOrNull<TagFilter>()?.state?.trim().orEmpty()
+        val firstTag = splitMulti(filters.firstInstanceOrNull<TagFilter>()?.state).firstOrNull().orEmpty()
 
+        if (query.isNotBlank()) {
+            val fullQuery = if (firstTag.isNotBlank()) "${query.trim()} $firstTag" else query.trim()
+            val sortBy = mapSortBy(sort)
+            val url = "$baseUrl/search/".toHttpUrl().newBuilder()
+                .addQueryParameter("q", fullQuery)
+                .apply {
+                    if (sortBy.isNotBlank()) addQueryParameter("sort_by", sortBy)
+                    if (page > 1) addQueryParameter("from_videos", page.toString())
+                }
+                .build()
+            return GET(url, headers)
+        }
+
+        val firstFilter = collectFilterRequests(page, sort, filters).firstOrNull()
         return when {
-            query.isNotBlank() -> {
-                val fullQuery = if (tag.isNotBlank()) "${query.trim()} $tag" else query.trim()
-                val url = "$baseUrl/search/".toHttpUrl().newBuilder()
-                    .addQueryParameter("q", fullQuery)
-                    .apply {
-                        if (sort.isNotBlank()) addQueryParameter("sort_by", sort)
-                        if (page > 1) addQueryParameter("from_videos", page.toString())
-                    }
-                    .build()
-                GET(url, headers)
-            }
-
-            tag.isNotBlank() -> {
-                val slug = slugify(tag)
-                val path = if (page <= 1) "/tags/$slug/" else "/tags/$slug/$page/"
-                GET(baseUrl + path, headers)
-            }
-
-            category.isNotBlank() -> {
-                val path = if (page <= 1) "/$category/" else "/$category/$page/"
-                GET(baseUrl + path, headers)
-            }
-
+            firstFilter != null -> firstFilter
             sort.isNotBlank() -> GET(pagedPath(sort, page), headers)
-
             else -> popularAnimeRequest(page)
         }
     }
@@ -143,21 +183,15 @@ class Aflamk1 :
 
     override fun searchAnimeNextPageSelector(): String = popularAnimeNextPageSelector()
 
-    override fun searchAnimeParse(response: Response): AnimesPage {
-        val document = response.asJsoup()
-        val animes = document.select(searchAnimeSelector())
-            .map { searchAnimeFromElement(it) }
-            .filter { it.url.isNotBlank() && it.title.isNotBlank() }
-            .distinctBy { it.url }
-        val hasNext = when {
-            document.selectFirst(searchAnimeNextPageSelector()) != null -> true
-            response.request.url.queryParameter("from_videos") != null -> animes.isNotEmpty()
-            else -> false
-        } && animes.isNotEmpty()
-        return AnimesPage(animes, hasNext)
-    }
+    override fun searchAnimeParse(response: Response): AnimesPage = popularAnimeParse(response)
 
     // =========================== Anime Details ============================
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+        val fullUrl = cleanUrl(anime.url)
+        val html = fetchPageCached(fullUrl)
+        animeDetailsParse(Jsoup.parse(html, fullUrl))
+    }
 
     override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
         val flash = document.html()
@@ -178,9 +212,7 @@ class Aflamk1 :
                     .eachText().joinToString()
             }
         description = document.selectFirst("meta[property=og:description], div.info .description, div.block-details")
-            ?.let { el ->
-                el.attr("content").ifBlank { el.text() }
-            }
+            ?.let { el -> el.attr("content").ifBlank { el.text() } }
         thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
             ?: document.selectFirst("img.thumb[src*=videos_screenshots], video[poster]")?.let {
                 it.attr("abs:src").ifBlank { it.attr("abs:poster") }
@@ -194,9 +226,7 @@ class Aflamk1 :
 
     private fun cleanUrl(url: String): String {
         val clean = url.trim()
-        if (clean.startsWith("http://") || clean.startsWith("https://")) {
-            return clean
-        }
+        if (clean.startsWith("http://") || clean.startsWith("https://")) return clean
         val raw = "$baseUrl/$clean"
         val path = raw.removePrefix(baseUrl).trim('/')
         if (path.isEmpty()) return baseUrl
@@ -213,6 +243,18 @@ class Aflamk1 :
 
     // ============================== Episodes ==============================
 
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
+        val fullUrl = cleanUrl(anime.url)
+        listOf(
+            SEpisode.create().apply {
+                name = "Video"
+                setUrlWithoutDomain(fullUrl)
+                episode_number = 1f
+                date_upload = System.currentTimeMillis()
+            },
+        )
+    }
+
     override fun episodeListParse(response: Response): List<SEpisode> = listOf(
         SEpisode.create().apply {
             name = "Video"
@@ -228,13 +270,23 @@ class Aflamk1 :
 
     // ============================ Video Links =============================
 
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+        val fullUrl = cleanUrl(episode.url)
+        val html = fetchPageCached(fullUrl)
+        parseVideosFromHtml(html).sort()
+    }
+
     override fun videoListParse(response: Response): List<Video> {
+        val url = response.request.url.toString()
         val html = response.body.string()
-        val pageUrl = "$baseUrl/"
+        cachePage(url, html)
+        return parseVideosFromHtml(html)
+    }
+
+    private fun parseVideosFromHtml(html: String): List<Video> {
         val license = LICENSE_CODE.find(html)?.groupValues?.get(1)
         val videoHeaders = headersBuilder()
-            .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-            .set("Referer", pageUrl)
+            .set("Referer", "$baseUrl/")
             .build()
 
         val pairs = mutableListOf<Pair<String, String>>()
@@ -276,7 +328,7 @@ class Aflamk1 :
         }.distinctBy { it.url }
 
         if (videos.isEmpty()) {
-            error("No playable streams found (flashvars missing or private video)")
+            throw IOException("No playable streams found (flashvars missing or private video)")
         }
         return videos
     }
@@ -300,29 +352,31 @@ class Aflamk1 :
     // =============================== Filters ==============================
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("Priority: Query → Tag → Category → Sort → Popular"),
+        AnimeFilter.Header("يمكنك اختيار أكثر من تصنيف أو كتابة أكثر من تاج بفواصل (,)"),
         SortFilter(),
-        CategoryFilter(),
+        CategoryGroup(),
         TagFilter(),
     )
 
     private class SortFilter :
         UriSelectFilter(
-            "Sort / listing",
+            "الترتيب / Sort",
             arrayOf(
-                "Most popular" to "most-popular",
-                "Latest updates" to "latest-updates",
-                "Top rated" to "top-rated",
+                "الأكثر شعبية (Most popular)" to "most-popular",
+                "الأحدث (Latest updates)" to "latest-updates",
+                "الأعلى تقييماً (Top rated)" to "top-rated",
             ),
         )
 
-    private class CategoryFilter :
-        UriSelectFilter(
-            "Category",
-            CATEGORIES,
+    private class CategoryCheckBox(name: String, val value: String) : AnimeFilter.CheckBox(name)
+
+    private class CategoryGroup :
+        AnimeFilter.Group<CategoryCheckBox>(
+            "التصنيفات / Categories (اختيار متعدد)",
+            CATEGORIES.map { (label, path) -> CategoryCheckBox(label, path) },
         )
 
-    private class TagFilter : AnimeFilter.Text("Tag (slug or Arabic text)")
+    private class TagFilter : AnimeFilter.Text("تاج / Tag (افصل بفاصلة ,)")
 
     private open class UriSelectFilter(
         name: String,
@@ -346,17 +400,92 @@ class Aflamk1 :
 
     // =============================== Helpers ==============================
 
-    private fun pagedPath(section: String, page: Int): String = if (page <= 1) {
-        "$baseUrl/$section/"
-    } else {
-        "$baseUrl/$section/$page/"
+    private suspend fun fetchAndMergePages(requests: List<Request>): AnimesPage = withContext(Dispatchers.IO) {
+        val pool = Executors.newFixedThreadPool(requests.size.coerceAtMost(MAX_PARALLEL_FILTERS))
+        try {
+            val futures = requests.map { req ->
+                pool.submit<AnimesPage?> {
+                    runCatching {
+                        client.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) return@use null
+                            parseListing(resp.asJsoup(), req.url.queryParameter("from_videos") != null)
+                        }
+                    }.getOrNull()
+                }
+            }
+            val pages = futures.mapNotNull { runCatching { it.get(12, TimeUnit.SECONDS) }.getOrNull() }
+            mergePages(pages)
+        } finally {
+            pool.shutdownNow()
+        }
     }
 
-    private fun slugify(raw: String): String = raw.trim()
-        .replace(Regex("""\s+"""), "-")
-        .trim('-')
+    private fun mergePages(pages: List<AnimesPage>): AnimesPage {
+        if (pages.isEmpty()) return AnimesPage(emptyList(), false)
+        val counts = LinkedHashMap<String, Int>()
+        val byUrl = LinkedHashMap<String, SAnime>()
+        for (page in pages) {
+            val seen = HashSet<String>()
+            for (item in page.animes) {
+                if (seen.add(item.url)) {
+                    counts[item.url] = (counts[item.url] ?: 0) + 1
+                    byUrl.putIfAbsent(item.url, item)
+                }
+            }
+        }
+        val merged = mutableListOf<SAnime>()
+        val added = HashSet<String>()
+        counts.entries.filter { it.value > 1 }.sortedByDescending { it.value }.forEach { (url, _) ->
+            byUrl[url]?.let {
+                merged += it
+                added += url
+            }
+        }
+        val maxLen = pages.maxOfOrNull { it.animes.size } ?: 0
+        for (i in 0 until maxLen) {
+            for (page in pages) {
+                val item = page.animes.getOrNull(i) ?: continue
+                if (added.add(item.url)) merged += item
+            }
+        }
+        return AnimesPage(merged, pages.any { it.hasNextPage })
+    }
+
+    private fun mapSortBy(sort: String): String = when (sort) {
+        "latest-updates" -> "post_date"
+        "most-popular" -> "video_viewed"
+        "top-rated" -> "rating"
+        else -> ""
+    }
+
+    private fun splitMulti(raw: String?): List<String> = raw.orEmpty()
+        .split(',', '،')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+
+    private fun pagedPath(section: String, page: Int): String = if (page <= 1) "$baseUrl/$section/" else "$baseUrl/$section/$page/"
+
+    private fun slugify(raw: String): String = raw.trim().replace(Regex("""\s+"""), "-").trim('-')
 
     private fun qualityFromUrl(url: String): String? = QUALITY_FROM_URL.find(url)?.groupValues?.get(1)?.let { "${it}p" }
+
+    private fun fetchPageCached(url: String): String {
+        val now = System.currentTimeMillis()
+        pageCache[url]?.let { (ts, body) ->
+            if (now - ts < PAGE_CACHE_TTL_MS) return body
+        }
+        val html = client.newCall(GET(url, headers)).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
+            resp.body.string()
+        }
+        cachePage(url, html)
+        return html
+    }
+
+    private fun cachePage(url: String, html: String) {
+        if (pageCache.size > 30) pageCache.clear()
+        pageCache[url] = System.currentTimeMillis() to html
+    }
 
     private inline fun <reified T> AnimeFilterList.firstInstanceOrNull(): T? = firstOrNull { it is T } as? T
 
@@ -372,12 +501,8 @@ class Aflamk1 :
         for (k in hash.length - 1 downTo 0) {
             val hashArray = hash.map { it.toString() }.toMutableList()
             var l = k
-            for (m in k until seedArray.size) {
-                l += seedArray[m].toInt()
-            }
-            while (l >= hashArray.size) {
-                l -= hashArray.size
-            }
+            for (m in k until seedArray.size) l += seedArray[m].toInt()
+            while (l >= hashArray.size) l -= hashArray.size
             val n = StringBuilder()
             for (o in hashArray.indices) {
                 n.append(
@@ -426,13 +551,14 @@ class Aflamk1 :
     }
 
     companion object {
+        private const val MAX_PARALLEL_FILTERS = 4
+        private const val PAGE_CACHE_TTL_MS = 3 * 60 * 1000L
+
         private val FLASH_TITLE = Regex("""video_title:\s*'((?:\\'|[^'])*)'""")
         private val FLASH_CATS = Regex("""video_categories:\s*'((?:\\'|[^'])*)'""")
         private val FLASH_TAGS = Regex("""video_tags:\s*'((?:\\'|[^'])*)'""")
         private val LICENSE_CODE = Regex("""license_code:\s*'([^']+)'""")
-        private val FLASH_URL = Regex(
-            """(video_url|video_alt_url\d*):\s*'((?:\\'|[^'])*)'""",
-        )
+        private val FLASH_URL = Regex("""(video_url|video_alt_url\d*):\s*'((?:\\'|[^'])*)'""")
         private val GET_FILE = Regex("""https?://[^"'\\\s]+/get_file/[^"'\\\s]+""")
         private val QUALITY_FROM_URL = Regex("""_(\d{3,4})p\.(?:mp4|m3u8)""", RegexOption.IGNORE_CASE)
         private val QUALITY_NUM = Regex("""(\d{3,4})""")
@@ -442,9 +568,8 @@ class Aflamk1 :
         private const val PREF_QUALITY_DEFAULT = "720"
         private val PREF_QUALITY_ENTRIES = listOf("1080", "720", "480", "360", "240", "HD", "MP4")
 
-        // Probed from site nav + /categories/
-        private val CATEGORIES = arrayOf(
-            "Any" to "",
+        // All 8 verified live categories from https://www.aflamk1.net/categories/
+        private val CATEGORIES = listOf(
             "سكس مترجم" to "categories/سكس-مترجم",
             "سكس محارم" to "categories/سكس-محارم-مترجم",
             "سكس اخوات" to "categories/سكس-اخوات-مترجم",

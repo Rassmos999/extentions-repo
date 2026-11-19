@@ -2,7 +2,6 @@ package eu.kanade.tachiyomi.animeextension.ar.arabshentai
 
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.mixdropextractor.MixDropExtractor
-import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
 import aniyomi.lib.universalextractor.UniversalExtractor
@@ -16,25 +15,39 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.multisrc.dooplay.DooPlay
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
-import okhttp3.FormBody
+import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 
 /**
- * ArabsHentai — https://arabshentai.net/anime/
+ * ArabsHentai — https://arabshentai.net/
  *
- * DooPlay theme (same family as NxxHentai). Cloudflare is handled by the **app**
- * NetworkHelper client (default UA + AndroidCookieJar WebView solver).
- * Do not force a desktop Windows User-Agent — it makes CF “Verifying you are human”
- * hang forever in the in-app WebView.
+ * Keeps DooPlay base class to preserve the existing sourceId for user libraries,
+ * while implementing the live WP-Script / RetroTube theme:
+ * - Series catalog: `/anime/` (`/anime/page/N/`) → `/category/{slug}/`
+ * - Latest episodes: `/` (`/page/N/`) with `?filter=latest|popular|most-viewed|longest`
+ * - Tags & Years: `/tag/{slug}/` (`/tag/{slug}/page/N/`)
+ * - Video streams: Dropbox direct MP4 (`raw=1`) + non-dead direct/embed fallbacks
+ *   (skipping dead `x-tez.com` URLs).
  */
 class ArabsHentai :
     DooPlay(
@@ -43,19 +56,32 @@ class ArabsHentai :
         "https://arabshentai.net",
     ) {
 
+    override val disableRelatedAnimes = true
+
+    override val disableRelatedAnimesBySearch = true
+
     override fun headersBuilder() = super.headersBuilder()
         .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         .set("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
         .set("Referer", "$baseUrl/")
 
-    private val playlistUtils by lazy { PlaylistUtils(client, headers) }
-    private val doodExtractor by lazy { DoodExtractor(client) }
-    private val mixDropExtractor by lazy { MixDropExtractor(client) }
-    private val streamWishExtractor by lazy { StreamWishExtractor(client, headers) }
-    private val streamTapeExtractor by lazy { StreamTapeExtractor(client) }
-    private val voeExtractor by lazy { VoeExtractor(client, headers) }
-    private val uqloadExtractor by lazy { UqloadExtractor(client) }
-    private val universalExtractor by lazy { UniversalExtractor(client) }
+    private val fastExtractorClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(7, TimeUnit.SECONDS)
+            .writeTimeout(5, TimeUnit.SECONDS)
+            .callTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val doodExtractor by lazy { DoodExtractor(fastExtractorClient) }
+    private val mixDropExtractor by lazy { MixDropExtractor(fastExtractorClient) }
+    private val streamWishExtractor by lazy { StreamWishExtractor(fastExtractorClient, headers) }
+    private val streamTapeExtractor by lazy { StreamTapeExtractor(fastExtractorClient) }
+    private val voeExtractor by lazy { VoeExtractor(fastExtractorClient, headers) }
+    private val uqloadExtractor by lazy { UqloadExtractor(fastExtractorClient) }
+    private val universalExtractor by lazy { UniversalExtractor(fastExtractorClient) }
+    private val pageCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
     // ============================== Popular ===============================
     override fun popularAnimeRequest(page: Int): Request {
@@ -63,250 +89,256 @@ class ArabsHentai :
         return GET(url, headers)
     }
 
-    /** Catalog cards: series (tvshows) + movies + generic items. */
-    private fun catalogSelector() = "article.thumb-block, article.item.tvshows div.poster, article.item.movies div.poster, " +
-        "article.item div.poster, div.content article div.poster, div.items article div.poster, article.item, article"
+    override fun popularAnimeSelector() = "article.thumb-block, article.post, div.thumb-block"
 
-    override fun popularAnimeSelector() = catalogSelector()
-
-    override fun popularAnimeNextPageSelector() = "div.pagination span.current + a, div.pagination a.arrow_pag, " +
-        "div.resppages a > i#nextpagination, div.resppages a > span.fa-chevron-left, " +
-        "div.resppages a > i.fa-chevron-left, div.resppages a > span.fa-chevron-right, " +
-        "div.resppages a > i.fa-caret-left, div.pagination a.inactive"
+    override fun popularAnimeNextPageSelector() = "div.pagination a.next, a.next.page-numbers, a[rel=next]"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
-        val link = element.selectFirst("a[href]")
-            ?: element.parent()?.selectFirst("a[href]")
-            ?: element
+        val link = element.selectFirst("a[href]") ?: element
         val href = link.absUrl("href").ifBlank { link.attr("href") }
         setUrlWithoutDomain(href)
         val img = element.selectFirst("img")
         title = link.attr("title").ifBlank {
-            img?.attr("alt").orEmpty().ifBlank {
-                element.selectFirst(".cat-title, .entry-header span, .data h3 a, .data h3, h3, h2")?.text().orEmpty()
-            }
+            element.selectFirst(".cat-title, .entry-header span, .entry-title, h2, h3")?.text().orEmpty()
+        }.ifBlank {
+            img?.attr("alt").orEmpty()
         }.trim()
-        thumbnail_url = img?.getImageUrl()
+        thumbnail_url = img?.extractThumbUrl()
     }
 
+    override fun popularAnimeParse(response: Response): AnimesPage = parseListing(response.asJsoup())
+
     // =============================== Latest ===============================
-    override val latestUpdatesPath = "episodes"
+    override val latestUpdatesPath = ""
 
     override fun latestUpdatesRequest(page: Int): Request {
-        val url = if (page <= 1) "$baseUrl/episodes/" else "$baseUrl/episodes/page/$page/"
+        val url = if (page <= 1) "$baseUrl/" else "$baseUrl/page/$page/"
         return GET(url, headers)
     }
 
-    override fun latestUpdatesSelector() = catalogSelector()
+    override fun latestUpdatesSelector() = popularAnimeSelector()
 
     override fun latestUpdatesNextPageSelector() = popularAnimeNextPageSelector()
+
+    override fun latestUpdatesParse(response: Response): AnimesPage = parseListing(response.asJsoup())
 
     // =============================== Search ===============================
     override val fetchGenres = false
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        // Text query always wins (filters ignored).
-        if (query.isNotBlank()) {
-            val encoded = java.net.URLEncoder.encode(query.trim(), Charsets.UTF_8.name())
-            val url = if (page <= 1) "$baseUrl/?s=$encoded" else "$baseUrl/page/$page/?s=$encoded"
-            return GET(url, headers)
-        }
-
-        val sort = filters.filterIsInstance<SortFilter>().firstOrNull()?.toUriPart().orEmpty()
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val cleanQuery = query.trim()
+        val selectedTags = filters.filterIsInstance<TagGroup>()
+            .firstOrNull()?.state?.filter { it.state }?.map { it.value }.orEmpty()
+        val customTags = filters.filterIsInstance<TagTextFilter>()
+            .firstOrNull()?.state.orEmpty()
+            .split(',', '،')
+            .map { it.trim().replace(Regex("""\s+"""), "-").trim('-') }
+            .filter { it.isNotEmpty() }
         val year = filters.filterIsInstance<YearFilter>().firstOrNull()?.toUriPart().orEmpty()
-        val genre = filters.filterIsInstance<GenreFilter>().firstOrNull()?.toUriPart().orEmpty()
+        val allTags = buildList {
+            addAll(selectedTags)
+            addAll(customTags)
+            if (year.isNotBlank()) add(year)
+        }.distinct()
+
+        if (cleanQuery.isBlank() && allTags.size > 1) {
+            val sort = filters.filterIsInstance<SortFilter>().firstOrNull()?.toUriPart().orEmpty()
+            val requests = allTags.take(MAX_PARALLEL_FILTERS).map { slug ->
+                GET(tagUrl(slug, page, sort), headers)
+            }
+            return fetchAndMergePages(requests)
+        }
+
+        val response = client.newCall(searchAnimeRequest(page, query, filters)).awaitSuccess()
+        return searchAnimeParse(response)
+    }
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        val cleanQuery = query.trim()
+        val sort = filters.filterIsInstance<SortFilter>().firstOrNull()?.toUriPart().orEmpty()
         val browse = filters.filterIsInstance<BrowseFilter>().firstOrNull()?.toUriPart().orEmpty()
+        val year = filters.filterIsInstance<YearFilter>().firstOrNull()?.toUriPart().orEmpty()
+        val firstTag = filters.filterIsInstance<TagGroup>()
+            .firstOrNull()?.state?.firstOrNull { it.state }?.value
+            ?: filters.filterIsInstance<TagTextFilter>()
+                .firstOrNull()?.state.orEmpty()
+                .split(',', '،')
+                .map { it.trim().replace(Regex("""\s+"""), "-").trim('-') }
+                .firstOrNull { it.isNotEmpty() }
+            ?: year
 
-        when (browse) {
-            "movies" -> {
-                val path = if (page <= 1) "$baseUrl/movies/" else "$baseUrl/movies/page/$page/"
-                return GET(path, headers)
-            }
-
-            "episodes" -> {
-                val path = if (page <= 1) "$baseUrl/episodes/" else "$baseUrl/episodes/page/$page/"
-                return GET(path, headers)
-            }
+        if (cleanQuery.isNotBlank()) {
+            val builder = (if (page <= 1) "$baseUrl/" else "$baseUrl/page/$page/").toHttpUrl().newBuilder()
+                .addQueryParameter("s", cleanQuery)
+            if (sort.isNotBlank()) builder.addQueryParameter("filter", sort)
+            return GET(builder.build(), headers)
         }
 
-        // Genre-only → cleaner /genre/{slug}/ archive (site supports both).
-        if (genre.isNotBlank() && sort.isBlank() && year.isBlank()) {
-            val path = if (page <= 1) {
-                "$baseUrl/genre/$genre/"
-            } else {
-                "$baseUrl/genre/$genre/page/$page/"
-            }
-            return GET(path, headers)
+        if (firstTag.isNotBlank()) {
+            return GET(tagUrl(firstTag, page, sort), headers)
         }
 
-        // Year-only archive also exists as /release/{year}/
-        if (year.isNotBlank() && genre.isBlank() && sort.isBlank()) {
-            val path = if (page <= 1) {
-                "$baseUrl/release/$year/"
-            } else {
-                "$baseUrl/release/$year/page/$page/"
-            }
-            return GET(path, headers)
+        if (browse == "latest" || sort.isNotBlank()) {
+            val builder = (if (page <= 1) "$baseUrl/" else "$baseUrl/page/$page/").toHttpUrl().newBuilder()
+            if (sort.isNotBlank()) builder.addQueryParameter("filter", sort)
+            return GET(builder.build(), headers)
         }
 
-        // Combined / default catalog under /anime/ with query params.
-        val path = if (page <= 1) "$baseUrl/anime/" else "$baseUrl/anime/page/$page/"
-        val builder = path.toHttpUrl().newBuilder()
-        if (sort.isNotBlank()) builder.addQueryParameter("sort", sort)
-        if (year.isNotBlank()) builder.addQueryParameter("release", year)
-        if (genre.isNotBlank()) builder.addQueryParameter("genre", genre)
-        return GET(builder.build(), headers)
+        return popularAnimeRequest(page)
     }
 
-    /**
-     * DooPlay parent parse uses latestUpdatesSelector for non-?s= URLs and
-     * mis-handles filter catalog pages. Always parse as catalog / search cards.
-     */
-    override fun searchAnimeParse(response: Response): AnimesPage {
-        val document = response.asJsoup()
-        val elements = document.select(catalogSelector()).ifEmpty {
-            document.select("div.result-item div.image a, .search-page .result-item article a")
-        }
-        val animes = elements.map { el ->
-            if (el.tagName() == "a") {
-                searchResultFromLink(el)
-            } else {
-                popularAnimeFromElement(el)
+    override fun searchAnimeParse(response: Response): AnimesPage = parseListing(response.asJsoup())
+
+    override fun searchAnimeSelector() = popularAnimeSelector()
+
+    override fun searchAnimeFromElement(element: Element): SAnime = popularAnimeFromElement(element)
+
+    private fun parseListing(document: Document): AnimesPage {
+        val animes = document.select(popularAnimeSelector())
+            .mapNotNull { el ->
+                val anime = popularAnimeFromElement(el)
+                val lowerUrl = anime.url.lowercase(Locale.ROOT)
+                if (anime.url.isBlank() || anime.title.isBlank()) return@mapNotNull null
+                if (NON_CONTENT_PATHS.any { it in lowerUrl }) return@mapNotNull null
+                anime
             }
-        }.distinctBy { it.url }
-        val hasNext = document.selectFirst(popularAnimeNextPageSelector()) != null
-        return AnimesPage(animes, hasNext)
+            .distinctBy { it.url }
+
+        val current = document.selectFirst("div.pagination a.current, div.pagination span.current")
+            ?.text()?.trim()?.toIntOrNull() ?: 1
+        val hasNextLink = document.selectFirst(popularAnimeNextPageSelector()) != null
+        val hasHigherPage = document.select("div.pagination a").any { a ->
+            (a.text().trim().toIntOrNull() ?: -1) > current
+        }
+        return AnimesPage(animes, (hasNextLink || hasHigherPage) && animes.isNotEmpty())
     }
 
-    override fun searchAnimeSelector() = catalogSelector() + ", div.result-item div.image a"
+    private suspend fun fetchAndMergePages(requests: List<Request>): AnimesPage = withContext(Dispatchers.IO) {
+        val pool = Executors.newFixedThreadPool(requests.size.coerceAtMost(MAX_PARALLEL_FILTERS))
+        try {
+            val futures = requests.map { req ->
+                pool.submit<AnimesPage?> {
+                    runCatching {
+                        client.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) return@use null
+                            parseListing(resp.asJsoup())
+                        }
+                    }.getOrNull()
+                }
+            }
+            val pages = futures.mapNotNull { runCatching { it.get(12, TimeUnit.SECONDS) }.getOrNull() }
+            mergePages(pages)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
 
-    override fun searchAnimeFromElement(element: Element): SAnime = if (element.tagName() == "a") searchResultFromLink(element) else popularAnimeFromElement(element)
-
-    private fun searchResultFromLink(element: Element): SAnime = SAnime.create().apply {
-        setUrlWithoutDomain(element.absUrl("href"))
-        val img = element.selectFirst("img")
-        title = element.parents().select(".title a, .title, .details .title a").firstOrNull()?.text()
-            ?: img?.attr("alt")
-            ?: element.attr("title").ifBlank { element.text() }
-        thumbnail_url = img?.getImageUrl()
+    private fun mergePages(pages: List<AnimesPage>): AnimesPage {
+        if (pages.isEmpty()) return AnimesPage(emptyList(), false)
+        val counts = LinkedHashMap<String, Int>()
+        val byUrl = LinkedHashMap<String, SAnime>()
+        for (page in pages) {
+            val seen = HashSet<String>()
+            for (item in page.animes) {
+                if (seen.add(item.url)) {
+                    counts[item.url] = (counts[item.url] ?: 0) + 1
+                    byUrl.putIfAbsent(item.url, item)
+                }
+            }
+        }
+        val merged = mutableListOf<SAnime>()
+        val added = HashSet<String>()
+        counts.entries.filter { it.value > 1 }.sortedByDescending { it.value }.forEach { (url, _) ->
+            byUrl[url]?.let {
+                merged += it
+                added += url
+            }
+        }
+        val maxLen = pages.maxOfOrNull { it.animes.size } ?: 0
+        for (i in 0 until maxLen) {
+            for (page in pages) {
+                val item = page.animes.getOrNull(i) ?: continue
+                if (added.add(item.url)) merged += item
+            }
+        }
+        return AnimesPage(merged, pages.any { it.hasNextPage })
     }
 
     // =========================== Anime Details ============================
-    override fun animeDetailsParse(document: Document): SAnime {
-        val doc = getRealAnimeDoc(document)
-        return SAnime.create().apply {
-            setUrlWithoutDomain(doc.location())
-            val sheader = doc.selectFirst("div.sheader")
-            val poster = sheader?.selectFirst("div.poster img")
-                ?: doc.selectFirst("div.poster img")
-            thumbnail_url = poster?.getImageUrl()
-            title = doc.selectFirst("div.wp-content > h1, div.data h1, h1")?.text()
-                ?.ifBlank { null }
-                ?: poster?.attr("alt").orEmpty()
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+        val fullUrl = toAbsoluteUrl(anime.url)
+        val html = fetchPageCached(fullUrl)
+        val doc = Jsoup.parse(html, fullUrl)
+        animeDetailsParse(doc)
+    }
 
-            genre = doc.select(
-                "div.sgeneros a, div.data a[href*='/genre/'], a[href*='?genre='], " +
-                    "div.wp-content a[href*='/genre/'], #info a[href*='genre']",
-            ).eachText().map { it.trim() }.filter { it.isNotBlank() }.distinct().joinToString()
+    override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
+        setUrlWithoutDomain(document.location())
+        title = document.selectFirst("h1.widget-title, h1.entry-title, h1")?.text()?.trim()
+            ?.ifBlank { null }
+            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim().orEmpty()
 
-            description = buildString {
-                val paras = doc.select("div.wp-content p, #info p, div#info .wp-content p")
-                    .map { it.text().trim() }
-                    .filter { it.length > 20 }
-                if (paras.isNotEmpty()) append(paras.first())
-                val year = sheader?.selectFirst("span.date, .extra span")?.text()
-                    ?: doc.selectFirst("span.year")?.text()
-                if (!year.isNullOrBlank()) {
-                    if (isNotEmpty()) append("\n\n")
-                    append("Year: ").append(year)
-                }
-            }.ifBlank { null }
+        thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
+            ?.takeIf { it.startsWith("http") }
+            ?: document.selectFirst("article.thumb-block img, .video-player img, img")?.extractThumbUrl()
 
-            status = SAnime.COMPLETED
-        }
+        genre = document.select(".tags-list a, a[rel=tag], a[href*='/tag/']")
+            .mapNotNull { it.text().trim().takeIf(String::isNotBlank) }
+            .distinct()
+            .joinToString()
+            .ifBlank { null }
+
+        description = document.selectFirst(".archive-description, .video-description, .entry-content p, meta[property=og:description]")
+            ?.let { el -> el.attr("content").ifBlank { el.text() }.trim() }
+            ?.ifBlank { null }
+
+        status = SAnime.COMPLETED
     }
 
     // ============================== Episodes ==============================
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
+        val fullUrl = toAbsoluteUrl(anime.url)
+        val html = fetchPageCached(fullUrl)
+        val doc = Jsoup.parse(html, fullUrl)
+        parseEpisodesFromDoc(doc, fullUrl)
+    }
 
-    /**
-     * Flat episodios list + any /episodes/ links (card UI). Prefer real episode
-     * URLs so videoListParse hits the player page, not the series shell.
-     */
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val doc = getRealAnimeDoc(response.asJsoup())
-        val byUrl = LinkedHashMap<String, SEpisode>()
+        val url = response.request.url.toString()
+        val html = response.body.string()
+        cachePage(url, html)
+        return parseEpisodesFromDoc(Jsoup.parse(html, url), url)
+    }
 
-        fun addEpisode(a: Element, fallbackIndex: Int) {
-            val href = a.absUrl("href").ifBlank { a.attr("href") }
-            if (href.isBlank() || href == doc.location()) return
-            val okPath = href.contains("/episodes/") || href.contains("/movies/") ||
-                a.selectFirst(".episodiotitle") != null
-            if (!okPath) return
-            val name = a.selectFirst(".episodiotitle")?.text()?.trim()
-                ?.ifBlank { null }
-                ?: a.attr("title").ifBlank { a.ownText() }.ifBlank {
-                    a.parent()?.selectFirst(".episodiotitle")?.text()
-                }.orEmpty().ifBlank { "الحلقة $fallbackIndex" }
-            val ep = SEpisode.create().apply {
-                setUrlWithoutDomain(href)
-                this.name = name
-                episode_number = EP_NUM.findAll(name).mapNotNull { it.groupValues[1].toFloatOrNull() }
-                    .lastOrNull() ?: fallbackIndex.toFloat()
-                date_upload = a.selectFirst(".episodate, .date")?.text()?.toDate()
-                    ?: a.parent()?.selectFirst(".episodate, .date")?.text()?.toDate()
-                    ?: 0L
-            }
-            byUrl.putIfAbsent(ep.url, ep)
-        }
-
-        var i = 1
-        doc.select("ul.episodios > li a[href], ul.episodios li a[href]").forEach { addEpisode(it, i++) }
-        i = 1
-        doc.select("#episodes a[href*='/episodes/'], .se-a a[href*='/episodes/'], a[href*='/episodes/']")
-            .forEach { addEpisode(it, i++) }
-
-        if (byUrl.isNotEmpty()) {
-            return byUrl.values.sortedByDescending { it.episode_number }
-        }
-
-        val episodesFromCategory = doc.select("article.thumb-block, article.post, div.thumb-block").mapNotNull { el ->
-            val a = el.selectFirst("a[href]") ?: return@mapNotNull null
-            val href = a.absUrl("href").ifBlank { a.attr("href") }
-            if (href.isBlank() || "/category/" in href) return@mapNotNull null
-            val title = a.attr("title").ifBlank { el.selectFirst(".cat-title, .entry-title, h2, h3")?.text().orEmpty() }
-            val epNum = Regex("""\b(\d+)\b""").findAll(title).lastOrNull()?.groupValues?.get(1)?.toFloatOrNull() ?: 1f
-            SEpisode.create().apply {
-                setUrlWithoutDomain(href)
-                name = title.ifBlank { "Episode $epNum" }
-                episode_number = epNum
-            }
-        }.distinctBy { it.url }
-
-        if (episodesFromCategory.isNotEmpty()) {
-            return episodesFromCategory.reversed()
-        }
-
-        val seasonList = doc.select(seasonListSelector)
-        if (seasonList.isNotEmpty()) {
-            return seasonList.flatMap(::getSeasonEpisodes).reversed()
-        }
-
-        // Single movie / episode page opened as "anime"
-        if (doc.selectFirst("video, video source, .responsive-player, iframe, ul#playeroptionsul, li.dooplay_player_option, iframe.metaframe") != null) {
-            return listOf(
+    private fun parseEpisodesFromDoc(doc: Document, pageUrl: String): List<SEpisode> {
+        // Category/Series page lists episodes as article.thumb-block cards.
+        if ("/category/" in pageUrl) {
+            val eps = doc.select("article.thumb-block, article.post, div.thumb-block").mapNotNull { el ->
+                val a = el.selectFirst("a[href]") ?: return@mapNotNull null
+                val href = a.absUrl("href").ifBlank { a.attr("href") }
+                if (href.isBlank() || "/category/" in href || href == pageUrl) return@mapNotNull null
+                val name = a.attr("title").ifBlank {
+                    el.selectFirst(".cat-title, .entry-header span, .entry-title, h2, h3")?.text().orEmpty()
+                }.trim()
+                val epNum = EP_NUM.findAll(name).lastOrNull()?.groupValues?.get(1)?.toFloatOrNull() ?: 1f
                 SEpisode.create().apply {
-                    setUrlWithoutDomain(doc.location())
-                    episode_number = 1F
-                    name = doc.selectFirst("h1.entry-title, h1")?.text() ?: episodeMovieText
-                },
-            )
+                    setUrlWithoutDomain(href)
+                    this.name = name.ifBlank { "الحلقة ${epNum.toInt()}" }
+                    episode_number = epNum
+                }
+            }.distinctBy { it.url }
+
+            if (eps.isNotEmpty()) {
+                return eps.sortedByDescending { it.episode_number }
+            }
         }
 
+        // Direct episode page (opened from Latest / Search / Tag).
         return listOf(
             SEpisode.create().apply {
-                setUrlWithoutDomain(doc.location())
+                setUrlWithoutDomain(pageUrl)
                 episode_number = 1F
-                name = episodeMovieText
+                name = doc.selectFirst("h1.entry-title, h1")?.text()?.trim()?.ifBlank { null } ?: episodeMovieText
             },
         )
     }
@@ -319,556 +351,302 @@ class ArabsHentai :
     }
 
     // ============================ Video Links =============================
-    override fun videoListParse(response: Response): List<Video> {
-        val document = response.asJsoup()
-        val pageUrl = document.location()
-        val html = document.html()
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+        val fullUrl = toAbsoluteUrl(episode.url)
+        val html = fetchPageCached(fullUrl)
+        parseVideosFromHtml(html, fullUrl).sort()
+    }
 
-        // Cloudflare challenge page — no player markup
+    override fun videoListParse(response: Response): List<Video> {
+        val url = response.request.url.toString()
+        val html = response.body.string()
+        cachePage(url, html)
+        return parseVideosFromHtml(html, url)
+    }
+
+    private fun parseVideosFromHtml(html: String, pageUrl: String): List<Video> {
         if (html.contains("Just a moment", ignoreCase = true) ||
             html.contains("Verifying you are human", ignoreCase = true) ||
             html.contains("cf-browser-verification", ignoreCase = true)
         ) {
-            throw Exception(
-                "Cloudflare blocked the episode page. Open WebView on this episode once, then retry play.",
-            )
+            throw IOException("Cloudflare blocked ArabsHentai. Open this episode in WebView once, then retry.")
         }
 
+        val document = Jsoup.parse(html, pageUrl)
         val videos = mutableListOf<Video>()
 
-        // 1) Direct HTML5 / CDN sources (highest reliability)
-        document.select(
-            "video source[src], video#wpst-video source, #player source, " +
-                ".responsive-player source, #dooplay_player_response source, source[src]",
-        ).forEach { source ->
-            val src = source.absUrl("src").ifBlank { source.attr("src") }.trim()
-                .replace("\\/", "/")
-            if (src.startsWith("http") && isMediaUrl(src)) {
-                val label = source.attr("label").ifBlank {
-                    QUALITY_IN_URL.find(src)?.value ?: "Player"
-                }
-                val tag = if (isBadProgressiveCdn(src)) "CDN fallback" else "Direct - $label"
-                videos += streamFromUrl(src, tag)
-            }
+        // 1) Working Dropbox direct MP4 links (raw=1 streams video/mp4 with 206 range support).
+        val dropboxLinks = linkedSetOf<String>()
+        document.select("a[href*=dropbox.com]").forEach { a ->
+            a.absUrl("href").ifBlank { a.attr("href") }
+                .takeIf { it.startsWith("http") }
+                ?.let(dropboxLinks::add)
         }
-        document.select("video[src]").forEach { v ->
-            val src = v.absUrl("src").ifBlank { v.attr("src") }.trim()
-            if (src.startsWith("http") && isMediaUrl(src) && !isBadProgressiveCdn(src)) {
-                videos += streamFromUrl(src, "Direct")
-            }
+        DROPBOX_MP4_REGEX.findAll(html).forEach { dropboxLinks += it.value.replace("&amp;", "&") }
+        dropboxLinks.forEach { rawDb ->
+            val directDb = toDropboxRawUrl(rawDb)
+            val quality = QUALITY_IN_URL.find(directDb)?.value?.let { "Dropbox - $it" } ?: "Dropbox - MP4"
+            val dbHeaders = headers.newBuilder()
+                .removeAll("Referer")
+                .set("Accept", "*/*")
+                .build()
+            videos += Video(directDb, quality, directDb, headers = dbHeaders)
         }
 
-        // Regex fallback for mp4/m3u8 in scripts / HTML
-        MP4_OR_M3U8.findAll(html).map { it.value.replace("\\/", "/").replace("&amp;", "&") }
+        // 2) Live direct HTML5 / script MP4 & M3U8 sources (skip dead x-tez.com hosts).
+        val directCandidates = linkedSetOf<String>()
+        document.select("video source[src], video[src], source[src]").forEach { el ->
+            val src = el.absUrl("src").ifBlank { el.attr("src") }.trim().replace("\\/", "/")
+            if (src.startsWith("http") && isPlayableMediaUrl(src)) directCandidates += src
+        }
+        MP4_OR_M3U8.findAll(html)
+            .map { it.value.replace("\\/", "/").replace("&amp;", "&") }
+            .filter { it.startsWith("http") && isPlayableMediaUrl(it) }
+            .forEach(directCandidates::add)
+
+        directCandidates.forEach { src ->
+            if ("dropbox.com" in src.lowercase(Locale.ROOT)) return@forEach
+            val q = if (".m3u8" in src.lowercase(Locale.ROOT)) "Direct - HLS" else (QUALITY_IN_URL.find(src)?.value?.let { "Direct - $it" } ?: "Direct - MP4")
+            videos += streamFromUrl(src, q, pageUrl)
+        }
+
+        // 3) Third-party iframes (if any), extracted in parallel with tight timeouts.
+        val iframes = document.select("iframe[src]")
+            .mapNotNull { it.absUrl("src").ifBlank { it.attr("src") }.trim().replace("&amp;", "&").takeIf(::isUsefulEmbed) }
             .distinct()
-            .filter { u ->
-                u.startsWith("http") &&
-                    !u.contains("wp-content/themes", ignoreCase = true) &&
-                    !u.contains("px.gif")
-            }
-            .forEach { u ->
-                if (isBadProgressiveCdn(u)) {
-                    videos += streamFromUrl(u, "CDN fallback")
-                } else {
-                    val q = if (u.contains(".m3u8", true)) "HLS" else (QUALITY_IN_URL.find(u)?.value ?: "MP4")
-                    videos += streamFromUrl(u, "Page - $q")
-                }
-            }
-
-        // 2) Iframes already on page (first DooPlay tab often preloaded)
-        val pageIframes = document.select(
-            "iframe.metaframe, iframe.rptss, .playex iframe, " +
-                "#dooplay_player_response iframe, #pframe iframe, iframe[src]",
-        ).mapNotNull { iframe ->
-            val src = iframe.absUrl("src").ifBlank { iframe.attr("src") }.trim()
-                .replace("&amp;", "&")
-            src.takeIf { isUsefulEmbed(it) }
-        }.distinct()
-        pageIframes.forEach { embed ->
-            videos += runCatching { runBlocking { extractFromEmbed(embed, "Embed") } }.getOrDefault(emptyList())
+        if (iframes.isNotEmpty()) {
+            videos += extractEmbedsInParallel(iframes)
         }
 
-        // 3) DooPlay ajax tabs
-        val players = document.select(
-            "ul#playeroptionsul li.dooplay_player_option, " +
-                "ul#playeroptionsul li[data-post], li.dooplay_player_option",
-        )
-        players.forEach { player ->
-            val name = player.selectFirst("span.title")?.text()?.trim()
-                ?: player.ownText().trim().ifBlank { "Server ${player.attr("data-nume")}" }
-            getPlayerUrl(player, pageUrl)?.let { embed ->
-                videos += runCatching { runBlocking { extractFromEmbed(embed, name) } }.getOrDefault(emptyList())
-            }
-        }
-
-        // 4) Download table /links/
-        val downloads = document.select(
-            "#download a[href*='/links/'], .links_table a[href*='/links/'], " +
-                "table a[href*='/links/'], a.nxx-download-ad-trigger[href], " +
-                ".box_links a[href*='/links/']",
-        ).mapNotNull { a ->
-            val href = a.absUrl("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val label = a.parent()?.selectFirst(".link-server-name, .server-name, .title")?.text()
-                ?: a.selectFirst(".link-server-name")?.text()
-                ?: a.attr("title").ifBlank { "Download" }
-            href to label.trim()
-        }.distinctBy { it.first }
-        downloads.forEach { (href, label) ->
-            val extracted = runCatching {
-                runBlocking {
-                    val finalUrl = resolveRedirect(href)
-                    if (finalUrl.isBlank() || (finalUrl == href && "/links/" in href)) {
-                        // Try parsing a link page if its redirect is protected or absent.
-                        extractFromLinkPage(href, label)
-                    } else {
-                        extractFromEmbed(finalUrl, label)
-                    }
-                }
-            }.getOrDefault(emptyList())
-            videos += extracted
-        }
-
-        var distinct = videos.distinctBy { it.url }
-
-        // sacdnssedge progressive MP4 has moov-at-end → ExoPlayer often jumps to last second.
-        val hosters = distinct.filterNot { isBadProgressiveCdn(it.url) }
-        if (hosters.isNotEmpty()) {
-            distinct = hosters
-        }
-
+        val distinct = videos.distinctBy { it.videoUrl ?: it.url }
         if (distinct.isEmpty()) {
-            throw Exception(
-                "No playable streams (empty player or Cloudflare). " +
-                    "Open WebView on this episode URL, wait for the page, then retry Start.",
-            )
+            throw IOException("لم يتم العثور على رابط تشغيل صالح لهذه الحلقة على ArabsHentai.")
         }
         return distinct
     }
 
-    /** Non-faststart CDN stubs that cause scrubber-at-end / unplayable streams. */
-    private fun isBadProgressiveCdn(url: String): Boolean {
-        val u = url.lowercase()
-        return "sacdnssedge" in u
-    }
-
-    override fun List<Video>.sort(): List<Video> {
-        val pref = preferences.getString(videoSortPrefKey, videoSortPrefDefault)!!
-        return sortedWith(
-            compareBy<Video> { hosterScore(it) }
-                .thenBy { !it.quality.contains(pref, ignoreCase = true) }
-                .thenByDescending { qualityRank(it.quality) },
-        )
-    }
-
-    /** Lower score = preferred (played first). */
-    private fun hosterScore(video: Video): Int {
-        val q = (video.quality + " " + video.url).lowercase()
-        return when {
-            "dood" in q || "streamhg" in q || "hgcloud" in q || "streamwish" in q -> 0
-            "mixdrop" in q || "mxdrop" in q -> 1
-            "m3u8" in q || "hls" in q -> 1
-            "streamtape" in q || "voe" in q || "uqload" in q -> 2
-            "upns" in q || "rubyvidhub" in q || "playmogo" in q -> 3
-            "embed" in q || "server" in q || "nxx" in q || "fast" in q -> 4
-            "direct" in q || "page" in q -> 8
-            isBadProgressiveCdn(video.url) || "cdn fallback" in q -> 9
-            else -> 5
-        }
-    }
-
-    private fun qualityRank(quality: String): Int = QUALITY_IN_URL.find(quality)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-
-    private fun isMediaUrl(url: String): Boolean = url.contains(".mp4", ignoreCase = true) ||
-        url.contains(".m3u8", ignoreCase = true) ||
-        url.contains("sacdnssedge", ignoreCase = true) ||
-        (url.contains("/video/", ignoreCase = true) && url.contains("http"))
-
-    private fun isUsefulEmbed(src: String): Boolean {
-        if (!src.startsWith("http") && !src.startsWith("//")) return false
-        val s = src.lowercase()
-        return "google" !in s && "exoclick" !in s && "animeapp.org" !in s &&
-            "doubleclick" !in s && "about:blank" !in s && s.length > 12
-    }
-
-    private fun getPlayerUrl(player: Element, pageUrl: String): String? {
-        val post = player.attr("data-post").ifBlank { return null }
-        val nume = player.attr("data-nume").ifBlank { return null }
-        val type = player.attr("data-type").ifBlank { "tv" }
-
-        val body = FormBody.Builder()
-            .add("action", "doo_player_ajax")
-            .add("post", post)
-            .add("nume", nume)
-            .add("type", type)
-            .build()
-
-        val postHeaders = headers.newBuilder()
-            .set("Accept", "*/*")
-            .set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-            .set("Origin", baseUrl)
-            .set("Referer", pageUrl)
-            .set("X-Requested-With", "XMLHttpRequest")
-            .build()
-
-        val raw = runCatching {
-            client.newCall(POST("$baseUrl/wp-admin/admin-ajax.php", postHeaders, body))
-                .execute().use { it.body.string() }
-        }.getOrNull().orEmpty()
-
-        if (raw.isBlank() || raw.contains("Just a moment", ignoreCase = true)) return null
-
-        // {"embed_url":"https:\/\/...","type":"mp4"} or empty
-        val embedMatch = EMBED_URL_JSON.find(raw)
-        val fromJson = embedMatch?.groupValues?.get(1)
-            ?.replace("\\/", "/")
-            ?.replace("\\u0026", "&")
-            ?.replace("\\\"", "\"")
-            ?.trim()
-            .orEmpty()
-        if (fromJson.startsWith("//")) return "https:$fromJson"
-        if (fromJson.startsWith("http")) return fromJson
-
-        val iframe = Regex("""src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            .find(raw)?.groupValues?.get(1)?.replace("&amp;", "&")
-        return when {
-            iframe == null -> null
-            iframe.startsWith("//") -> "https:$iframe"
-            iframe.startsWith("http") -> iframe
-            else -> null
-        }
-    }
-
-    private fun resolveRedirect(url: String): String {
-        val req = GET(
-            url,
-            headers.newBuilder()
-                .set("Referer", "$baseUrl/")
-                .build(),
-        )
-        return runCatching {
-            client.newCall(req).execute().use { resp ->
-                val final = resp.request.url.toString()
-                if (final != url && final.startsWith("http") && "/links/" !in final) {
-                    return@use final
+    private fun extractEmbedsInParallel(embeds: List<String>): List<Video> {
+        val pool = Executors.newFixedThreadPool(embeds.size.coerceAtMost(4))
+        val completion = ExecutorCompletionService<List<Video>>(pool)
+        val futures = mutableListOf<Future<List<Video>>>()
+        val collected = mutableListOf<Video>()
+        try {
+            embeds.forEach { embed ->
+                futures += completion.submit {
+                    runCatching { runBlocking { extractFromEmbed(embed, "Embed") } }.getOrDefault(emptyList())
                 }
-                val body = resp.body.string()
-                val doc = org.jsoup.Jsoup.parse(body, url)
-                doc.selectFirst("a[href^=http], a.button, .download-link a")?.absUrl("href")
-                    ?.takeIf { it.startsWith("http") && "/links/" !in it }
-                    ?: run {
-                        val m = Regex(
-                            """(?:location|window\.location|href)\s*=\s*['"](https?://[^'"]+)['"]""",
-                        ).find(body)
-                        m?.groupValues?.get(1)
+            }
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(MAX_EXTRACTION_WAIT_MS)
+            var softDeadline = deadline
+            var doneCount = 0
+            while (doneCount < futures.size) {
+                val rem = (if (collected.isNotEmpty()) softDeadline else deadline) - System.nanoTime()
+                if (rem <= 0L) break
+                val fut = completion.poll(rem, TimeUnit.NANOSECONDS) ?: break
+                doneCount++
+                val batch = runCatching { fut.get() }.getOrDefault(emptyList())
+                if (batch.isNotEmpty()) {
+                    val wasFirst = collected.isEmpty()
+                    collected += batch
+                    if (wasFirst) {
+                        softDeadline = minOf(deadline, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(EXTRA_WAIT_AFTER_FIRST_MS))
                     }
-                    ?: MP4_OR_M3U8.find(body)?.value
-                    ?: final
+                }
             }
-        }.getOrDefault(url)
-    }
-
-    private suspend fun extractFromLinkPage(url: String, label: String): List<Video> {
-        val resolved = resolveRedirect(url)
-        if (resolved != url && isUsefulEmbed(resolved)) {
-            return extractFromEmbed(resolved, label)
+        } finally {
+            futures.forEach { it.cancel(true) }
+            pool.shutdownNow()
         }
-        val doc = runCatching {
-            client.newCall(GET(url, headers.newBuilder().set("Referer", "$baseUrl/").build()))
-                .execute().asJsoup()
-        }.getOrNull() ?: return emptyList()
-        val out = mutableListOf<Video>()
-        doc.select("iframe[src], a[href*='http']").forEach { el ->
-            val u = when {
-                el.hasAttr("src") -> el.absUrl("src")
-                else -> el.absUrl("href")
-            }
-            if (isUsefulEmbed(u) && "/links/" !in u) {
-                out += extractFromEmbed(u, label)
-            }
-        }
-        MP4_OR_M3U8.findAll(doc.html()).map { it.value }.distinct().forEach {
-            out += streamFromUrl(it, label)
-        }
-        return out
+        return collected
     }
 
     private suspend fun extractFromEmbed(url: String, label: String): List<Video> {
         var clean = url.trim().replace("&amp;", "&").replace("\\/", "/")
         if (clean.startsWith("//")) clean = "https:$clean"
         if (!clean.startsWith("http")) return emptyList()
-        val lower = clean.lowercase()
-
+        val lower = clean.lowercase(Locale.ROOT)
         return when {
-            lower.contains("dood") || lower.contains("d0o0d") || lower.contains("ds2play") ||
-                lower.contains("ds2video") || lower.contains("doodstream") ->
+            "dood" in lower || "d0o0d" in lower || "ds2play" in lower || "playmogo" in lower ->
                 doodExtractor.videoFromUrl(clean, prefix = "$label - ")?.let(::listOf).orEmpty()
 
-            lower.contains("mixdrop") || lower.contains("mxdrop") ->
+            "mixdrop" in lower || "mxdrop" in lower ->
                 mixDropExtractor.videoFromUrl(clean, lang = label)
 
             STREAMWISH.any { it in lower } ->
                 streamWishExtractor.videosFromUrl(clean, label)
 
-            lower.contains("streamtape") || lower.contains("streamta.pe") ->
+            "streamtape" in lower || "streamta.pe" in lower ->
                 streamTapeExtractor.videoFromUrl(clean, quality = label)?.let(::listOf).orEmpty()
 
-            lower.contains("voe") || lower.contains("voe-unblock") ->
+            "voe" in lower ->
                 voeExtractor.videosFromUrl(clean)
 
-            lower.contains("uqload") ->
+            "uqload" in lower ->
                 uqloadExtractor.videosFromUrl(clean, "$label -")
 
-            lower.contains(".m3u8") || lower.contains(".mp4") ||
-                lower.contains("sacdnssedge") ->
-                streamFromUrl(clean, label)
+            ".m3u8" in lower || ".mp4" in lower ->
+                streamFromUrl(clean, label, "$baseUrl/")
 
-            lower.contains("upns") ->
-                extractUpns(clean, label)
-
-            lower.contains("rubyvidhub") || lower.contains("playmogo") ||
-                lower.contains("vidhub") ->
-                extractFromPlayerPage(clean, label)
-
-            else -> {
-                val uni = runCatching {
-                    universalExtractor.videosFromUrl(clean, headers, prefix = "$label - ")
-                }.getOrDefault(emptyList())
-                if (uni.isNotEmpty()) return uni
-                extractFromPlayerPage(clean, label)
-            }
+            else ->
+                runCatching { universalExtractor.videosFromUrl(clean, headers, prefix = "$label - ") }
+                    .getOrDefault(emptyList())
         }
     }
 
-    private suspend fun extractUpns(url: String, label: String): List<Video> {
-        val id = url.substringAfterLast('#').substringBefore('?').trim()
-        if (id.isBlank() || id.startsWith("http")) {
-            return extractFromPlayerPage(url, label)
-        }
-        val host = runCatching { url.toHttpUrl().host }.getOrNull()
-            ?: return extractFromPlayerPage(url, label)
-        val scheme = runCatching { url.toHttpUrl().scheme }.getOrDefault("https")
-        val api = "$scheme://$host/api/v1/video?id=$id"
-        val body = runCatching {
-            client.newCall(
-                GET(
-                    api,
-                    headers.newBuilder()
-                        .set("Referer", "$scheme://$host/")
-                        .set("Accept", "application/json,*/*")
-                        .set("Origin", "$scheme://$host")
-                        .build(),
-                ),
-            ).execute().use { it.body.string() }
-        }.getOrNull().orEmpty()
-
-        val found = mutableListOf<Video>()
-        if (body.contains("http") && ("m3u8" in body || "mp4" in body)) {
-            MP4_OR_M3U8.findAll(body).map { it.value.replace("\\/", "/") }.distinct().forEach {
-                found += streamFromUrl(it, "$label Upns")
-            }
-        }
-        if (found.isNotEmpty()) return found.distinctBy { it.url }
-        return extractFromPlayerPage(url, label)
+    private fun streamFromUrl(url: String, quality: String, referer: String): List<Video> {
+        val clean = url.trim().replace("\\/", "/").replace("&amp;", "&")
+        val vHeaders = headers.newBuilder()
+            .set("Referer", referer)
+            .set("Accept", "*/*")
+            .build()
+        return listOf(Video(clean, quality, clean, headers = vHeaders))
     }
 
-    private suspend fun extractFromPlayerPage(url: String, label: String): List<Video> {
-        val doc = runCatching {
-            client.newCall(
-                GET(
-                    url,
-                    headers.newBuilder()
-                        .set("Referer", "$baseUrl/")
-                        .build(),
-                ),
-            ).execute().asJsoup()
-        }.getOrNull() ?: return emptyList()
-
-        val nested = mutableListOf<Video>()
-        val body = doc.html()
-
-        doc.select("source[src], video[src], video source").forEach { el ->
-            val src = el.absUrl("src").ifBlank { el.attr("src") }
-            if (src.startsWith("http") && isMediaUrl(src)) {
-                nested += streamFromUrl(src, label)
-            }
-        }
-        MP4_OR_M3U8.findAll(body).map { it.value.replace("\\/", "/") }.distinct().forEach {
-            nested += streamFromUrl(it, "$label CDN")
-        }
-        // JWPlayer / Clappr style file:"..."
-        Regex("""["']file["']\s*:\s*["'](https?://[^"']+)["']""")
-            .findAll(body).map { it.groupValues[1] }.distinct().forEach {
-                nested += streamFromUrl(it, label)
-            }
-        Regex("""["']sources?["']\s*:\s*\[\s*\{\s*["']file["']\s*:\s*["'](https?://[^"']+)["']""")
-            .findAll(body).map { it.groupValues[1] }.distinct().forEach {
-                nested += streamFromUrl(it, label)
-            }
-
-        doc.select("iframe[src]").forEach { el ->
-            val src = el.absUrl("src").ifBlank { el.attr("src") }
-            if (isUsefulEmbed(src) && src != url && "upns" !in src.lowercase()) {
-                nested += extractFromEmbed(src, label)
-            }
-        }
-
-        // Last resort: hash-based players sometimes put stream in query
-        if (nested.isEmpty() && url.contains("#")) {
-            val hash = url.substringAfter("#")
-            if (hash.startsWith("http")) nested += streamFromUrl(hash, label)
-        }
-
-        return nested.distinctBy { it.url }
-    }
-
-    private fun streamFromUrl(url: String, quality: String): List<Video> {
-        val clean = url.replace("\\/", "/").replace("&amp;", "&").trim()
-        if (!clean.startsWith("http")) return emptyList()
-        val vHeaders = videoHeaders()
-        return when {
-            clean.contains(".m3u8", ignoreCase = true) -> {
-                runCatching {
-                    playlistUtils.extractFromHls(
-                        clean,
-                        referer = "$baseUrl/",
-                        videoNameGen = { q -> "$quality - $q" },
-                    )
-                }.getOrElse { listOf(Video(clean, quality, clean, headers = vHeaders)) }
-            }
-
-            else -> listOf(Video(clean, quality, clean, headers = vHeaders))
-        }
-    }
-
-    private fun videoHeaders() = headers.newBuilder()
-        .set(
-            "User-Agent",
-            headers["User-Agent"]
-                ?: "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    override fun List<Video>.sort(): List<Video> {
+        val pref = preferences.getString(videoSortPrefKey, videoSortPrefDefault)!!
+        return sortedWith(
+            compareBy<Video> { if (it.quality.contains("Dropbox", true)) 0 else 1 }
+                .thenBy { !it.quality.contains(pref, ignoreCase = true) }
+                .thenByDescending { QUALITY_IN_URL.find(it.quality)?.groupValues?.get(1)?.toIntOrNull() ?: 0 },
         )
-        .set("Referer", "$baseUrl/")
-        .set("Origin", baseUrl)
-        .set("Accept", "*/*")
-        .build()
+    }
 
     // ============================== Filters ===============================
-    // Search tab + empty query → filters apply. Popular tab ignores filters.
     override fun getFilterList() = AnimeFilterList(
-        AnimeFilter.Header("استخدم تبويب البحث (اترك المربع فارغاً) لتطبيق الفلاتر"),
-        AnimeFilter.Header("البحث النصي يتجاهل الفلاتر"),
+        AnimeFilter.Header("يمكنك اختيار أكثر من تصنيف في نفس الوقت"),
         BrowseFilter(),
         SortFilter(),
         YearFilter(),
-        GenreFilter(),
+        TagGroup(),
+        TagTextFilter(),
     )
 
     private class BrowseFilter :
         UriPartFilter(
-            "تصفح",
+            "القسم / Section",
             arrayOf(
-                Pair("أنميات /anime/", ""),
-                Pair("أحدث الحلقات /episodes/", "episodes"),
-                Pair("أفلام /movies/", "movies"),
+                Pair("قائمة الأنمي /anime/", "anime"),
+                Pair("أحدث الحلقات /", "latest"),
             ),
         )
 
     private class SortFilter :
         UriPartFilter(
-            "ترتيب (على /anime/)",
+            "الترتيب / Sort",
             arrayOf(
-                Pair("آخر ما تم نشره", ""),
-                Pair("أحدث الإصدارات", "release"),
-                Pair("A → Z", "az"),
+                Pair("الافتراضي", ""),
+                Pair("الأحدث", "latest"),
+                Pair("الأكثر شعبية", "popular"),
+                Pair("الأكثر مشاهدة", "most-viewed"),
+                Pair("الأطول", "longest"),
             ),
         )
 
     private class YearFilter :
         UriPartFilter(
-            "سنة الإصدار",
+            "السنة / Year",
             arrayOf(Pair("الكل", "")) +
                 (2026 downTo 2000).map { Pair(it.toString(), it.toString()) }.toTypedArray(),
         )
 
-    private class GenreFilter :
-        UriPartFilter(
-            "التصنيف",
-            arrayOf(
-                Pair("الكل", ""),
-                Pair("بدون حجب", "بدون-حجب"),
-                Pair("محارم", "محارم"),
-                Pair("حريم", "حريم"),
-                Pair("ميلف", "ميلف"),
-                Pair("معلمة", "معلمة"),
-                Pair("معلم", "معلم"),
-                Pair("طالبة مدرسة", "طالبة-مدرسة"),
-                Pair("اثداء كبيرة", "اثداء-كبيرة"),
-                Pair("اغتصاب", "اغتصاب"),
-                Pair("اغتصاب جماعي", "اغتصاب-جماعي"),
-                Pair("تحكم بالعقل", "تحكم-بالعقل"),
-                Pair("تحطم العقل", "تحطم-العقل"),
-                Pair("تنويم المغناطيسي", "تنويم-المغناطيسي"),
-                Pair("تصوير", "تصوير"),
-                Pair("تعابير منحرفة", "تعابير-منحرفة"),
-                Pair("جنس فموي", "جنس-فموي"),
-                Pair("جنس ثلاثي", "جنس-ثلاثي"),
-                Pair("جنس جماعي", "جنس-جماعي"),
-                Pair("جنس بالثدي", "جنس-بالثدي"),
-                Pair("جنس بالعام", "جنس-بالعام"),
-                Pair("خيانة", "خيانة"),
-                Pair("دياثة", "دياثة"),
-                Pair("يوري", "يوري"),
-                Pair("ياوي", "ياوي"),
-                Pair("فوتا", "فوتا"),
-                Pair("لولي", "لولي"),
-                Pair("شوتا", "شوتا"),
-                Pair("حمل", "حمل"),
-                Pair("عبودية", "عبودية"),
-                Pair("كوميدي", "كوميدي"),
-                Pair("رومانسي", "رومانسي"),
-                Pair("دراما", "دراما"),
-                Pair("فانتازيا", "فانتازيا"),
-                Pair("فانيلا", "فانيلا"),
-                Pair("هنتاي", "هنتاي"),
-                Pair("وحوش", "وحوش"),
-                Pair("مجسات", "مجسات"),
-                Pair("خادمات", "خادمات"),
-                Pair("ممرضة", "ممرضة"),
-                Pair("كوسبلاي", "كوسبلاي"),
-                Pair("فتاة قطة", "فتاة-قطة"),
-                Pair("إبتزاز", "إبتزاز"),
-                Pair("إذلال", "إذلال"),
-                Pair("إلف", "إلف"),
-                Pair("إيسيكاي", "إيسيكاي-isekai"),
-                Pair("اخ و أخت", "اخ-و-أخت"),
-                Pair("استمناء", "استمناء"),
-                Pair("التحكم بالأشخاص", "التحكم-بالأشخاص"),
-                Pair("العاب جنسية", "العاب-جنسية"),
-                Pair("الفتاة السحرية", "الفتاة-السحرية"),
-                Pair("بشرة سوداء", "بشرة-سوداء"),
-                Pair("تبادل الزوجات", "تبادل-الزوجات"),
-                Pair("تحرش في المواصلات", "تحرش-في-المواصلات"),
-                Pair("تسوندري", "تسوندري"),
-                Pair("خيال", "خيال"),
-                Pair("ربات البيوت", "ربات-البيوت"),
-                Pair("رعب", "رعب"),
-                Pair("رياضة", "رياضة"),
-                Pair("سيصدر قريباً", "سيصدر-قريباً"),
-                Pair("شريحة من الحياة", "شريحة-من-الحياة"),
-                Pair("شياطين", "شياطين"),
-                Pair("عاهرات", "عاهرات"),
-                Pair("عذرية", "عذرية"),
-                Pair("قوة خارقة", "قوة-خارقة"),
-                Pair("ملابس داخلية", "ملابس-داخلية"),
-                Pair("ملابس سباحة", "ملابس-سباحة"),
-                Pair("موظفات المكاتب", "موظفات-المكاتب"),
-                Pair("وغد قبيح", "وغد-قبيح"),
-                Pair("عنف و رطب حبال", "عنف-و-رطب-حبال"),
-            ),
+    private class TagCheckBox(name: String, val value: String) : AnimeFilter.CheckBox(name)
+
+    private class TagGroup :
+        AnimeFilter.Group<TagCheckBox>(
+            "التصنيفات / Tags (اختيار متعدد)",
+            LIVE_TAGS.map { (label, slug) -> TagCheckBox(label, slug) },
         )
 
+    private class TagTextFilter : AnimeFilter.Text("وسم إضافي (افصل بفاصلة ,)")
+
+    // ============================== Helpers ===============================
+    private fun tagUrl(slug: String, page: Int, sort: String): String {
+        val encoded = URLEncoder.encode(slug, Charsets.UTF_8.name()).replace("+", "%20")
+        val path = if (page <= 1) "$baseUrl/tag/$encoded/" else "$baseUrl/tag/$encoded/page/$page/"
+        return if (sort.isNotBlank()) {
+            path.toHttpUrl().newBuilder().addQueryParameter("filter", sort).build().toString()
+        } else {
+            path
+        }
+    }
+
+    private fun toAbsoluteUrl(url: String): String = when {
+        url.startsWith("http://") || url.startsWith("https://") -> url
+        url.startsWith("//") -> "https:$url"
+        else -> "$baseUrl/${url.trimStart('/')}"
+    }
+
+    private fun fetchPageCached(url: String): String {
+        val now = System.currentTimeMillis()
+        pageCache[url]?.let { (ts, body) ->
+            if (now - ts < PAGE_CACHE_TTL_MS) return body
+        }
+        val html = client.newCall(GET(url, headers)).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
+            resp.body.string()
+        }
+        cachePage(url, html)
+        return html
+    }
+
+    private fun cachePage(url: String, html: String) {
+        if (pageCache.size > 30) pageCache.clear()
+        pageCache[url] = System.currentTimeMillis() to html
+    }
+
+    private fun toDropboxRawUrl(url: String): String {
+        val http = url.toHttpUrlOrNull() ?: return url.replace("dl=1", "raw=1").replace("dl=0", "raw=1")
+        return http.newBuilder()
+            .removeAllQueryParameters("dl")
+            .setQueryParameter("raw", "1")
+            .build()
+            .toString()
+    }
+
+    private fun isPlayableMediaUrl(url: String): Boolean {
+        val lower = url.lowercase(Locale.ROOT)
+        if (DEAD_HOSTS.any { it in lower }) return false
+        if ("wp-content/themes" in lower || "px.gif" in lower) return false
+        return ".mp4" in lower || ".m3u8" in lower
+    }
+
+    private fun isUsefulEmbed(src: String): Boolean {
+        val http = src.toHttpUrlOrNull() ?: return false
+        val host = http.host.lowercase(Locale.ROOT)
+        if ('.' !in host) return false
+        return "google" !in host && "exoclick" !in host && "doubleclick" !in host &&
+            "twinrdengine" !in host && "arabshentai.net" !in host
+    }
+
+    private fun Element.extractThumbUrl(): String? {
+        val src = when {
+            hasAttr("data-src") -> attr("data-src")
+            hasAttr("data-lazy-src") -> attr("data-lazy-src")
+            hasAttr("data-original") -> attr("data-original")
+            else -> attr("src")
+        }.ifBlank { attr("src") }.trim()
+        if (src.isBlank() || src.startsWith("data:")) return null
+        return when {
+            src.startsWith("//") -> "https:$src"
+            src.startsWith("http://") || src.startsWith("https://") -> src
+            else -> absUrl("data-src").ifBlank { absUrl("src") }
+        }.takeIf { it.startsWith("http") }
+    }
+
     companion object {
-        private val EP_NUM = Regex("""(\d{1,4})""")
-        private val EMBED_URL_JSON = Regex(""""embed_url"\s*:\s*"([^"]*)"""")
+        private const val MAX_PARALLEL_FILTERS = 4
+        private const val MAX_EXTRACTION_WAIT_MS = 10_000L
+        private const val EXTRA_WAIT_AFTER_FIRST_MS = 1_500L
+        private const val PAGE_CACHE_TTL_MS = 3 * 60 * 1000L
+
+        private val DEAD_HOSTS = listOf("x-tez.com", "sacdnssedge")
+        private val NON_CONTENT_PATHS = listOf("/sample-page", "/privacy-policy", "/dmca", "/contact")
+
+        private val EP_NUM = Regex("""\b(\d{1,4})\b""")
+        private val DROPBOX_MP4_REGEX = Regex(
+            """https?://(?:www\.)?dropbox\.com/[^\s"'<>\\]+?\.mp4[^\s"'<>\\]*""",
+            RegexOption.IGNORE_CASE,
+        )
         private val MP4_OR_M3U8 = Regex(
             """https?://[^\s"'<>\\]+?\.(?:mp4|m3u8)[^\s"'<>\\]*""",
             RegexOption.IGNORE_CASE,
@@ -880,12 +658,51 @@ class ArabsHentai :
             "dwish", "playerwish", "streamhg", "hgcloud", "hglink", "vidhide",
             "streamhide", "filelions", "vidmoly", "smoothpre",
         )
-    }
-}
 
-open class UriPartFilter(
-    displayName: String,
-    val vals: Array<Pair<String, String>>,
-) : AnimeFilter.Select<String>(displayName, vals.map { it.first }.toTypedArray()) {
-    fun toUriPart() = vals[state].second
+        // Verified live tags from https://arabshentai.net/tag/
+        private val LIVE_TAGS = listOf(
+            "بدون حجب (Uncensored)" to "بدون-حجب",
+            "Uncensored" to "uncensored",
+            "سكس محرم" to "سكس-محرم",
+            "حريم" to "حريم",
+            "من طيز (Anal)" to "anal",
+            "جنس شرجي" to "جنس-شرجي",
+            "جماعي" to "جماعي",
+            "اغتصاب" to "اغتصاب",
+            "أم" to "أم",
+            "امي" to "امي",
+            "ام و ابنتها" to "ام-و-ابنتها",
+            "ام زوجتي" to "ام-زوجتي",
+            "اخت" to "اخت",
+            "اختي" to "اختي",
+            "اخوات" to "اخوات",
+            "أبنة" to "أبنة",
+            "بنت الاخ" to "بنت-الاخ",
+            "خيانة" to "خيانة",
+            "دياثة" to "دياثة",
+            "تحكم بلعقل" to "تحكم-بلعقل",
+            "تنويم مغناطيسي" to "تنويم-مغناطيسي",
+            "سيطرة" to "سيطرة",
+            "تعذيب" to "تعذيب",
+            "تعنيف" to "تعنيف",
+            "خادمة" to "خادمة",
+            "استاذ" to "استاذ",
+            "سينسي" to "سينسي",
+            "رومانسي" to "رومانسي",
+            "حب" to "حب",
+            "اول مرة" to "اول-مرة",
+            "أتشي" to "أتشي",
+            "تسوندري" to "تسوندري",
+            "سحاقيات" to "سحاقيات",
+            "يوري (Yuri)" to "yuri",
+            "ياوي (Yaoi)" to "yaoi",
+            "سوكوبوس" to "سوكوبوس",
+            "ساحرات" to "ساحرات",
+            "سحر" to "سحر",
+            "سكس شياطين" to "سكس-شياطين",
+            "اشباح" to "اشباح",
+            "انتقام" to "انتقام",
+            "سادي" to "سادي",
+        )
+    }
 }

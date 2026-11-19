@@ -10,16 +10,24 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.awaitSuccess
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.getPreferencesLazy
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class ArabXN :
     ParsedAnimeHttpSource(),
@@ -33,13 +41,17 @@ class ArabXN :
 
     override val supportsLatest = true
 
+    override val disableRelatedAnimes = true
+
+    override val disableRelatedAnimesBySearch = true
+
     private val preferences by getPreferencesLazy()
+    private val pageCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
 
     // ============================== Popular ===============================
-    // Catalog: /video/ (all videos). Page 2+ → /video/page/{n}
     override fun popularAnimeRequest(page: Int): Request {
         val url = if (page <= 1) "$baseUrl/video/" else "$baseUrl/video/page/$page"
         return GET(url, headers)
@@ -66,10 +78,14 @@ class ArabXN :
         thumbnail_url = element.selectFirst("img.video-card-poster, img")?.getImageUrl()
     }
 
-    override fun popularAnimeNextPageSelector(): String = "nav.catalog-pagination a[href], nav.pagination a[href], .catalog-pagination a[href], link[rel=next], div.pagination span.current-page ~ a[href], div.pagination .current ~ a[href], div.pagination a.next, a[rel=next]"
+    override fun popularAnimeNextPageSelector(): String = "nav.catalog-pagination span.is-current ~ a[href], " +
+        "nav.pagination span.is-current ~ a[href], .catalog-pagination .is-current ~ a[href], " +
+        "div.pagination span.current-page ~ a[href], div.pagination .current ~ a[href], " +
+        "a[rel=next], link[rel=next], div.pagination a.next"
 
-    override fun popularAnimeParse(response: Response): AnimesPage {
-        val document = response.asJsoup()
+    override fun popularAnimeParse(response: Response): AnimesPage = parseListing(response.asJsoup())
+
+    private fun parseListing(document: Document): AnimesPage {
         val animes = document.select(popularAnimeSelector())
             .map { popularAnimeFromElement(it) }
             .filter { it.url.contains("/watch-") && it.title.isNotBlank() }
@@ -79,7 +95,6 @@ class ArabXN :
     }
 
     // =============================== Latest ===============================
-    // Homepage مترجم feed: /  and /page/{n}
     override fun latestUpdatesRequest(page: Int): Request {
         val url = if (page <= 1) "$baseUrl/" else "$baseUrl/page/$page"
         return GET(url, headers)
@@ -91,48 +106,45 @@ class ArabXN :
 
     override fun latestUpdatesNextPageSelector(): String = popularAnimeNextPageSelector()
 
-    override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
+    override fun latestUpdatesParse(response: Response): AnimesPage = parseListing(response.asJsoup())
 
     // =============================== Search ===============================
-
-    /**
-     * Text search: /search/{query}  and /search/{query}/{page}
-     * Tag browse:  /tag/{slug}     and /tag/{slug}/page/{page}
-     * Channel:     /channel/{slug}/ and /channel/{slug}/page/{page}
-     * Pornstar:    /pornstar/{slug}
-     * Category:    path from filter (mixed /tag/… and section roots)
-     */
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val category = filters.firstInstanceOrNull<CategoryFilter>()?.selected.orEmpty()
-        val channel = filters.firstInstanceOrNull<ChannelFilter>()?.state?.trim().orEmpty()
-        val tag = filters.firstInstanceOrNull<TagFilter>()?.state?.trim().orEmpty()
-        val pornstar = filters.firstInstanceOrNull<PornstarFilter>()?.state?.trim().orEmpty()
-
-        val fullQuery = buildString {
-            append(query.trim())
-            if (channel.isNotBlank()) {
-                if (isNotEmpty()) append(" ")
-                append(channel)
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) {
+            val paths = collectFilterPaths(filters, page)
+            if (paths.size > 1) {
+                val requests = paths.take(MAX_PARALLEL_FILTERS).map { GET("$baseUrl$it", headers) }
+                return fetchAndMergePages(requests)
             }
-            if (pornstar.isNotBlank()) {
-                if (isNotEmpty()) append(" ")
-                append(pornstar)
-            }
-            if (tag.isNotBlank()) {
-                if (isNotEmpty()) append(" ")
-                append(tag)
-            }
-        }.trim()
-
-        val path = when {
-            fullQuery.isNotBlank() -> searchPath(fullQuery, page)
-            channel.isNotBlank() -> channelPath(channel, page)
-            pornstar.isNotBlank() -> pornstarPath(pornstar, page)
-            tag.isNotBlank() -> tagPath(tag, page)
-            category.isNotBlank() -> categoryPath(category, page)
-            else -> return popularAnimeRequest(page)
         }
-        return GET("$baseUrl$path", headers)
+        val response = client.newCall(searchAnimeRequest(page, query, filters)).awaitSuccess()
+        return searchAnimeParse(response)
+    }
+
+    private fun collectFilterPaths(filters: AnimeFilterList, page: Int): List<String> {
+        val selectedCats = filters.firstInstanceOrNull<CategoryGroup>()
+            ?.state?.filter { it.state }?.map { categoryPath(it.value, page) }.orEmpty()
+        val channels = splitMulti(filters.firstInstanceOrNull<ChannelFilter>()?.state)
+            .map { channelPath(it, page) }
+        val pornstars = splitMulti(filters.firstInstanceOrNull<PornstarFilter>()?.state)
+            .map { pornstarPath(it, page) }
+        val tags = splitMulti(filters.firstInstanceOrNull<TagFilter>()?.state)
+            .map { tagPath(it, page) }
+        return (channels + pornstars + tags + selectedCats).distinct()
+    }
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isNotBlank()) {
+            return GET("$baseUrl${searchPath(cleanQuery, page)}", headers)
+        }
+        val firstPath = collectFilterPaths(filters, page).firstOrNull()
+        return if (firstPath != null) {
+            GET("$baseUrl$firstPath", headers)
+        } else {
+            popularAnimeRequest(page)
+        }
     }
 
     override fun searchAnimeSelector(): String = popularAnimeSelector()
@@ -141,9 +153,15 @@ class ArabXN :
 
     override fun searchAnimeNextPageSelector(): String = popularAnimeNextPageSelector()
 
-    override fun searchAnimeParse(response: Response): AnimesPage = popularAnimeParse(response)
+    override fun searchAnimeParse(response: Response): AnimesPage = parseListing(response.asJsoup())
 
     // =========================== Anime Details ============================
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+        val fullUrl = toAbsoluteUrl(anime.url)
+        val html = fetchPageCached(fullUrl)
+        animeDetailsParse(Jsoup.parse(html, fullUrl))
+    }
+
     override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
         title = document.selectFirst("div.video-details h1, h1")?.text()?.trim()
             ?.ifBlank { null }
@@ -184,15 +202,35 @@ class ArabXN :
     }
 
     // ============================== Episodes ==============================
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
+        val fullUrl = toAbsoluteUrl(anime.url)
+        val html = fetchPageCached(fullUrl)
+        val doc = Jsoup.parse(html, fullUrl)
+        val dateUpload = parseReleaseDate(
+            doc.selectFirst("meta[property=og:video:release_date]")?.attr("content"),
+        )
+        listOf(
+            SEpisode.create().apply {
+                name = "Video"
+                setUrlWithoutDomain(fullUrl)
+                episode_number = 1f
+                date_upload = dateUpload
+            },
+        )
+    }
+
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val document = response.asJsoup()
+        val url = response.request.url.toString()
+        val html = response.body.string()
+        cachePage(url, html)
+        val document = Jsoup.parse(html, url)
         val dateUpload = parseReleaseDate(
             document.selectFirst("meta[property=og:video:release_date]")?.attr("content"),
         )
         return listOf(
             SEpisode.create().apply {
                 name = "Video"
-                setUrlWithoutDomain(response.request.url.toString())
+                setUrlWithoutDomain(url)
                 episode_number = 1f
                 date_upload = dateUpload
             },
@@ -204,16 +242,21 @@ class ArabXN :
     override fun episodeFromElement(element: Element) = throw UnsupportedOperationException()
 
     // ============================ Video Links =============================
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+        val fullUrl = toAbsoluteUrl(episode.url)
+        val html = fetchPageCached(fullUrl)
+        parseVideosFromHtml(html, fullUrl).sort()
+    }
 
-    /**
-     * Player embeds multi-quality MP4 on arabxn.xyz:
-     *   <source src="…/240p/….mp4" title="240p">
-     *   <source src="…/360p/….mp4" title="360p">
-     *   <source src="….mp4" title="HD 720p">  (full quality, no quality folder)
-     */
     override fun videoListParse(response: Response): List<Video> {
-        val document = response.asJsoup()
-        val pageUrl = response.request.url.toString()
+        val url = response.request.url.toString()
+        val html = response.body.string()
+        cachePage(url, html)
+        return parseVideosFromHtml(html, url)
+    }
+
+    private fun parseVideosFromHtml(html: String, pageUrl: String): List<Video> {
+        val document = Jsoup.parse(html, pageUrl)
         val videoHeaders = headersBuilder()
             .set("Referer", pageUrl)
             .build()
@@ -229,14 +272,10 @@ class ArabXN :
 
         if (fromSources.isNotEmpty()) return fromSources
 
-        // Fallback: scan page HTML for arabxn.xyz MP4 URLs
-        val html = document.html()
         return MP4_URL_REGEX.findAll(html)
             .map { it.value }
             .distinct()
-            .map { url ->
-                Video(url, qualityFromUrl(url), url, headers = videoHeaders)
-            }
+            .map { url -> Video(url, qualityFromUrl(url), url, headers = videoHeaders) }
             .toList()
     }
 
@@ -256,29 +295,26 @@ class ArabXN :
 
     // =============================== Filters ==============================
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("اترك البحث فارغاً واستخدم الفلاتر"),
-        AnimeFilter.Header("الأولوية: نص البحث → قناة → ممثل → تاج → تصنيف"),
-        AnimeFilter.Separator(),
-        CategoryFilter(),
+        AnimeFilter.Header("يمكنك اختيار أكثر من تصنيف أو كتابة أكثر من ممثل/تاج بفواصل (,)"),
+        CategoryGroup(),
         ChannelFilter(),
         TagFilter(),
         PornstarFilter(),
     )
 
-    private open class UriSelectFilter(
-        name: String,
-        private val pairs: Array<Pair<String, String>>,
-    ) : AnimeFilter.Select<String>(name, pairs.map { it.first }.toTypedArray()) {
-        val selected: String get() = pairs[state].second
-    }
+    private class CategoryCheckBox(name: String, val value: String) : AnimeFilter.CheckBox(name)
 
-    private class CategoryFilter : UriSelectFilter("التصنيف / Category", CATEGORIES)
+    private class CategoryGroup :
+        AnimeFilter.Group<CategoryCheckBox>(
+            "التصنيفات / Categories (اختيار متعدد)",
+            CATEGORIES.map { (label, path) -> CategoryCheckBox(label, path) },
+        )
 
-    private class ChannelFilter : AnimeFilter.Text("قناة / Channel (slug, e.g. brazzers)")
+    private class ChannelFilter : AnimeFilter.Text("قناة / Channel (e.g. brazzers, bangbros)")
 
     private class TagFilter : AnimeFilter.Text("تاج / Tag (e.g. milf, سكس-مترجم)")
 
-    private class PornstarFilter : AnimeFilter.Text("ممثل / Pornstar (slug, e.g. abi-james)")
+    private class PornstarFilter : AnimeFilter.Text("ممثل / Pornstar (e.g. angela-white, mia-khalifa)")
 
     // ============================= Preferences ============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -293,13 +329,69 @@ class ArabXN :
     }
 
     // =============================== Helpers ==============================
+    private suspend fun fetchAndMergePages(requests: List<Request>): AnimesPage = withContext(Dispatchers.IO) {
+        val pool = Executors.newFixedThreadPool(requests.size.coerceAtMost(MAX_PARALLEL_FILTERS))
+        try {
+            val futures = requests.map { req ->
+                pool.submit<AnimesPage?> {
+                    runCatching {
+                        client.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) return@use null
+                            parseListing(resp.asJsoup())
+                        }
+                    }.getOrNull()
+                }
+            }
+            val pages = futures.mapNotNull { runCatching { it.get(12, TimeUnit.SECONDS) }.getOrNull() }
+            mergePages(pages)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    private fun mergePages(pages: List<AnimesPage>): AnimesPage {
+        if (pages.isEmpty()) return AnimesPage(emptyList(), false)
+        val counts = LinkedHashMap<String, Int>()
+        val byUrl = LinkedHashMap<String, SAnime>()
+        for (page in pages) {
+            val seen = HashSet<String>()
+            for (item in page.animes) {
+                if (seen.add(item.url)) {
+                    counts[item.url] = (counts[item.url] ?: 0) + 1
+                    byUrl.putIfAbsent(item.url, item)
+                }
+            }
+        }
+        val merged = mutableListOf<SAnime>()
+        val added = HashSet<String>()
+        counts.entries.filter { it.value > 1 }.sortedByDescending { it.value }.forEach { (url, _) ->
+            byUrl[url]?.let {
+                merged += it
+                added += url
+            }
+        }
+        val maxLen = pages.maxOfOrNull { it.animes.size } ?: 0
+        for (i in 0 until maxLen) {
+            for (page in pages) {
+                val item = page.animes.getOrNull(i) ?: continue
+                if (added.add(item.url)) merged += item
+            }
+        }
+        return AnimesPage(merged, pages.any { it.hasNextPage })
+    }
+
+    private fun splitMulti(raw: String?): List<String> = raw.orEmpty()
+        .split(',', '،')
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+
     private fun searchPath(query: String, page: Int): String {
         val slug = encodePathSegment(query)
         return if (page <= 1) "/search/$slug" else "/search/$slug/$page"
     }
 
     private fun tagPath(raw: String, page: Int): String {
-        val slug = normalizeSlug(raw)
+        val slug = normalizeSlug(raw.removePrefix("tag/").removePrefix("/"))
         return if (page <= 1) "/tag/$slug" else "/tag/$slug/page/$page"
     }
 
@@ -310,38 +402,17 @@ class ArabXN :
 
     private fun pornstarPath(raw: String, page: Int): String {
         val slug = normalizeSlug(raw.removePrefix("pornstar/").removePrefix("/"))
-        // Site pornstar pages rarely paginate; keep single path
         return if (page <= 1) "/pornstar/$slug" else "/pornstar/$slug/page/$page"
     }
 
-    /**
-     * Category values are full path suffixes without host, e.g. `/video/`, `/سكس-عربي/`, `/tag/سكس-مصري`.
-     * Pagination: homepage → `/page/N`; tags → `…/page/N`; section roots → `…/N`.
-     */
     private fun categoryPath(path: String, page: Int): String {
         val clean = path.trim().let { if (it.startsWith("/")) it else "/$it" }.trimEnd('/')
-        // Homepage "/"
-        if (clean.isEmpty()) {
-            return if (page <= 1) "/" else "/page/$page"
-        }
-        if (page <= 1) {
-            // Keep trailing slash for section roots (site uses both; trailing is safer)
-            return if (clean.startsWith("/tag/")) clean else "$clean/"
-        }
-        // tag paths use /page/N
-        if (clean.startsWith("/tag/")) {
-            return "$clean/page/$page"
-        }
-        // video catalog uses /video/page/{n} (/video/{n} renders an empty list)
-        if (clean == "/video") {
-            return "/video/page/$page"
-        }
-        // section roots like /سكس-عربي or /xnxx use /{n}
-        return "$clean/$page"
+        if (clean.isEmpty()) return if (page <= 1) "/" else "/page/$page"
+        if (page <= 1) return if (clean.startsWith("/tag/")) clean else "$clean/"
+        return "$clean/page/$page"
     }
 
     private fun encodePathSegment(raw: String): String {
-        // Keep Arabic + alnum; spaces → -, encode the rest for path safety
         val cleaned = raw.trim().replace(Regex("""\s+"""), "-")
         return URLEncoder.encode(cleaned, Charsets.UTF_8.name())
             .replace("+", "%20")
@@ -362,17 +433,37 @@ class ArabXN :
             "/480p/" in lower -> "480p"
             "/720p/" in lower -> "720p"
             "/1080p/" in lower -> "1080p"
-            else -> "Full HD"
+            else -> "720p HD"
         }
     }
 
     private fun parseReleaseDate(raw: String?): Long {
         if (raw.isNullOrBlank()) return 0L
-        return try {
-            DATE_FORMAT.parse(raw.trim())?.time ?: 0L
-        } catch (_: Exception) {
-            0L
+        return runCatching { DATE_FORMAT.parse(raw.trim())?.time ?: 0L }.getOrDefault(0L)
+    }
+
+    private fun toAbsoluteUrl(url: String): String = when {
+        url.startsWith("http://") || url.startsWith("https://") -> url
+        url.startsWith("//") -> "https:$url"
+        else -> "$baseUrl/${url.trimStart('/')}"
+    }
+
+    private fun fetchPageCached(url: String): String {
+        val now = System.currentTimeMillis()
+        pageCache[url]?.let { (ts, body) ->
+            if (now - ts < PAGE_CACHE_TTL_MS) return body
         }
+        val html = client.newCall(GET(url, headers)).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
+            resp.body.string()
+        }
+        cachePage(url, html)
+        return html
+    }
+
+    private fun cachePage(url: String, html: String) {
+        if (pageCache.size > 30) pageCache.clear()
+        pageCache[url] = System.currentTimeMillis() to html
     }
 
     private inline fun <reified T> AnimeFilterList.firstInstanceOrNull(): T? = firstOrNull { it is T } as? T
@@ -388,12 +479,10 @@ class ArabXN :
         }.ifBlank { attr("src") }.trim()
 
         if (src.isBlank() || src.startsWith("data:")) return null
-        val resolved = if (src.startsWith("//")) {
-            "https:$src"
-        } else if (src.startsWith("http://") || src.startsWith("https://")) {
-            src
-        } else {
-            absUrl("data-original").ifBlank { absUrl("data-src").ifBlank { absUrl("src") } }
+        val resolved = when {
+            src.startsWith("//") -> "https:$src"
+            src.startsWith("http://") || src.startsWith("https://") -> src
+            else -> absUrl("data-original").ifBlank { absUrl("data-src").ifBlank { absUrl("src") } }
         }
         return resolved.takeIf { it.isNotBlank() && !it.startsWith("data:") }
     }
@@ -408,31 +497,35 @@ class ArabXN :
     }
 
     companion object {
+        private const val MAX_PARALLEL_FILTERS = 4
+        private const val PAGE_CACHE_TTL_MS = 3 * 60 * 1000L
+
         private val QUALITY_REGEX = Regex("""(\d{3,4})""")
         private val MP4_URL_REGEX = Regex(
-            """https?://(?:arabxn\.xyz|www\.arabxn\.com)[^"'<\s]+\.mp4""",
+            """https?://(?:video\.arabxn\.com|arabxn\.xyz|www\.arabxn\.com)[^"'<\s]+\.mp4""",
             RegexOption.IGNORE_CASE,
         )
         private val DATE_FORMAT = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_TITLE = "الجودة المفضلة / Preferred quality"
-        private val PREF_QUALITY_ENTRIES = listOf("720", "360", "240", "Full", "HD")
+        private val PREF_QUALITY_ENTRIES = listOf("720", "360", "240", "HD")
         private const val PREF_QUALITY_DEFAULT = "720"
 
-        // From site nav + /التصنيفات/
-        private val CATEGORIES = arrayOf(
-            "أي / Any" to "",
-            "كل الفيديوهات / All videos" to "/video/",
-            "سكس مترجم (الرئيسية)" to "/",
-            "سكس" to "/السكس",
-            "سكس عربي" to "/سكس-عربي/",
-            "سكس اخوات" to "/سكس-اخوات/",
-            "سكس أمهات" to "/سكس-امهات/",
-            "سكس محارم" to "/سكس-محارم/",
-            "سكس مصري" to "/tag/سكس-مصري",
+        // Verified canonical live paths on arabxn.com
+        private val CATEGORIES = listOf(
+            "كل الفيديوهات / All videos" to "/video",
+            "سكس مترجم" to "/category/سكس-مترجم",
+            "سكس عربي" to "/category/سكس-عربي",
+            "سكس مصري" to "/category/سكس-مصري",
+            "سكس امهات" to "/category/سكس-امهات",
+            "سكس اخوات" to "/category/سكس-اخوات",
+            "سكس محارم" to "/category/سكس-محارم",
+            "السكس" to "/category/السكس",
+            "xnxx" to "/category/xnxx",
+            "سكس جماعي مترجم" to "/tag/سكس-جماعي-مترجم",
+            "نودز مصري" to "/tag/نودز-مصري",
             "سكس طيز" to "/tag/سكس-طيز",
-            "xnxx" to "/xnxx/",
         )
     }
 }

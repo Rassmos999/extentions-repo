@@ -1,14 +1,16 @@
 ext {
     extName = 'SexMahali'
     extClass = '.SexMahali'
-    extVersionCode = 17
-    overrideVersionCode = 16
+    extVersionCode = 18
+    overrideVersionCode = 17
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
+    implementation(project(':lib:doodextractor'))
+    implementation(project(':lib:m3u8server'))
     implementation(project(':lib:playlistutils'))
     implementation(project(':lib:voeextractor'))
     implementation(project(':lib:streamtapeextractor'))
