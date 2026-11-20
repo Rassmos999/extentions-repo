@@ -16,6 +16,7 @@ import keiyoushi.utils.addListPreference
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
@@ -257,8 +258,10 @@ class ArabXN :
 
     private fun parseVideosFromHtml(html: String, pageUrl: String): List<Video> {
         val document = Jsoup.parse(html, pageUrl)
+        // Always use ASCII-safe Referer; raw Arabic in OkHttp Headers throws IllegalArgumentException.
+        val safeRef = pageUrl.toHttpUrlOrNull()?.toString() ?: "$baseUrl/"
         val videoHeaders = headersBuilder()
-            .set("Referer", pageUrl)
+            .set("Referer", safeRef)
             .build()
 
         val fromSources = document.select("video#my-video source[src], video source[src]")
@@ -442,10 +445,13 @@ class ArabXN :
         return runCatching { DATE_FORMAT.parse(raw.trim())?.time ?: 0L }.getOrDefault(0L)
     }
 
-    private fun toAbsoluteUrl(url: String): String = when {
-        url.startsWith("http://") || url.startsWith("https://") -> url
-        url.startsWith("//") -> "https:$url"
-        else -> "$baseUrl/${url.trimStart('/')}"
+    private fun toAbsoluteUrl(url: String): String {
+        val raw = when {
+            url.startsWith("http://") || url.startsWith("https://") -> url
+            url.startsWith("//") -> "https:$url"
+            else -> "$baseUrl/${url.trimStart('/')}"
+        }
+        return raw.toHttpUrlOrNull()?.toString() ?: raw
     }
 
     private fun fetchPageCached(url: String): String {

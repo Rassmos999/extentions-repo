@@ -517,7 +517,7 @@ class SexMahali :
 
         val mp4 = MP4_REGEX.find(combined)?.value ?: return emptyList()
         val videoHeaders = headers.newBuilder()
-            .set("Referer", finalUrl)
+            .set("Referer", safeReferer(finalUrl))
             .build()
         return listOf(Video(mp4, "$label - MP4", mp4, headers = videoHeaders))
     }
@@ -534,7 +534,7 @@ class SexMahali :
         verifyToken: String? = null,
     ): List<Video> {
         val streamHeaders = headers.newBuilder()
-            .set("Referer", referer)
+            .set("Referer", safeReferer(referer))
             .apply { if (!origin.isNullOrBlank()) set("Origin", origin) }
             .set("Accept", "*/*")
             .build()
@@ -761,10 +761,18 @@ class SexMahali :
         return AnimesPage(merged, pages.any { it.hasNextPage })
     }
 
-    private fun toAbsoluteUrl(url: String): String = when {
-        url.startsWith("http://") || url.startsWith("https://") -> url
-        url.startsWith("//") -> "https:$url"
-        else -> "$baseUrl/${url.trimStart('/')}"
+    private fun safeReferer(url: String): String = url.toHttpUrlOrNull()?.toString()
+        ?.takeIf { it.all { ch -> ch.code in 0x20..0x7E } }
+        ?: "$baseUrl/"
+
+    private fun toAbsoluteUrl(url: String): String {
+        val raw = when {
+            url.startsWith("http://") || url.startsWith("https://") -> url
+            url.startsWith("//") -> "https:$url"
+            else -> "$baseUrl/${url.trimStart('/')}"
+        }
+        val normalized = if ('?' !in raw && !raw.endsWith("/")) "$raw/" else raw
+        return normalized.toHttpUrlOrNull()?.toString() ?: normalized
     }
 
     private fun fetchPageCached(url: String): String {

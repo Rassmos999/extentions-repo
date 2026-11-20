@@ -241,13 +241,14 @@ class SexAlArab :
     override fun episodeListRequest(anime: SAnime): Request = GET(cleanUrl(anime.url), headers)
 
     private fun cleanUrl(url: String): String {
-        val clean = url.trim()
+        val clean = url.trim().replaceFirst("http://sexalarab.com", "https://sexalarab.com")
         if (clean.startsWith("http://") || clean.startsWith("https://")) {
-            return clean.replaceFirst("http://sexalarab.com", "https://sexalarab.com")
+            return if ('?' !in clean && !clean.endsWith("/")) "$clean/" else clean
         }
-        val raw = "$baseUrl/$clean"
-        val path = raw.removePrefix(baseUrl).trim('/')
-        if (path.isEmpty()) return baseUrl
+        val withoutQuery = clean.substringBefore('?')
+        val query = clean.substringAfter('?', "")
+        val path = withoutQuery.removePrefix(baseUrl).trim('/')
+        if (path.isEmpty()) return "$baseUrl/"
         val builder = baseUrl.toHttpUrl().newBuilder()
         path.split('/').filter { it.isNotEmpty() }.forEach { segment ->
             if (segment.contains("%")) {
@@ -255,6 +256,11 @@ class SexAlArab :
             } else {
                 builder.addPathSegment(segment)
             }
+        }
+        // Preserve trailing slash so sexalarab.com does NOT 301-redirect to cleartext http://!
+        builder.addPathSegment("")
+        if (query.isNotEmpty()) {
+            builder.encodedQuery(query)
         }
         return builder.build().toString()
     }

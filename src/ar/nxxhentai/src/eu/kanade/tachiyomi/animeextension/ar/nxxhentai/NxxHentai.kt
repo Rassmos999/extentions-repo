@@ -24,6 +24,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -592,13 +593,14 @@ class NxxHentai :
         val post = player.attr("data-post").ifBlank { return null }
         val nume = player.attr("data-nume").ifBlank { return null }
         val type = player.attr("data-type").ifBlank { "tv" }
+        val safeRef = safeReferer(pageUrl)
 
         // Prefer lightweight REST v2 GET first, fall back to admin-ajax POST.
         val restRaw = runCatching {
             fastExtractorClient.newCall(
                 GET(
                     "$baseUrl/wp-json/dooplayer/v2/$post/$type/$nume",
-                    headers.newBuilder().set("Referer", pageUrl).set("Accept", "application/json,*/*").build(),
+                    headers.newBuilder().set("Referer", safeRef).set("Accept", "application/json,*/*").build(),
                 ),
             ).execute().use { if (it.isSuccessful) it.body.string() else "" }
         }.getOrDefault("")
@@ -615,7 +617,7 @@ class NxxHentai :
             .set("Accept", "*/*")
             .set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
             .set("Origin", baseUrl)
-            .set("Referer", pageUrl)
+            .set("Referer", safeRef)
             .set("X-Requested-With", "XMLHttpRequest")
             .build()
 
@@ -877,10 +879,18 @@ class NxxHentai :
         return builder.build()
     }
 
-    private fun toAbsoluteUrl(url: String): String = when {
-        url.startsWith("http://") || url.startsWith("https://") -> url
-        url.startsWith("//") -> "https:$url"
-        else -> "$baseUrl/${url.trimStart('/')}"
+    private fun safeReferer(url: String): String = url.toHttpUrlOrNull()?.toString()
+        ?.takeIf { it.all { ch -> ch.code in 0x20..0x7E } }
+        ?: "$baseUrl/"
+
+    private fun toAbsoluteUrl(url: String): String {
+        val raw = when {
+            url.startsWith("http://") || url.startsWith("https://") -> url
+            url.startsWith("//") -> "https:$url"
+            else -> "$baseUrl/${url.trimStart('/')}"
+        }
+        val normalized = if ('?' !in raw && !raw.endsWith("/")) "$raw/" else raw
+        return normalized.toHttpUrlOrNull()?.toString() ?: normalized
     }
 
     private fun fetchPageCached(url: String): String {

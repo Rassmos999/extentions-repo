@@ -33,6 +33,7 @@ import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 class ArabX :
     ParsedAnimeHttpSource(),
@@ -250,9 +251,14 @@ class ArabX :
     override fun episodeListRequest(anime: SAnime): Request = GET(cleanUrl(anime.url), headers)
 
     private fun cleanUrl(url: String): String {
-        val full = if (url.startsWith("http")) url else "$baseUrl$url"
-        return runCatching { full.toHttpUrl().toString() }.getOrDefault(full)
+        val raw = url.trim().let { if (it.startsWith("http://") || it.startsWith("https://")) it else "$baseUrl/${it.trimStart('/')}" }
+        val normalized = if ('?' !in raw && !raw.endsWith("/")) "$raw/" else raw
+        return normalized.toHttpUrlOrNull()?.toString() ?: normalized
     }
+
+    private fun safeReferer(url: String): String = url.toHttpUrlOrNull()?.toString()
+        ?.takeIf { it.all { ch -> ch.code in 0x20..0x7E } }
+        ?: "$baseUrl/"
 
     // ============================== Episodes ==============================
 
@@ -298,12 +304,17 @@ class ArabX :
 
     private fun parseVideosFromHtml(pageHtml: String, pageUrl: String): List<Video> {
         val document = Jsoup.parse(pageHtml, pageUrl)
+        val videos = mutableListOf<Video>()
+
+        // 1) Self-hosted KVS flashvars directly on the watch page (e.g. arabx.cam/get_file/...).
+        videos += extractKvsFlashvars(pageHtml, pageUrl)
+
+        // 2) External / embedded iframes (playeriz.com, /embed/{id}, etc.)
         val iframeSrcs = document.select("div.player iframe[src], div.embed-wrap iframe[src], iframe[src]")
             .map { it.attr("abs:src").ifBlank { it.attr("src") } }
             .filter { it.startsWith("http") && !it.contains("google") && !it.contains("exoclick") }
             .distinct()
 
-        val videos = mutableListOf<Video>()
         if (iframeSrcs.isNotEmpty()) {
             videos += extractHostersInParallel(iframeSrcs, pageUrl)
         }
@@ -348,7 +359,7 @@ class ArabX :
     }
 
     private fun videosFromHoster(embedUrl: String, pageUrl: String): List<Video> {
-        val embedHeaders = headersBuilder().set("Referer", pageUrl).build()
+        val embedHeaders = headersBuilder().set("Referer", safeReferer(pageUrl)).build()
         val (finalUrl, html) = runCatching {
             fastExtractorClient.newCall(GET(embedUrl, embedHeaders)).execute().use { resp ->
                 resp.request.url.toString() to resp.body.string()
@@ -356,6 +367,10 @@ class ArabX :
         }.getOrNull() ?: return emptyList()
 
         if (html.isBlank()) return emptyList()
+
+        // Self-hosted KVS /embed/{id} player (video_url / video_alt_url / get_file)
+        val kvsStreams = extractKvsFlashvars(html, finalUrl)
+        if (kvsStreams.isNotEmpty()) return kvsStreams
 
         val unpacked = JsUnpacker.unpackAndCombine(html).orEmpty().ifBlank {
             documentScripts(html)
@@ -376,20 +391,126 @@ class ArabX :
     }
 
     private fun videosFromHosterWithoutNesting(embedUrl: String, pageUrl: String): List<Video> {
-        val embedHeaders = headersBuilder().set("Referer", pageUrl).build()
+        val embedHeaders = headersBuilder().set("Referer", safeReferer(pageUrl)).build()
         val html = runCatching {
             fastExtractorClient.newCall(GET(embedUrl, embedHeaders)).execute().use { it.body.string() }
         }.getOrNull().orEmpty()
         if (html.isBlank()) return emptyList()
+        val kvsStreams = extractKvsFlashvars(html, embedUrl)
+        if (kvsStreams.isNotEmpty()) return kvsStreams
         val unpacked = JsUnpacker.unpackAndCombine(html).orEmpty()
         return extractDirectStreams("$html\n$unpacked", embedUrl, labelPrefix = "Playeriz")
     }
 
+    private fun extractKvsFlashvars(html: String, referer: String): List<Video> {
+        val license = KVS_LICENSE_CODE.find(html)?.groupValues?.get(1)
+        val videoHeaders = headersBuilder()
+            .set("Referer", safeReferer(referer))
+            .build()
+
+        val pairs = mutableListOf<Pair<String, String>>()
+        KVS_FLASH_URL.findAll(html).forEach { m ->
+            val key = m.groupValues[1]
+            val url = m.groupValues[2]
+            if (url.isBlank() || url == "1") return@forEach
+            if (!url.contains("get_file") && !url.startsWith("function") && !url.contains(".mp4", true) &&
+                !url.contains(".m3u8", true)
+            ) {
+                return@forEach
+            }
+            val quality = Regex("""${Regex.escape(key)}_text:\s*'([^']*)'""")
+                .find(html)?.groupValues?.get(1)?.ifBlank { null }
+                ?: KVS_QUALITY_FROM_URL.find(url)?.groupValues?.get(1)?.let { "${it}p" }
+                ?: if (key == "video_alt_url") "720p" else "MP4"
+            pairs += quality to url
+        }
+        if (pairs.isEmpty()) {
+            KVS_GET_FILE.findAll(html).map { it.value }.distinct().forEach { url ->
+                val q = KVS_QUALITY_FROM_URL.find(url)?.groupValues?.get(1)?.let { "${it}p" } ?: "MP4"
+                pairs += q to url
+            }
+        }
+        return pairs.mapNotNull { (quality, raw) ->
+            val resolved = runCatching {
+                if (raw.startsWith("function")) {
+                    if (license == null) return@mapNotNull null
+                    decryptKvsHash(raw, license)
+                } else {
+                    raw
+                }
+            }.getOrNull().orEmpty()
+            if (resolved.isBlank()) return@mapNotNull null
+            Video(resolved, "ArabX - $quality", resolved, headers = videoHeaders)
+        }.distinctBy { it.url }
+    }
+
+    private fun decryptKvsHash(videoUrl: String, licenseCode: String, hashRange: Int = 16): String {
+        val parts = videoUrl.split("/").toMutableList()
+        require(parts.size > 7) { "Unexpected KVS URL shape" }
+        val hashFull = parts[7]
+        val convertLen = 2 * hashRange
+        var hash = hashFull.take(convertLen)
+        val nonConvert = hashFull.drop(convertLen)
+        val seed = calcKvsSeed(licenseCode, hashRange)
+        val seedArray = seed.map { it.toString() }
+        for (k in hash.length - 1 downTo 0) {
+            val hashArray = hash.map { it.toString() }.toMutableList()
+            var l = k
+            for (m in k until seedArray.size) l += seedArray[m].toInt()
+            while (l >= hashArray.size) l -= hashArray.size
+            val n = StringBuilder()
+            for (o in hashArray.indices) {
+                n.append(
+                    when (o) {
+                        k -> hashArray[l]
+                        l -> hashArray[k]
+                        else -> hashArray[o]
+                    },
+                )
+            }
+            hash = n.toString()
+        }
+        parts[7] = hash + nonConvert
+        return parts.drop(2).joinToString("/").replaceFirst(":///", "://")
+    }
+
+    private fun calcKvsSeed(licenseCode: String, hashRange: Int): String {
+        val licenseCodeArray = licenseCode.map { it.toString() }
+        val fb = StringBuilder()
+        for (c in licenseCodeArray) {
+            if (c == "$") continue
+            val v = c.toInt()
+            fb.append(if (v != 0) c else "1")
+        }
+        val f = fb.toString()
+        val j = f.length / 2
+        val k = f.substring(0, j + 1).toInt()
+        val l = f.substring(j).toInt()
+        var g = abs(l - k)
+        var fi = g
+        g = abs(k - l)
+        fi += g
+        fi *= 2
+        val s = fi.toString()
+        val fArray = s.map { it.toString() }
+        val i = hashRange / 2 + 2
+        val m = StringBuilder()
+        for (g2 in 0..j) {
+            for (h in 1..4) {
+                var n = licenseCodeArray[g2 + h].toInt() + fArray[g2].toInt()
+                if (n >= i) n -= i
+                m.append(n)
+            }
+        }
+        return m.toString()
+    }
+
     private fun extractDirectStreams(html: String, referer: String, labelPrefix: String): List<Video> {
         val results = mutableListOf<Video>()
-        val origin = referer.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" }
+        val safeRef = safeReferer(referer)
+        val origin = safeRef.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" }
         val streamHeaders = headersBuilder()
-            .set("Referer", referer)
+            .set("Referer", safeRef)
             .apply { if (origin != null) set("Origin", origin) }
             .set("Accept", "*/*")
             .build()
@@ -649,6 +770,10 @@ class ArabX :
         private const val PAGE_CACHE_TTL_MS = 3 * 60 * 1000L
 
         private val QUALITY_REGEX = Regex("""(\d{3,4})""")
+        private val KVS_LICENSE_CODE = Regex("""license_code:\s*'([^']+)'""")
+        private val KVS_FLASH_URL = Regex("""(video_url|video_alt_url\d*):\s*'((?:\\'|[^'])*)'""")
+        private val KVS_GET_FILE = Regex("""https?://[^"'\\\s]+/get_file/[^"'\\\s]+""")
+        private val KVS_QUALITY_FROM_URL = Regex("""_(\d{3,4})p?\.(?:mp4|m3u8)""", RegexOption.IGNORE_CASE)
         private val RESOLUTION_HEIGHT_REGEX = Regex("""RESOLUTION=\d+x(\d+)""", RegexOption.IGNORE_CASE)
         private val FILE_URL_REGEX = Regex(
             """file\s*:\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""",

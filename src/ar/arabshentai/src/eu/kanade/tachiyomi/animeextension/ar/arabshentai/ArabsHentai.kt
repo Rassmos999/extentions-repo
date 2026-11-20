@@ -375,7 +375,7 @@ class ArabsHentai :
         val document = Jsoup.parse(html, pageUrl)
         val videos = mutableListOf<Video>()
 
-        // 1) Working Dropbox direct MP4 links (raw=1 streams video/mp4 with 206 range support).
+        // 1) Working Dropbox direct MP4 links (pre-resolve redirect with browser UA; detect quota blocks).
         val dropboxLinks = linkedSetOf<String>()
         document.select("a[href*=dropbox.com]").forEach { a ->
             a.absUrl("href").ifBlank { a.attr("href") }
@@ -383,14 +383,20 @@ class ArabsHentai :
                 ?.let(dropboxLinks::add)
         }
         DROPBOX_MP4_REGEX.findAll(html).forEach { dropboxLinks += it.value.replace("&amp;", "&") }
+        var dropboxQuotaBlocked = false
         dropboxLinks.forEach { rawDb ->
             val directDb = toDropboxRawUrl(rawDb)
-            val quality = QUALITY_IN_URL.find(directDb)?.value?.let { "Dropbox - $it" } ?: "Dropbox - MP4"
+            val resolved = resolveDropboxDirectUrl(directDb)
+            if (resolved == null) {
+                dropboxQuotaBlocked = true
+                return@forEach
+            }
+            val quality = QUALITY_IN_URL.find(resolved)?.value?.let { "Dropbox - $it" } ?: "Dropbox - MP4"
             val dbHeaders = headers.newBuilder()
                 .removeAll("Referer")
                 .set("Accept", "*/*")
                 .build()
-            videos += Video(directDb, quality, directDb, headers = dbHeaders)
+            videos += Video(resolved, quality, resolved, headers = dbHeaders)
         }
 
         // 2) Live direct HTML5 / script MP4 & M3U8 sources (skip dead x-tez.com hosts).
@@ -420,7 +426,12 @@ class ArabsHentai :
 
         val distinct = videos.distinctBy { it.videoUrl ?: it.url }
         if (distinct.isEmpty()) {
-            throw IOException("لم يتم العثور على رابط تشغيل صالح لهذه الحلقة على ArabsHentai.")
+            val msg = if (dropboxQuotaBlocked) {
+                "رابط Dropbox على ArabsHentai متوقف مؤقتاً بسبب تجاوز حد التحميل اليومي للموقع، وسيرفر الموقع الأساسي (x-tez.com) معطل."
+            } else {
+                "لم يتم العثور على رابط تشغيل صالح لهذه الحلقة على ArabsHentai."
+            }
+            throw IOException(msg)
         }
         return distinct
     }
@@ -495,11 +506,36 @@ class ArabsHentai :
 
     private fun streamFromUrl(url: String, quality: String, referer: String): List<Video> {
         val clean = url.trim().replace("\\/", "/").replace("&amp;", "&")
+        val safeRef = referer.toHttpUrlOrNull()?.toString()
+            ?.takeIf { it.all { ch -> ch.code in 0x20..0x7E } }
+            ?: "$baseUrl/"
         val vHeaders = headers.newBuilder()
-            .set("Referer", referer)
+            .set("Referer", safeRef)
             .set("Accept", "*/*")
             .build()
         return listOf(Video(clean, quality, clean, headers = vHeaders))
+    }
+
+    private fun resolveDropboxDirectUrl(rawUrl: String): String? {
+        val noRedirect = fastExtractorClient.newBuilder().followRedirects(false).build()
+        val reqHeaders = headers.newBuilder().removeAll("Referer").set("Accept", "*/*").build()
+        var current = rawUrl
+        repeat(4) {
+            val next = runCatching {
+                noRedirect.newCall(GET(current, reqHeaders)).execute().use { resp ->
+                    val loc = resp.header("Location")
+                    if (!loc.isNullOrBlank()) {
+                        return@use resp.request.url.resolve(loc)?.toString() ?: loc
+                    }
+                    val ct = resp.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
+                    if ("text/html" in ct) return null
+                    return current
+                }
+            }.getOrNull() ?: return current
+            current = next
+            if ("dropboxusercontent.com" in current.lowercase(Locale.ROOT)) return current
+        }
+        return current
     }
 
     override fun List<Video>.sort(): List<Video> {
@@ -570,10 +606,14 @@ class ArabsHentai :
         }
     }
 
-    private fun toAbsoluteUrl(url: String): String = when {
-        url.startsWith("http://") || url.startsWith("https://") -> url
-        url.startsWith("//") -> "https:$url"
-        else -> "$baseUrl/${url.trimStart('/')}"
+    private fun toAbsoluteUrl(url: String): String {
+        val raw = when {
+            url.startsWith("http://") || url.startsWith("https://") -> url
+            url.startsWith("//") -> "https:$url"
+            else -> "$baseUrl/${url.trimStart('/')}"
+        }
+        val normalized = if ('?' !in raw && !raw.endsWith("/")) "$raw/" else raw
+        return normalized.toHttpUrlOrNull()?.toString() ?: normalized
     }
 
     private fun fetchPageCached(url: String): String {
