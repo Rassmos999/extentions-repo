@@ -226,10 +226,13 @@ class Aflamk1 :
 
     private fun cleanUrl(url: String): String {
         val clean = url.trim()
-        if (clean.startsWith("http://") || clean.startsWith("https://")) return clean
-        val raw = "$baseUrl/$clean"
-        val path = raw.removePrefix(baseUrl).trim('/')
-        if (path.isEmpty()) return baseUrl
+        if (clean.startsWith("http://") || clean.startsWith("https://")) {
+            return if ('?' !in clean && !clean.endsWith("/")) "$clean/" else clean
+        }
+        val withoutQuery = clean.substringBefore('?')
+        val query = clean.substringAfter('?', "")
+        val path = withoutQuery.removePrefix(baseUrl).trim('/')
+        if (path.isEmpty()) return "$baseUrl/"
         val builder = baseUrl.toHttpUrl().newBuilder()
         path.split('/').filter { it.isNotEmpty() }.forEach { segment ->
             if (segment.contains("%")) {
@@ -237,6 +240,11 @@ class Aflamk1 :
             } else {
                 builder.addPathSegment(segment)
             }
+        }
+        // aflamk1.net redirects any video URL without a trailing slash back to homepage!
+        builder.addPathSegment("")
+        if (query.isNotEmpty()) {
+            builder.encodedQuery(query)
         }
         return builder.build().toString()
     }
