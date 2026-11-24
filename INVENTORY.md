@@ -66,7 +66,7 @@ Repository structure and usage-based partitioning for the **110 published extens
 | `sextb` | `all.sextb` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.17`, `9d2e370`) |
 | `supjav` | `all.supjav` | JAV multi-embed streaming (CF protected) | **Fixed & Rebuilt** (`v14.100`, `156cfd5`: `supportsLatest`, pagination, synchronous extractors + `TV`/`DOOD`/`MIXDROP`/`UQLOAD`/`FST`/`EVS`/`LUC`/`VAS` + filters; CF Turnstile gated) |
 | `supjav2` | `all.supjav2` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.29`, `156cfd5`: wired `uqloadExtractor`, `DOOD` mirrors, `StreamWishExtractor`/`VidHideExtractor` fallbacks, multi-variant HLS, removed dead suspend block; CF Turnstile gated) |
-| `xmoviesforyou` | `all.xmoviesforyou` | Adult movies (direct HLS + mirrors) | **Added & Built** (`v14.1`, `/api/stream` HLS with `Origin`+`Referer`, Dood/StreamTape/MixDrop mirrors, live-verified) |
+| `xmoviesforyou` | `all.xmoviesforyou` | Adult movies (direct HLS + mirrors) | **Added & Built** (`v14.2`, `/api/stream` HLS proxied via `m3u8Server` with `Origin`+`Referer` fixing `eternalslumber.online` 403, Dood/StreamTape/MixDrop mirrors, live-verified) |
 | `xnxx` | `all.xnxx` | Adult tube | **Fixed & Rebuilt** (`v14.22`, `3b51b4a`: dynamic `/todays-selection/` archive date pagination + next-page selectors) |
 | `xvideos` | `all.xvideos` | Adult tube | **Fixed & Rebuilt** (`v14.23`, `3b51b4a`: next-page selectors + category/tag + filter search routing) |
 

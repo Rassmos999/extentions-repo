@@ -546,7 +546,10 @@ class HentaiAraby :
     private fun extractSlug(urlOrPath: String): String {
         val clean = urlOrPath.substringBefore('?').substringBefore('#').trimEnd('/')
         val raw = clean.substringAfterLast('/')
-        return runCatching { URLDecoder.decode(raw, Charsets.UTF_8.name()) }.getOrDefault(raw)
+        if ('%' !in raw) return raw
+        return runCatching {
+            URLDecoder.decode(raw.replace("+", "%2B"), Charsets.UTF_8.name())
+        }.getOrDefault(raw)
     }
 
     private fun toCdnUrl(path: String): String {

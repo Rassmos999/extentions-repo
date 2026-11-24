@@ -33,7 +33,6 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
-import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -675,10 +674,17 @@ class ArabsHentai :
         )
 
     // ============================== Helpers ===============================
-    private fun genreUrl(slug: String, page: Int): String {
-        val encoded = URLEncoder.encode(slug, Charsets.UTF_8.name()).replace("+", "%20")
-        return if (page <= 1) "$baseUrl/genre/$encoded/" else "$baseUrl/genre/$encoded/page/$page/"
-    }
+    private fun genreUrl(slug: String, page: Int): String = "$baseUrl/genre".toHttpUrl().newBuilder()
+        .addPathSegment(slug)
+        .apply {
+            if (page > 1) {
+                addPathSegment("page")
+                addPathSegment(page.toString())
+            }
+        }
+        .addPathSegment("")
+        .build()
+        .toString()
 
     private fun isAnimeContentUrl(url: String): Boolean {
         val lower = url.lowercase(Locale.ROOT)

@@ -570,10 +570,10 @@
   {
     "name": "Aniyomi: XMoviesForYou",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.xmoviesforyou",
-    "apk": "aniyomi-all.xmoviesforyou-v14.1.apk",
+    "apk": "aniyomi-all.xmoviesforyou-v14.2.apk",
     "lang": "all",
-    "code": 1,
-    "version": "14.1",
+    "code": 2,
+    "version": "14.2",
     "nsfw": 1,
     "sources": [
       {
@@ -757,10 +757,10 @@
   {
     "name": "Aniyomi: ArabsHentai",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.arabshentai",
-    "apk": "aniyomi-ar.arabshentai-v14.37.apk",
+    "apk": "aniyomi-ar.arabshentai-v14.38.apk",
     "lang": "ar",
-    "code": 37,
-    "version": "14.37",
+    "code": 38,
+    "version": "14.38",
     "nsfw": 1,
     "sources": [
       {
@@ -893,10 +893,10 @@
   {
     "name": "Aniyomi: HentaiAraby",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.hentaiaraby",
-    "apk": "aniyomi-ar.hentaiaraby-v14.1.apk",
+    "apk": "aniyomi-ar.hentaiaraby-v14.2.apk",
     "lang": "ar",
-    "code": 1,
-    "version": "14.1",
+    "code": 2,
+    "version": "14.2",
     "nsfw": 1,
     "sources": [
       {

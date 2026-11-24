@@ -4,8 +4,8 @@ import android.content.SharedPreferences
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.doodextractor.DoodExtractor
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.mixdropextractor.MixDropExtractor
-import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
@@ -46,10 +46,11 @@ import java.util.concurrent.TimeUnit
  * - Popular: `/most-viewed` (Top 100 most viewed scenes)
  * - Latest: `/` (`/page/N`)
  * - Search: `/new-search?q={query}&sort={relevance|latest|oldest}&page={N}`
- * - Categories & Studios: `/category/{slug}?page={N}`, `/studio/{slug}?page={N}`
- * - Playback: Primary direct native HLS via `/api/stream/{videoId}?target={target}`
- *   (with required `Origin` + `Referer` headers) plus parallel fallback mirrors
- *   (DoodStream / StreamTape / MixDrop).
+ * - Categories & Studios: `/category/{slug}?page={N}`, `/studio/{slug}?page={N}` (multi-filter parallel merge)
+ * - Playback: Primary direct native HLS via `/api/stream/{videoId}?target={target}` routed through
+ *   local `M3u8ServerManager` so `Origin` + `Referer` are attached to every `.m3u8` and `.ts` segment
+ *   (fixes HTTP 403 on `node*.eternalslumber.online` nodes in mpv/ExoPlayer), plus parallel fallback
+ *   mirrors (DoodStream / StreamTape / MixDrop).
  */
 class XMoviesForYou :
     AnimeHttpSource(),
@@ -74,7 +75,15 @@ class XMoviesForYou :
             .build()
     }
 
-    private val playlistUtils by lazy { PlaylistUtils(fastClient, headers) }
+    private val streamProxyClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .writeTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val m3u8Server by lazy { M3u8ServerManager(streamProxyClient) }
     private val doodExtractor by lazy { DoodExtractor(fastClient) }
     private val mixDropExtractor by lazy { MixDropExtractor(fastClient) }
     private val streamTapeExtractor by lazy { StreamTapeExtractor(fastClient) }
@@ -104,14 +113,11 @@ class XMoviesForYou :
     // =============================== Search ===============================
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val cleanQuery = query.trim()
-        val selectedCats = filters.filterIsInstance<CategoryGroup>()
-            .firstOrNull()?.state?.filter { it.state }?.map { it.slug }.orEmpty()
-
-        if (cleanQuery.isBlank() && selectedCats.size > 1) {
-            val requests = selectedCats.take(MAX_PARALLEL_FILTERS).map { slug ->
-                categoryRequest(slug, page)
+        if (cleanQuery.isBlank()) {
+            val filterRequests = buildFilterRequests(page, filters)
+            if (filterRequests.size > 1) {
+                return fetchAndMergePages(filterRequests, page)
             }
-            return fetchAndMergePages(requests, page)
         }
 
         val response = client.newCall(searchAnimeRequest(page, query, filters)).awaitSuccess()
@@ -122,9 +128,6 @@ class XMoviesForYou :
         val cleanQuery = query.trim()
         val sort = filters.filterIsInstance<SearchSortFilter>().firstOrNull()?.toUriPart().orEmpty()
         val browse = filters.filterIsInstance<BrowseFilter>().firstOrNull()?.toUriPart().orEmpty()
-        val studio = filters.filterIsInstance<StudioFilter>().firstOrNull()?.toUriPart().orEmpty()
-        val firstCat = filters.filterIsInstance<CategoryGroup>()
-            .firstOrNull()?.state?.firstOrNull { it.state }?.slug.orEmpty()
 
         if (cleanQuery.isNotBlank()) {
             val builder = "$baseUrl/new-search".toHttpUrl().newBuilder()
@@ -134,14 +137,9 @@ class XMoviesForYou :
             return GET(builder.build(), headers)
         }
 
-        if (studio.isNotBlank()) {
-            val builder = "$baseUrl/studio/$studio".toHttpUrl().newBuilder()
-            if (page > 1) builder.addQueryParameter("page", page.toString())
-            return GET(builder.build(), headers)
-        }
-
-        if (firstCat.isNotBlank()) {
-            return categoryRequest(firstCat, page)
+        val filterRequests = buildFilterRequests(page, filters)
+        if (filterRequests.isNotEmpty()) {
+            return filterRequests.first()
         }
 
         return if (browse == "most-viewed") {
@@ -149,6 +147,23 @@ class XMoviesForYou :
         } else {
             latestUpdatesRequest(page)
         }
+    }
+
+    private fun buildFilterRequests(page: Int, filters: AnimeFilterList): List<Request> {
+        val studio = filters.filterIsInstance<StudioFilter>().firstOrNull()?.toUriPart().orEmpty()
+        val selectedCats = filters.filterIsInstance<CategoryGroup>()
+            .firstOrNull()?.state?.filter { it.state }?.map { it.slug }.orEmpty()
+
+        val requests = mutableListOf<Request>()
+        if (studio.isNotBlank()) {
+            requests += studioRequest(studio, page)
+        }
+        selectedCats.forEach { slug ->
+            if (requests.size < MAX_PARALLEL_FILTERS) {
+                requests += categoryRequest(slug, page)
+            }
+        }
+        return requests
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
@@ -160,13 +175,20 @@ class XMoviesForYou :
     }
 
     private fun categoryRequest(slug: String, page: Int): Request {
-        val builder = "$baseUrl/category/$slug".toHttpUrl().newBuilder()
+        val builder = "$baseUrl/category".toHttpUrl().newBuilder()
+            .addPathSegment(slug)
+        if (page > 1) builder.addQueryParameter("page", page.toString())
+        return GET(builder.build(), headers)
+    }
+
+    private fun studioRequest(slug: String, page: Int): Request {
+        val builder = "$baseUrl/studio".toHttpUrl().newBuilder()
+            .addPathSegment(slug)
         if (page > 1) builder.addQueryParameter("page", page.toString())
         return GET(builder.build(), headers)
     }
 
     private fun parseListing(doc: Document, page: Int): AnimesPage {
-        // Search page uses `a.card`; main / category / studio / most-viewed use `a.group.flex.flex-col` inside <section> or <main>
         val searchCards = doc.select("a.card")
         val elements = when {
             searchCards.isNotEmpty() -> searchCards
@@ -274,11 +296,12 @@ class XMoviesForYou :
         title = doc.selectFirst("main h1, h1")?.text()?.trim()?.ifBlank { null }
             ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim().orEmpty()
 
-        thumbnail_url = doc.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
-            ?.takeIf { it.startsWith("http") }
-            ?: doc.selectFirst("#player img, video[poster]")?.let { el ->
-                el.attr("poster").ifBlank { el.extractThumbUrl().orEmpty() }
-            }?.takeIf { it.startsWith("http") }
+        val ogImage: String? = doc.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
+        val playerImage: String? = doc.selectFirst("#player img, video[poster]")?.let { el ->
+            el.attr("poster").ifBlank { el.extractThumbUrl().orEmpty() }
+        }
+        thumbnail_url = ogImage?.takeIf { it.startsWith("http") }
+            ?: playerImage?.takeIf { it.startsWith("http") }
 
         val studios = doc.select("a[href^='/studio/']").mapNotNull { it.text().trim().takeIf(String::isNotBlank) }.distinct()
         val stars = doc.select("a[href^='/pornstar/']").mapNotNull { it.text().trim().takeIf(String::isNotBlank) }.distinct()
@@ -350,45 +373,15 @@ class XMoviesForYou :
     private fun extractAllVideos(html: String, pageUrl: String): List<Video> {
         val videos = mutableListOf<Video>()
 
-        // 1) Primary direct native HLS via `/api/stream/{videoId}?target={target}`
+        // 1) Primary direct native HLS via `/api/stream/{videoId}?target={target}` proxied
+        //    through local M3u8ServerManager so `Origin` + `Referer` are attached on every
+        //    `.m3u8` and `.ts` request (fixes HTTP 403 on `eternalslumber.online` nodes).
         val videoId = VIDEO_ID_REGEX.find(html)?.groupValues?.get(1)
         val target = TARGET_REGEX.find(html)?.groupValues?.get(1).orEmpty()
         if (!videoId.isNullOrBlank()) {
-            val apiUrl = "$baseUrl/api/stream/$videoId".toHttpUrl().newBuilder().apply {
-                if (target.isNotBlank()) addQueryParameter("target", target)
-            }.build()
-            val apiHeaders = headers.newBuilder()
-                .set("Accept", "application/json, */*")
-                .set("Referer", pageUrl)
-                .build()
-            val hlsUrl = runCatching {
-                fastClient.newCall(GET(apiUrl, apiHeaders)).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use null
-                    STREAM_URL_JSON_REGEX.find(resp.body.string())?.groupValues?.get(1)
-                        ?.replace("\\/", "/")
-                }
-            }.getOrNull()
-
+            val hlsUrl = fetchStreamApiUrl(videoId, target, pageUrl)
             if (!hlsUrl.isNullOrBlank()) {
-                val hlsHeaders = headers.newBuilder()
-                    .set("Accept", "*/*")
-                    .set("Origin", baseUrl)
-                    .set("Referer", "$baseUrl/")
-                    .build()
-                val extracted = runCatching {
-                    playlistUtils.extractFromHls(
-                        playlistUrl = hlsUrl,
-                        referer = "$baseUrl/",
-                        masterHeaders = hlsHeaders,
-                        videoHeaders = hlsHeaders,
-                        videoNameGen = { q -> if (q == "Video") "Direct HLS - HD" else "Direct HLS - $q" },
-                    )
-                }.getOrDefault(emptyList())
-                if (extracted.isNotEmpty()) {
-                    videos += extracted
-                } else {
-                    videos += Video(hlsUrl, "Direct HLS - HD", hlsUrl, headers = hlsHeaders)
-                }
+                videos += extractProxiedHls(hlsUrl)
             }
         }
 
@@ -412,6 +405,84 @@ class XMoviesForYou :
             throw IOException("No playable video stream found on XMoviesForYou.")
         }
         return distinct
+    }
+
+    private fun fetchStreamApiUrl(videoId: String, target: String, referer: String): String? {
+        val apiUrl = "$baseUrl/api/stream/$videoId".toHttpUrl().newBuilder().apply {
+            if (target.isNotBlank()) addQueryParameter("target", target)
+        }.build()
+        val apiHeaders = headers.newBuilder()
+            .set("Accept", "application/json, */*")
+            .set("Referer", referer)
+            .build()
+
+        repeat(2) { attempt ->
+            val codeAndBody = runCatching {
+                fastClient.newCall(GET(apiUrl, apiHeaders)).execute().use { resp ->
+                    resp.code to (if (resp.isSuccessful) resp.body.string() else "")
+                }
+            }.getOrNull() ?: return null
+            val (code, body) = codeAndBody
+            if (code == 200 && body.isNotBlank()) {
+                return STREAM_URL_JSON_REGEX.find(body)?.groupValues?.get(1)?.replace("\\/", "/")
+            }
+            if (code == 429 && attempt == 0) {
+                runCatching { Thread.sleep(600L) }
+            } else {
+                return null
+            }
+        }
+        return null
+    }
+
+    private fun extractProxiedHls(hlsUrl: String): List<Video> {
+        val reqHeaders = headers.newBuilder()
+            .set("Accept", "*/*")
+            .set("Origin", baseUrl)
+            .set("Referer", "$baseUrl/")
+            .set("Accept-Encoding", "identity")
+            .build()
+
+        // Verify the HLS playlist is genuinely playable (HTTP 200 + #EXTM3U) before exposing it
+        val playlistBody = runCatching {
+            fastClient.newCall(GET(hlsUrl, reqHeaders)).execute().use { resp ->
+                if (!resp.isSuccessful) return emptyList()
+                resp.body.string()
+            }
+        }.getOrNull() ?: return emptyList()
+
+        if (!playlistBody.trimStart().startsWith("#EXTM3U")) return emptyList()
+
+        if (!m3u8Server.isRunning()) m3u8Server.startServer()
+        val ua = headers["User-Agent"]
+        val baseHttp = hlsUrl.toHttpUrlOrNull()
+        val lines = playlistBody.lines().map(String::trim)
+        val variants = mutableListOf<Video>()
+
+        for (i in lines.indices) {
+            val line = lines[i]
+            if (!line.startsWith("#EXT-X-STREAM-INF")) continue
+            val next = lines.getOrNull(i + 1)?.takeIf { it.isNotBlank() && !it.startsWith("#") } ?: continue
+            val resolved = baseHttp?.resolve(next)?.toString() ?: continue
+            val localUrl = m3u8Server.processM3u8Url(
+                m3u8Url = resolved,
+                referer = "$baseUrl/",
+                userAgent = ua,
+                origin = baseUrl,
+            ) ?: continue
+            val height = RESOLUTION_HEIGHT_REGEX.find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val label = if (height != null) "Direct HLS - ${height}p" else "Direct HLS - HD"
+            variants += Video(localUrl, label, localUrl)
+        }
+        if (variants.isNotEmpty()) return variants.distinctBy { it.videoUrl }
+
+        val localUrl = m3u8Server.processM3u8Url(
+            m3u8Url = hlsUrl,
+            referer = "$baseUrl/",
+            userAgent = ua,
+            origin = baseUrl,
+        ) ?: return emptyList()
+        return listOf(Video(localUrl, "Direct HLS - HD", localUrl))
     }
 
     private fun extractMirrorsInParallel(urls: List<String>, maxWaitMs: Long): List<Video> {
@@ -598,6 +669,7 @@ class XMoviesForYou :
         private val STREAM_URL_JSON_REGEX = Regex(""""url"\s*:\s*"([^"]+)"""")
         private val DATE_PUBLISHED_REGEX = Regex(""""datePublished"\s*:\s*"([^"]+)"""")
         private val QUALITY_NUM_REGEX = Regex("""(?i)(2160|1440|1080|720|480|360|240)p?""")
+        private val RESOLUTION_HEIGHT_REGEX = Regex("""RESOLUTION=\d+x(\d+)""", RegexOption.IGNORE_CASE)
 
         private val DOOD_HOSTS = listOf("playmogo", "dood", "d0o0d", "ds2play", "d-s.io", "myvidplay")
         private val MIRROR_HOSTS = DOOD_HOSTS + listOf("streamtape", "streamta.pe", "mixdrop", "mxdrop")
