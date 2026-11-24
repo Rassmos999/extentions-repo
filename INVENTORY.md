@@ -1,6 +1,6 @@
 # Extension Repository Inventory & Partitioning
 
-Repository structure and usage-based partitioning for the **109 published extensions** (`all`: 34, `ar`: 23, `en`: 52).
+Repository structure and usage-based partitioning for the **110 published extensions** (`all`: 35, `ar`: 23, `en`: 52).
 
 > Legacy unindexed directories under `src/` (`de`, `es`, `fr`, `hi`, `id`, `it`, `ko`, `pl`, `pt`, `ru`, `sr`, `tr`, `uk`, `zh`) are excluded from `settings.gradle.kts` and left untouched.
 
@@ -17,7 +17,7 @@ Repository structure and usage-based partitioning for the **109 published extens
 
 ---
 
-## Part 1: `all` — Language-Independent & Multi-Language (34 extensions)
+## Part 1: `all` — Language-Independent & Multi-Language (35 extensions)
 
 ### Group A1 — Anime & Donghua Streaming (9)
 | Extension | Package Suffix | Usage / Type | Current Status |
@@ -52,7 +52,7 @@ Repository structure and usage-based partitioning for the **109 published extens
 | `torrentio` | `all.torrentio` | Torrentio Movies/TV (Torrent / Debrid) | **Fixed & Rebuilt** (`v14.9`, `8da0dc3`/`419657b`: torrent manifest, deeplinks, DTO) |
 | `torrentioanime` | `all.torrentioanime` | Torrentio Anime (Torrent / Debrid) | **Fixed & Rebuilt** (`v14.20`, `8da0dc3`/`419657b`: torrent manifest, deeplinks) |
 
-### Group A4 — Adult / JAV +18 (13)
+### Group A4 — Adult / JAV +18 (14)
 | Extension | Package Suffix | Usage / Type | Current Status |
 |---|---|---|---|
 | `jable` | `all.jable` | JAV HLS streaming | **Fixed & Rebuilt** (`v14.15`, `156cfd5`: `/categories/*` + seeded tags, single `sort_by`, headers, HLS `PlaylistUtils` + `Referer`, live-verified) |
@@ -66,6 +66,7 @@ Repository structure and usage-based partitioning for the **109 published extens
 | `sextb` | `all.sextb` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.17`, `9d2e370`) |
 | `supjav` | `all.supjav` | JAV multi-embed streaming (CF protected) | **Fixed & Rebuilt** (`v14.100`, `156cfd5`: `supportsLatest`, pagination, synchronous extractors + `TV`/`DOOD`/`MIXDROP`/`UQLOAD`/`FST`/`EVS`/`LUC`/`VAS` + filters; CF Turnstile gated) |
 | `supjav2` | `all.supjav2` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.29`, `156cfd5`: wired `uqloadExtractor`, `DOOD` mirrors, `StreamWishExtractor`/`VidHideExtractor` fallbacks, multi-variant HLS, removed dead suspend block; CF Turnstile gated) |
+| `xmoviesforyou` | `all.xmoviesforyou` | Adult movies (direct HLS + mirrors) | **Added & Built** (`v14.1`, `/api/stream` HLS with `Origin`+`Referer`, Dood/StreamTape/MixDrop mirrors, live-verified) |
 | `xnxx` | `all.xnxx` | Adult tube | **Fixed & Rebuilt** (`v14.22`, `3b51b4a`: dynamic `/todays-selection/` archive date pagination + next-page selectors) |
 | `xvideos` | `all.xvideos` | Adult tube | **Fixed & Rebuilt** (`v14.23`, `3b51b4a`: next-page selectors + category/tag + filter search routing) |
 

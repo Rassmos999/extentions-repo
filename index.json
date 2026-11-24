@@ -568,6 +568,23 @@
     ]
   },
   {
+    "name": "Aniyomi: XMoviesForYou",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.xmoviesforyou",
+    "apk": "aniyomi-all.xmoviesforyou-v14.1.apk",
+    "lang": "all",
+    "code": 1,
+    "version": "14.1",
+    "nsfw": 1,
+    "sources": [
+      {
+        "name": "XMoviesForYou",
+        "lang": "all",
+        "id": "2919365812839147327",
+        "baseUrl": "https://xmoviesforyou.com"
+      }
+    ]
+  },
+  {
     "name": "Aniyomi: Xnxx",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.xnxx",
     "apk": "aniyomi-all.xnxx-v14.22.apk",

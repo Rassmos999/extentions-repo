@@ -1,0 +1,15 @@
+ext {
+    extName = 'XMoviesForYou'
+    extClass = '.XMoviesForYou'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
+dependencies {
+    implementation(project(":lib:playlistutils"))
+    implementation(project(":lib:doodextractor"))
+    implementation(project(":lib:mixdropextractor"))
+    implementation(project(":lib:streamtapeextractor"))
+}

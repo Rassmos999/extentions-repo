@@ -68,6 +68,7 @@ GROUPS = {
         "all:sextb",
         "all:supjav",
         "all:supjav2",
+        "all:xmoviesforyou",
         "all:xnxx",
         "all:xvideos",
     ],
