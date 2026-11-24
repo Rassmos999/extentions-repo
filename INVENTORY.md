@@ -1,6 +1,6 @@
 # Extension Repository Inventory & Partitioning
 
-Repository structure and usage-based partitioning for the **108 published extensions** (`all`: 34, `ar`: 22, `en`: 52).
+Repository structure and usage-based partitioning for the **109 published extensions** (`all`: 34, `ar`: 23, `en`: 52).
 
 > Legacy unindexed directories under `src/` (`de`, `es`, `fr`, `hi`, `id`, `it`, `ko`, `pl`, `pt`, `ru`, `sr`, `tr`, `uk`, `zh`) are excluded from `settings.gradle.kts` and left untouched.
 
@@ -71,11 +71,11 @@ Repository structure and usage-based partitioning for the **108 published extens
 
 ---
 
-## Part 2: `ar` — Arabic Extensions (22 extensions — Scheduled Next)
+## Part 2: `ar` — Arabic Extensions (23 extensions — Scheduled Next)
 
 - **R1 — Arabic Anime (8)**: `anime4up`, `animeblkom`, `animeiat`, `animelek`, `animerco`, `arabanime`, `okanime`, `witanime`
 - **R2 — Arabic Movies & Series (7)**: `arabseed`, `asia2tv`, `cimaleek`, `cimalight`, `egydead`, `faselhd`, `tuktukcinema`
-- **R3 — Arabic Adult +18 (7)**: `aflamk1`, `arabshentai`, `arabx`, `arabxn`, `nxxhentai`, `sexalarab`, `sexmahali`
+- **R3 — Arabic Adult +18 (8)**: `aflamk1`, `arabshentai`, `arabx`, `arabxn`, `hentaiaraby`, `nxxhentai`, `sexalarab`, `sexmahali`
 
 ---
 

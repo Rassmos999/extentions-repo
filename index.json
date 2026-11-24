@@ -740,17 +740,17 @@
   {
     "name": "Aniyomi: ArabsHentai",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.arabshentai",
-    "apk": "aniyomi-ar.arabshentai-v14.36.apk",
+    "apk": "aniyomi-ar.arabshentai-v14.37.apk",
     "lang": "ar",
-    "code": 36,
-    "version": "14.36",
+    "code": 37,
+    "version": "14.37",
     "nsfw": 1,
     "sources": [
       {
         "name": "ArabsHentai",
         "lang": "ar",
         "id": "8204483525307465141",
-        "baseUrl": "https://arabshentai.net"
+        "baseUrl": "https://arabshentai.com"
       }
     ]
   },
@@ -870,6 +870,23 @@
         "lang": "ar",
         "id": "1378291029586884571",
         "baseUrl": ""
+      }
+    ]
+  },
+  {
+    "name": "Aniyomi: HentaiAraby",
+    "pkg": "eu.kanade.tachiyomi.animeextension.ar.hentaiaraby",
+    "apk": "aniyomi-ar.hentaiaraby-v14.1.apk",
+    "lang": "ar",
+    "code": 1,
+    "version": "14.1",
+    "nsfw": 1,
+    "sources": [
+      {
+        "name": "HentaiAraby",
+        "lang": "ar",
+        "id": "1829277345272612529",
+        "baseUrl": "https://hentaiaraby.com"
       }
     ]
   },

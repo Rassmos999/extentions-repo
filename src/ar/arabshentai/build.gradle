@@ -2,9 +2,9 @@ ext {
     extName = 'ArabsHentai'
     extClass = '.ArabsHentai'
     themePkg = 'dooplay'
-    extVersionCode = 34
-    overrideVersionCode = 34
-    baseUrl = 'https://arabshentai.net'
+    extVersionCode = 35
+    overrideVersionCode = 35
+    baseUrl = 'https://arabshentai.com'
     isNsfw = true
 }
 
@@ -13,6 +13,7 @@ apply plugin: "kei.plugins.extension.legacy"
 dependencies {
     implementation(project(':lib:playlistutils'))
     implementation(project(':lib:doodextractor'))
+    implementation(project(':lib:vidhideextractor'))
     implementation(project(':lib:mixdropextractor'))
     implementation(project(':lib:streamwishextractor'))
     implementation(project(':lib:streamtapeextractor'))
