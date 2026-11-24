@@ -2,8 +2,8 @@ ext {
     extName = 'ArabsHentai'
     extClass = '.ArabsHentai'
     themePkg = 'dooplay'
-    extVersionCode = 36
-    overrideVersionCode = 36
+    extVersionCode = 37
+    overrideVersionCode = 37
     baseUrl = 'https://arabshentai.com'
     isNsfw = true
 }

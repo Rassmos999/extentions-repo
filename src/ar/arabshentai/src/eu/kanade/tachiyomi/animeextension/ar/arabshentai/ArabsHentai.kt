@@ -29,6 +29,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -524,8 +525,14 @@ class ArabsHentai :
 
     private fun extractEmbedUrlFromAjaxBody(body: String): String? {
         if (body.isBlank()) return null
-        val match = EMBED_URL_JSON_REGEX.find(body)?.groupValues?.getOrNull(1)
-        val raw = (match ?: body)
+        val jsonEmbed = runCatching { JSONObject(body).optString("embed_url") }.getOrNull()
+            ?.takeIf(String::isNotBlank)
+        val raw = (
+            jsonEmbed
+                ?: EMBED_URL_JSON_REGEX.find(body)?.groupValues?.getOrNull(1)
+                ?: body
+            )
+            .replace("\\u0026", "&")
             .replace("\\/", "/")
             .replace("\\\"", "\"")
             .replace("&amp;", "&")

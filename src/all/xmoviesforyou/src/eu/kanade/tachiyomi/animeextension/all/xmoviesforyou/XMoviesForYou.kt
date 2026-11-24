@@ -27,6 +27,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -424,7 +425,12 @@ class XMoviesForYou :
             }.getOrNull() ?: return null
             val (code, body) = codeAndBody
             if (code == 200 && body.isNotBlank()) {
-                return STREAM_URL_JSON_REGEX.find(body)?.groupValues?.get(1)?.replace("\\/", "/")
+                val parsedUrl = runCatching { JSONObject(body).optString("url") }.getOrNull()
+                    ?.takeIf(String::isNotBlank)
+                    ?: STREAM_URL_JSON_REGEX.find(body)?.groupValues?.get(1)
+                        ?.replace("\\u0026", "&")
+                        ?.replace("\\/", "/")
+                return parsedUrl
             }
             if (code == 429 && attempt == 0) {
                 runCatching { Thread.sleep(600L) }
