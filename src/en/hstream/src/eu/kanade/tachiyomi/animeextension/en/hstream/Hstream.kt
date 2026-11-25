@@ -178,10 +178,13 @@ class Hstream :
         val doc = response.asJsoup()
 
         val token = client.cookieJar.loadForRequest(response.request.url)
-            .first { it.name.equals("XSRF-TOKEN") }
-            .value
+            .firstOrNull { it.name.equals("XSRF-TOKEN", ignoreCase = true) }
+            ?.value
+            ?: throw java.io.IOException("Missing XSRF-TOKEN cookie on Hstream. Open the page in WebView once and retry.")
 
-        val episodeId = doc.selectFirst("input#e_id")!!.attr("value")
+        val episodeId = doc.selectFirst("input#e_id")?.attr("value")
+            ?.takeIf(String::isNotBlank)
+            ?: throw java.io.IOException("Episode ID not found on Hstream.")
 
         val newHeaders = headersBuilder().apply {
             set("Referer", doc.location())
@@ -194,14 +197,31 @@ class Hstream :
         val data = client.newCall(POST("$baseUrl/player/api", newHeaders, body)).execute()
             .parseAs<PlayerApiResponse>()
 
+        val streamHeaders = headersBuilder()
+            .set("Referer", "$baseUrl/")
+            .set("Origin", baseUrl)
+            .build()
+
         val urlBase = data.stream_domains.random() + "/" + data.stream_url
         val subtitleList = listOf(Track("$urlBase/eng.ass", "English"))
 
+        val videos = mutableListOf<Video>()
         val resolutions = listOfNotNull("720", "1080", if (data.resolution == "4k") "2160" else null)
-        return resolutions.map { resolution ->
+        resolutions.forEach { resolution ->
             val url = urlBase + getVideoUrlPath(data.legacy != 0, resolution)
-            Video(url, "${resolution}p", url, subtitleTracks = subtitleList)
+            videos += Video(url, "${resolution}p", url, headers = streamHeaders, subtitleTracks = subtitleList)
         }
+        if (data.legacy == 0) {
+            if (data.interpolated == 1) {
+                val u1080i = "$urlBase/1080i/manifest.mpd"
+                videos += Video(u1080i, "1080p (48fps)", u1080i, headers = streamHeaders, subtitleTracks = subtitleList)
+            }
+            if (data.interpolated_uhd == 1) {
+                val u2160i = "$urlBase/2160i/manifest.mpd"
+                videos += Video(u2160i, "2160p (48fps)", u2160i, headers = streamHeaders, subtitleTracks = subtitleList)
+            }
+        }
+        return videos
     }
 
     private fun getVideoUrlPath(isLegacy: Boolean, resolution: String): String = if (isLegacy) {
@@ -220,6 +240,8 @@ class Hstream :
         val resolution: String = "4k",
         val stream_url: String,
         val stream_domains: List<String>,
+        val interpolated: Int = 0,
+        val interpolated_uhd: Int = 0,
     )
 
     override fun videoListSelector(): String = throw UnsupportedOperationException()

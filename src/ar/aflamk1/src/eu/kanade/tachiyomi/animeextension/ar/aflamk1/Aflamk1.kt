@@ -1,6 +1,8 @@
 package eu.kanade.tachiyomi.animeextension.ar.aflamk1
 
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -338,8 +340,21 @@ class Aflamk1 :
         if (videos.isEmpty()) {
             throw IOException("No playable streams found (flashvars missing or private video)")
         }
-        return videos
+        return if (preferences.getBoolean("pref_seek_cache", true)) {
+            m3u8Server.wrapVideosForCache(
+                videos = videos,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = videoHeaders["Referer"] ?: "$baseUrl/",
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            videos
+        }
     }
+
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
 
     override fun videoListSelector() = throw UnsupportedOperationException()
 
@@ -404,6 +419,12 @@ class Aflamk1 :
             default = PREF_QUALITY_DEFAULT,
             summary = "%s",
         )
+        SwitchPreferenceCompat(screen.context).apply {
+            key = "pref_seek_cache"
+            title = "تفعيل كاش التقديم والترجيع (Local Seek Cache)"
+            summary = "تخزين مقاطع الفيديو مؤقتاً لمدة 20 دقيقة لتسريع التقديم والرجوع لنفس النقطة."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
     }
 
     // =============================== Helpers ==============================

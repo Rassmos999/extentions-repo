@@ -1,9 +1,13 @@
 ext {
     extName = 'ArabXN'
     extClass = '.ArabXN'
-    extVersionCode = 18
-    overrideVersionCode = 16
+    extVersionCode = 19
+    overrideVersionCode = 19
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+dependencies {
+    implementation(project(':lib:m3u8server'))
+}

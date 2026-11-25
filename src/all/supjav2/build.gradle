@@ -1,11 +1,12 @@
 ext {
     extName = 'SupJav 2'
     extClass = '.SupJav2Factory'
-    extVersionCode = 29
+    extVersionCode = 30
     isNsfw = true
 }
 apply plugin: "kei.plugins.extension.legacy"
 dependencies {
+    implementation(project(":lib:m3u8server"))
     implementation(project(":lib:doodextractor"))
     implementation(project(":lib:mixdropextractor"))
     implementation(project(":lib:streamtapeextractor"))

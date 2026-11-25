@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.all.javdb
 
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -96,6 +97,7 @@ class JavDB :
     private val missAvUrl get() = preferences.getString(PREF_MISSAV_KEY, PREF_MISSAV_DEFAULT)!!
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
 
     // ============================== Popular ===============================
     override fun popularAnimeRequest(page: Int): Request {
@@ -310,7 +312,19 @@ class JavDB :
         if (streams.isEmpty() && magnets.isEmpty()) {
             throw Exception("No stream found for $code. Enable magnet links in the extension settings to use torrents.")
         }
-        return streams.sort() + magnets
+        val cachedStreams = if (preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)) {
+            m3u8Server.wrapVideosForCache(
+                videos = streams.sort(),
+                cacheHls = true,
+                cacheMp4 = false,
+                defaultReferer = "$STREAM_MIRROR_DEFAULT/",
+                defaultOrigin = STREAM_MIRROR_DEFAULT,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            streams.sort()
+        }
+        return cachedStreams + magnets
     }
 
     /** MissAV page slugs for a JavDB code: the plain release plus its leak / Chinese-subtitle uploads. */
@@ -455,6 +469,12 @@ class JavDB :
             entries = listOf("1080p", "720p", "480p", "360p"),
             entryValues = listOf("1080", "720", "480", "360"),
         )
+        screen.addSwitchPreference(
+            key = PREF_SEEK_CACHE_KEY,
+            default = true,
+            title = "Enable local seek/skip cache",
+            summary = "Caches watched HLS segments locally (20 min TTL) and prefetches ahead for faster skip/rewind.",
+        )
     }
 
     companion object {
@@ -502,6 +522,7 @@ class JavDB :
         private const val PREF_MAGNETS_DEFAULT = true
         private const val PREF_QUALITY_KEY = "pref_quality"
         private const val PREF_QUALITY_DEFAULT = "1080"
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
     }
 }
 

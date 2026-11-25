@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.en.hanime
 import android.text.InputType
 import android.util.Log
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
@@ -81,6 +82,7 @@ class Hanime :
     private var authCookie: String? = null
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
 
     private val preferences by getPreferencesLazy()
 
@@ -583,13 +585,12 @@ class Hanime :
             return emptyList()
         }
 
-        return playable.parallelFlatMap { source ->
+        val extracted = playable.parallelFlatMap { source ->
             val streamUrl = resolveStreamUrl(source.src)
             val qualityLabel = source.label?.takeIf { it.isNotBlank() }
                 ?: source.height?.let { "${it}p" }
                 ?: "Video"
             try {
-                // Prefer expanding multi-variant masters; media playlists yield a single quality.
                 playlistUtils.extractFromHls(
                     playlistUrl = streamUrl,
                     masterHeaders = playerHeaders,
@@ -606,6 +607,18 @@ class Hanime :
                 )
                 listOf(Video(streamUrl, qualityLabel, streamUrl, headers = playerHeaders))
             }
+        }
+        return if (preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)) {
+            m3u8Server.wrapVideosForCache(
+                videos = extracted,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = "https://player.hanime.tv/",
+                defaultOrigin = "https://player.hanime.tv",
+                defaultUserAgent = playerHeaders["User-Agent"],
+            )
+        } else {
+            extracted
         }
     }
 
@@ -1021,6 +1034,7 @@ class Hanime :
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
         private const val PREF_QUALITY_DEFAULT = "1080p"
         private val QUALITY_LIST = arrayOf("1080p", "720p", "480p", "360p")
 
@@ -1144,6 +1158,13 @@ class Hanime :
             entryValues = EP_TITLE_FORMAT_LIST,
             default = PREF_EP_TITLE_FORMAT_DEFAULT,
             summary = "%s",
+        )
+
+        screen.addSwitchPreference(
+            key = PREF_SEEK_CACHE_KEY,
+            title = "Enable local seek/skip cache",
+            summary = "Caches watched HLS segments locally (20 min TTL) and prefetches ahead for faster skip/rewind.",
+            default = true,
         )
     }
 }

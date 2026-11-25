@@ -1,6 +1,9 @@
 package eu.kanade.tachiyomi.animeextension.ar.nxxhentai
 
+import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.doodextractor.DoodExtractor
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
@@ -82,7 +85,25 @@ class NxxHentai :
     private val playlistUtils by lazy { PlaylistUtils(fastExtractorClient, headers) }
     private val doodExtractor by lazy { DoodExtractor(fastExtractorClient) }
     private val mixDropExtractor by lazy { MixDropExtractor(fastExtractorClient) }
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
     private val streamWishExtractor by lazy { StreamWishExtractor(fastExtractorClient, headers) }
+
+    private fun proxyTransform(m3u8Url: String, referer: String, origin: String): String = m3u8Server.processM3u8Url(
+        m3u8Url = m3u8Url,
+        referer = referer,
+        userAgent = headers["User-Agent"],
+        origin = origin,
+    ) ?: m3u8Url
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        super.setupPreferenceScreen(screen)
+        SwitchPreferenceCompat(screen.context).apply {
+            key = "pref_seek_cache"
+            title = "تفعيل كاش التقديم والترجيع (Local Seek Cache)"
+            summary = "تخزين مقاطع الفيديو مؤقتاً لمدة 20 دقيقة لتسريع التقديم والرجوع لنفس النقطة."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
+    }
     private val streamTapeExtractor by lazy { StreamTapeExtractor(fastExtractorClient) }
     private val voeExtractor by lazy { VoeExtractor(fastExtractorClient, headers) }
     private val uqloadExtractor by lazy { UqloadExtractor(fastExtractorClient) }
@@ -514,7 +535,18 @@ class NxxHentai :
                     "Open WebView on this episode URL, wait for the page, then retry Start.",
             )
         }
-        return distinct
+        return if (preferences.getBoolean("pref_seek_cache", true)) {
+            m3u8Server.wrapVideosForCache(
+                videos = distinct,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = "$baseUrl/",
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            distinct
+        }
     }
 
     private fun runTasksInParallel(jobs: List<() -> List<Video>>): List<Video> {
@@ -705,7 +737,7 @@ class NxxHentai :
                 mixDropExtractor.videoFromUrl(clean, lang = label)
 
             STREAMWISH.any { it in lower } ->
-                streamWishExtractor.videosFromUrl(clean, label)
+                streamWishExtractor.videosFromUrl(clean, { q -> "$label - $q" }, ::proxyTransform)
 
             lower.contains("streamtape") || lower.contains("streamta.pe") ->
                 streamTapeExtractor.videoFromUrl(clean, quality = label)?.let(::listOf).orEmpty()

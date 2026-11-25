@@ -3,6 +3,8 @@ package eu.kanade.tachiyomi.animeextension.ar.hentaiaraby
 import android.content.SharedPreferences
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
@@ -64,6 +66,7 @@ class HentaiAraby :
     }
 
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
 
     private val detailCache = ConcurrentHashMap<String, Pair<Long, VideoDetailDto>>()
 
@@ -435,7 +438,18 @@ class HentaiAraby :
         if (distinct.isEmpty()) {
             throw IOException("لم يتم العثور على رابط تشغيل صالح لهذا الفيديو على HentaiAraby.")
         }
-        return distinct
+        return if (preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)) {
+            m3u8Server.wrapVideosForCache(
+                videos = distinct,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = "$baseUrl/",
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            distinct
+        }
     }
 
     private fun resolveMp4Url(detail: VideoDetailDto): String? {
@@ -511,6 +525,13 @@ class HentaiAraby :
             entryValues = arrayOf("HLS", "Direct MP4")
             setDefaultValue(PREF_TYPE_DEFAULT)
             summary = "%s"
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SEEK_CACHE_KEY
+            title = "تفعيل كاش التقديم والترجيع (Local Seek Cache)"
+            summary = "تخزين مقاطع الفيديو مؤقتاً لمدة 20 دقيقة لتسريع التقديم والرجوع لنفس النقطة."
+            setDefaultValue(true)
         }.also(screen::addPreference)
     }
 
@@ -602,6 +623,7 @@ class HentaiAraby :
         private const val PREF_QUALITY_DEFAULT = "1080"
         private const val PREF_TYPE_KEY = "preferred_stream_type"
         private const val PREF_TYPE_DEFAULT = "HLS"
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
 
         private val RENDITIONS_SUFFIX = Regex("""/renditions/?$""", RegexOption.IGNORE_CASE)
         private val QUALITY_REGEX = Regex("""(?i)(2160|1440|1080|720|480|360|240)p""")

@@ -1,6 +1,8 @@
 package eu.kanade.tachiyomi.animeextension.ar.arabx
 
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -321,8 +323,22 @@ class ArabX :
         if (videos.isEmpty()) {
             videos += extractDirectStreams(pageHtml, pageUrl, labelPrefix = "Direct")
         }
-        return videos.distinctBy { it.videoUrl ?: it.url }
+        val distinct = videos.distinctBy { it.videoUrl ?: it.url }
+        return if (preferences.getBoolean("pref_seek_cache", true)) {
+            m3u8Server.wrapVideosForCache(
+                videos = distinct,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = safeReferer(pageUrl),
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            distinct
+        }
     }
+
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
 
     private fun extractHostersInParallel(iframes: List<String>, pageUrl: String): List<Video> {
         if (iframes.size == 1) return runCatching { videosFromHoster(iframes[0], pageUrl) }.getOrDefault(emptyList())
@@ -645,6 +661,12 @@ class ArabX :
             default = PREF_QUALITY_DEFAULT,
             summary = "%s",
         )
+        SwitchPreferenceCompat(screen.context).apply {
+            key = "pref_seek_cache"
+            title = "تفعيل كاش التقديم والترجيع (Local Seek Cache)"
+            summary = "تخزين مقاطع الفيديو مؤقتاً لمدة 20 دقيقة لتسريع التقديم والرجوع لنفس النقطة."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
     }
 
     // =============================== Helpers ==============================

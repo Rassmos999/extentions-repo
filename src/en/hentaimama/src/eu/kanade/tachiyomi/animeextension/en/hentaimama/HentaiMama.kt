@@ -2,6 +2,8 @@ package eu.kanade.tachiyomi.animeextension.en.hentaimama
 
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
@@ -16,6 +18,7 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parallelCatchingFlatMapBlocking
 import okhttp3.FormBody
 import okhttp3.Headers
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
@@ -24,6 +27,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.parser.Parser
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 class HentaiMama :
     ParsedAnimeHttpSource(),
@@ -103,7 +107,17 @@ class HentaiMama :
 
     // Video Extractor
 
-    private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+    private val fastClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .connectTimeout(7, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .writeTimeout(7, TimeUnit.SECONDS)
+            .callTimeout(15, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
+    private val playlistUtils by lazy { PlaylistUtils(fastClient, headers) }
 
     override fun videoListParse(response: Response): List<Video> {
         val html = response.body.string()
@@ -119,8 +133,9 @@ class HentaiMama :
         val newHeaders = Headers.headersOf("referer", "$baseUrl/")
 
         // Returns a JSON array of <iframe> HTML strings, one per mirror.
-        val players = client.newCall(POST("$baseUrl/wp-admin/admin-ajax.php", newHeaders, body))
-            .execute().body.string()
+        val players = fastClient.newCall(POST("$baseUrl/wp-admin/admin-ajax.php", newHeaders, body))
+            .execute().use { it.body.string() }
+            .replace("\\u0026", "&")
             .replace("\\/", "/")
             .replace("\\\"", "\"")
         val urls = IFRAME_SRC_REGEX.findAll(players)
@@ -128,7 +143,7 @@ class HentaiMama :
             .distinct()
             .toList()
 
-        return urls.parallelCatchingFlatMapBlocking { url ->
+        val extracted = urls.parallelCatchingFlatMapBlocking { url ->
             val mirror = when {
                 url.contains("newjav.php") -> "Mirror 1"
                 url.contains("dt_embed=hls-mp4") -> "Mirror 2"
@@ -137,7 +152,9 @@ class HentaiMama :
                 url.contains("dt_embed=rtmp") -> "Beta"
                 else -> "Default"
             }
-            val page = client.newCall(GET(url, newHeaders)).execute().body.string().replace("\\/", "/")
+            val page = fastClient.newCall(GET(url, newHeaders)).execute().use { it.body.string() }
+                .replace("\\u0026", "&")
+                .replace("\\/", "/")
 
             STREAM_URL_REGEX.findAll(page).map { it.value }.distinct().flatMap { videoUrl ->
                 if (videoUrl.contains(".m3u8")) {
@@ -147,6 +164,20 @@ class HentaiMama :
                     listOf(Video(videoUrl, if (quality != null) "$mirror - $quality" else mirror, videoUrl, headers))
                 }
             }.toList()
+        }.distinctBy { it.videoUrl ?: it.url }
+
+        val useSeekCache = preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)
+        return if (useSeekCache) {
+            m3u8Server.wrapVideosForCache(
+                videos = extracted,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = "$baseUrl/",
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            extracted
         }
     }
 
@@ -244,6 +275,13 @@ class HentaiMama :
             }
         }
         screen.addPreference(videoQualityPref)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SEEK_CACHE_KEY
+            title = "Enable local seek/skip cache"
+            summary = "Caches watched HLS segments and MP4 blocks locally (20 min TTL) for instant skip/rewind."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
     }
 
     // Filters
@@ -356,6 +394,10 @@ class HentaiMama :
     internal class Year(val id: String) : AnimeFilter.CheckBox(id)
     private class YearList(years: List<Year>) : AnimeFilter.Group<Year>("Year", years)
     private fun getYears() = listOf(
+        Year("2026"),
+        Year("2025"),
+        Year("2024"),
+        Year("2023"),
         Year("2022"),
         Year("2021"),
         Year("2020"),
@@ -591,6 +633,7 @@ class HentaiMama :
     companion object {
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_TITLE = "Preferred video quality"
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
         private val PREF_QUALITY_ENTRIES = arrayOf("Mirror 1", "Mirror 2", "Mirror 3", "HLS", "Beta")
 
         private const val NEXT_PAGE_SELECTOR = "a.dt-pg-next, div.pagination-wraper div.resppages a, link[rel=next]"

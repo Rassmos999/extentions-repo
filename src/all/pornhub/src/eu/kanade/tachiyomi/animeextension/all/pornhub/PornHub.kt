@@ -1,6 +1,8 @@
 package eu.kanade.tachiyomi.animeextension.all.pornhub
 
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -297,7 +299,7 @@ class PornHub :
         if (videos.isEmpty()) {
             throw Exception("No playable video streams found for this video.")
         }
-        videos
+        wrapWithSeekCache(videos)
     }
 
     override fun videoListRequest(episode: SEpisode): Request {
@@ -335,7 +337,22 @@ class PornHub :
         if (videos.isEmpty()) {
             throw Exception("No playable video streams found for this video.")
         }
-        return videos
+        return wrapWithSeekCache(videos)
+    }
+
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
+
+    private fun wrapWithSeekCache(videos: List<Video>): List<Video> = if (preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)) {
+        m3u8Server.wrapVideosForCache(
+            videos = videos,
+            cacheHls = true,
+            cacheMp4 = true,
+            defaultReferer = "$baseUrl/",
+            defaultOrigin = baseUrl,
+            defaultUserAgent = headers["User-Agent"],
+        )
+    } else {
+        videos
     }
 
     // ============================== Filters ===============================
@@ -361,6 +378,12 @@ class PornHub :
             default = PREF_QUALITY_DEFAULT,
             summary = "%s",
         )
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SEEK_CACHE_KEY
+            title = "Enable local seek/skip cache"
+            summary = "Caches watched HLS segments and MP4 blocks locally (20 min TTL) for instant skip/rewind."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
     }
 
     // ============================== Parsers ===============================
@@ -731,6 +754,7 @@ class PornHub :
         )
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
         private const val PREF_QUALITY_TITLE = "Preferred quality"
         private const val PREF_QUALITY_DEFAULT = "720p"
         private val PREF_QUALITY_ENTRIES = listOf("1080p", "720p", "480p", "240p")

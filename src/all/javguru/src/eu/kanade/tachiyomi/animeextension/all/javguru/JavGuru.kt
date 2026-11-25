@@ -2,12 +2,15 @@ package eu.kanade.tachiyomi.animeextension.all.javguru
 
 import android.util.Base64
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.javcoverfetcher.JavCoverFetcher
 import aniyomi.lib.javcoverfetcher.JavCoverFetcher.fetchHDCovers
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
+import aniyomi.lib.vidhideextractor.VidHideExtractor
 import aniyomi.lib.voeextractor.VoeExtractor
 import eu.kanade.tachiyomi.animeextension.all.javguru.extractors.EmTurboExtractor
 import eu.kanade.tachiyomi.animeextension.all.javguru.extractors.MaxStreamExtractor
@@ -41,6 +44,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
 class JavGuru :
@@ -349,9 +353,24 @@ class JavGuru :
             .map { String(Base64.decode(it, Base64.DEFAULT)) }
             .toList()
 
-        return iframeUrls
+        val extracted = iframeUrls
             .parallelMapNotNullBlocking(::resolveHosterUrl)
             .parallelCatchingFlatMapBlocking(::getVideos)
+            .distinctBy { it.videoUrl ?: it.url }
+
+        val useSeekCache = preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)
+        return if (useSeekCache) {
+            m3u8Server.wrapVideosForCache(
+                videos = extracted,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = "$baseUrl/",
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            extracted
+        }
     }
 
     private suspend fun resolveHosterUrl(iframeUrl: String): String? = runCatching {
@@ -397,41 +416,54 @@ class JavGuru :
         return redirectUrl
     }.getOrNull()
 
+    private val fastExtractorClient by lazy {
+        client.newBuilder()
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .writeTimeout(6, TimeUnit.SECONDS)
+            .callTimeout(14, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
+
+    private fun proxyTransform(m3u8Url: String, referer: String, origin: String): String = m3u8Server.processM3u8Url(
+        m3u8Url = m3u8Url,
+        referer = referer,
+        userAgent = headers["User-Agent"],
+        origin = origin,
+    ) ?: m3u8Url
+
     private val streamWishExtractor by lazy {
         val swHeaders = headersBuilder()
             .set("Referer", "$baseUrl/")
             .build()
 
-        StreamWishExtractor(client, swHeaders)
+        StreamWishExtractor(fastExtractorClient, swHeaders)
     }
-    private val streamTapeExtractor by lazy { StreamTapeExtractor(client) }
-    private val doodExtractor by lazy { DoodExtractor(client) }
-    private val mixDropExtractor by lazy { MixDropExtractor(client) }
-    private val maxStreamExtractor by lazy { MaxStreamExtractor(client, headers) }
-    private val emTurboExtractor by lazy { EmTurboExtractor(client, headers) }
-    private val voeExtractor by lazy { VoeExtractor(client, headers) }
+    private val vidHideExtractor by lazy {
+        val vhHeaders = headersBuilder()
+            .set("Referer", "$baseUrl/")
+            .build()
+        VidHideExtractor(fastExtractorClient, vhHeaders)
+    }
+    private val streamTapeExtractor by lazy { StreamTapeExtractor(fastExtractorClient) }
+    private val doodExtractor by lazy { DoodExtractor(fastExtractorClient) }
+    private val mixDropExtractor by lazy { MixDropExtractor(fastExtractorClient) }
+    private val maxStreamExtractor by lazy { MaxStreamExtractor(fastExtractorClient, headers) }
+    private val emTurboExtractor by lazy { EmTurboExtractor(fastExtractorClient, headers) }
+    private val voeExtractor by lazy { VoeExtractor(fastExtractorClient, headers) }
 
     private suspend fun getVideos(hosterUrl: String): List<Video> = when {
-        listOf("javplaya", "javclan").any { it in hosterUrl } -> {
-            val direct = extractPackedM3u8(hosterUrl, prefix = "StreamWish")
-            if (direct.isNotEmpty()) {
-                direct
-            } else {
-                streamWishExtractor.videosFromUrl(hosterUrl).map { video ->
-                    val newHeaders = (video.headers ?: headers).newBuilder()
-                        .set("Referer", "$baseUrl/")
-                        .set("Origin", baseUrl)
-                        .build()
-                    Video(
-                        url = video.url,
-                        quality = video.quality,
-                        videoUrl = video.videoUrl,
-                        headers = newHeaders,
-                        subtitleTracks = video.subtitleTracks,
-                        audioTracks = video.audioTracks,
-                    )
-                }
-            }
+        listOf("javplaya", "javclan", "streamwish", "wishembed", "niramirus").any { it in hosterUrl } -> {
+            streamWishExtractor.videosFromUrl(hosterUrl, { "StreamWish - $it" }, ::proxyTransform)
+                .ifEmpty { vidHideExtractor.videosFromUrl(hosterUrl, { "StreamWish - $it" }, ::proxyTransform) }
+                .ifEmpty { extractPackedM3u8(hosterUrl, prefix = "StreamWish") }
+        }
+
+        listOf("vidhide", "earnvids", "morencius", "streamhg").any { it in hosterUrl } -> {
+            vidHideExtractor.videosFromUrl(hosterUrl, { "VidHide - $it" }, ::proxyTransform)
+                .ifEmpty { extractPackedM3u8(hosterUrl, prefix = "VidHide") }
         }
 
         hosterUrl.contains("streamtape") -> {
@@ -537,16 +569,19 @@ class JavGuru :
     }
 
     private fun extractPackedM3u8FromBody(embedUrl: String, rawBody: String, prefix: String = "HLS"): List<Video> {
-        val unpacked = unpackPackedJs(rawBody).ifBlank { rawBody }.replace("\\/", "/")
-        val m3u8Url = M3U8_URL_REGEX.find(unpacked)?.value ?: return emptyList()
-        val origin = embedUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" }
-        val videoHeaders = headersBuilder().apply {
-            if (origin != null) {
-                set("Referer", "$origin/")
-                set("Origin", origin)
-            }
-        }.build()
-        return listOf(Video(m3u8Url, prefix, m3u8Url, videoHeaders))
+        val unpacked = unpackPackedJs(rawBody).ifBlank { rawBody }
+            .replace("\\u0026", "&")
+            .replace("\\/", "/")
+        val parsed = embedUrl.toHttpUrlOrNull()
+        val origin = parsed?.let { "${it.scheme}://${it.host}" } ?: baseUrl
+        val referer = "$origin/"
+
+        val rawCandidate = HLS4_REGEX.find(unpacked)?.groupValues?.getOrNull(1)
+            ?: M3U8_URL_REGEX.find(unpacked)?.value
+            ?: return emptyList()
+        val m3u8Url = if (rawCandidate.startsWith("http")) rawCandidate else parsed?.resolve(rawCandidate)?.toString() ?: return emptyList()
+        val localUrl = proxyTransform(m3u8Url, referer, origin)
+        return listOf(Video(localUrl, prefix, localUrl))
     }
 
     private fun unpackPackedJs(html: String): String {
@@ -624,6 +659,13 @@ class JavGuru :
         )
 
         JavCoverFetcher.addPreferenceToScreen(screen)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SEEK_CACHE_KEY
+            title = "Enable local seek/skip cache"
+            summary = "Caches watched segments locally (20 min TTL) and prefetches ahead for faster skip/rewind."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
     }
 
     companion object {
@@ -637,6 +679,8 @@ class JavGuru :
         private val PAGINATION_REGEX = Regex("""/page/(\d+)""")
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val M3U8_URL_REGEX = Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""")
+        private val HLS4_REGEX = Regex("""["']hls4["']\s*:\s*["']([^"']+)["']""")
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
         private val PACKED_JS_REGEX = Regex("""eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)""", RegexOption.DOT_MATCHES_ALL)
         private val WORD_REGEX = Regex("""\b\w+\b""")
 

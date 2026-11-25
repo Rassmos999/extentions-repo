@@ -201,8 +201,15 @@ class PTorrent :
         }
     }
 
+    @Volatile
+    private var cachedTrackers: Pair<Long, String>? = null
+
     private fun fetchTrackers(): String {
-        return try {
+        val now = System.currentTimeMillis()
+        cachedTrackers?.let { (ts, list) ->
+            if (now - ts < 60L * 60L * 1000L) return list
+        }
+        val fetched = try {
             val request = Request.Builder()
                 .url("https://raw.githubusercontent.com/ngosang/trackerslist/refs/heads/master/trackers_all_http.txt")
                 .build()
@@ -214,6 +221,8 @@ class PTorrent :
         } catch (_: Exception) {
             DEFAULT_TRACKERS
         }
+        cachedTrackers = now to fetched
+        return fetched
     }
 
     override fun episodeFromElement(element: Element) = throw Exception("Not used")

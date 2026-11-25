@@ -55,20 +55,20 @@ Repository structure and usage-based partitioning for the **110 published extens
 ### Group A4 — Adult / JAV +18 (14)
 | Extension | Package Suffix | Usage / Type | Current Status |
 |---|---|---|---|
-| `jable` | `all.jable` | JAV HLS streaming | **Fixed & Rebuilt** (`v14.15`, `156cfd5`: `/categories/*` + seeded tags, single `sort_by`, headers, HLS `PlaylistUtils` + `Referer`, live-verified) |
-| `javdb` | `all.javdb` | JAV index + MissAV HLS + magnets (`isTorrent = true`) | **Fixed & Rebuilt** (`v14.2`, `3b51b4a`: `missav.live` default + MissAV `Referer` fixing `surrit.com` 403, `isTorrent = true` verified) |
-| `javgg` | `all.javgg` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.31`, `9d2e370`) |
-| `javguru` | `all.javguru` | JAV multi-embed + Actress catalog | **Fixed & Rebuilt** (`v14.56`, `9d2e370`) |
-| `missav` | `all.missav` | JAV HLS streaming | **Fixed & Rebuilt** (`v14.78`, `3b51b4a`: `missav.live` default + site `Origin`/`Referer` fixing `surrit.com` 403, top categories, pagination, `VER_DRIFT` resolved) |
-| `myreadingmanga` | `all.myreadingmanga` | Bara/Yaoi video/gallery scraper (multi-lang factory) | **Fixed & Rebuilt** (`v14.3`, `156cfd5`: merged CookieJar + WebView cookies + `Referer`/`Origin` headers, `cacheAssistant` retry guard; CF Turnstile gated) |
-| `pornhub` | `all.pornhub` | Adult tube (HLS / MP4) | **Fixed & Rebuilt** (`v14.64`, `3b51b4a`: search `o=ht`/`cm` 404 fix, 99 live categories, `videoHeaders` cookies) |
-| `rouvideo` | `all.rouvideo` | Asian adult (TanStack Start + PNG-HLS proxy) | **Fixed & Rebuilt** (`v14.26`, `9d2e370`: `/home` parsing + `m3u8server` PNG-HLS proxy) |
-| `sextb` | `all.sextb` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.17`, `9d2e370`) |
-| `supjav` | `all.supjav` | JAV multi-embed streaming (CF protected) | **Fixed & Rebuilt** (`v14.100`, `156cfd5`: `supportsLatest`, pagination, synchronous extractors + `TV`/`DOOD`/`MIXDROP`/`UQLOAD`/`FST`/`EVS`/`LUC`/`VAS` + filters; CF Turnstile gated) |
-| `supjav2` | `all.supjav2` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.29`, `156cfd5`: wired `uqloadExtractor`, `DOOD` mirrors, `StreamWishExtractor`/`VidHideExtractor` fallbacks, multi-variant HLS, removed dead suspend block; CF Turnstile gated) |
-| `xmoviesforyou` | `all.xmoviesforyou` | Adult movies (direct HLS + mirrors) | **Added & Built** (`v14.2`, `/api/stream` HLS proxied via `m3u8Server` with `Origin`+`Referer` fixing `eternalslumber.online` 403, Dood/StreamTape/MixDrop mirrors, live-verified) |
-| `xnxx` | `all.xnxx` | Adult tube | **Fixed & Rebuilt** (`v14.22`, `3b51b4a`: dynamic `/todays-selection/` archive date pagination + next-page selectors) |
-| `xvideos` | `all.xvideos` | Adult tube | **Fixed & Rebuilt** (`v14.23`, `3b51b4a`: next-page selectors + category/tag + filter search routing) |
+| `jable` | `all.jable` | JAV HLS streaming | **Upgraded & Rebuilt** (`v14.16`: `:lib:m3u8server` hybrid seek-cache + lookahead prefetch toggle) |
+| `javdb` | `all.javdb` | JAV index + MissAV HLS + magnets (`isTorrent = true`) | **Upgraded & Rebuilt** (`v14.3`: `:lib:m3u8server` hybrid seek-cache + lookahead prefetch on MissAV HLS streams) |
+| `javgg` | `all.javgg` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.32`: `hls4` via `m3u8Server` for EarnVids/StreamHG/StreamWish, F4 `/v/...` proxy preference, parallel extraction with early cutoff, 3-min `pageCache`, multi-select Tags/Genres, seek-cache) |
+| `javguru` | `all.javguru` | JAV multi-embed + Actress catalog | **Fixed & Rebuilt** (`v14.57`: `hls4` + `m3u8Server` for StreamWish/VidHide/EarnVids, `fastExtractorClient`, hybrid seek-cache) |
+| `missav` | `all.missav` | JAV HLS streaming | **Upgraded & Rebuilt** (`v14.79`: `:lib:m3u8server` hybrid seek-cache + `Origin`/`Referer`/`Cookie` forwarding + lookahead prefetch) |
+| `myreadingmanga` | `all.myreadingmanga` | Bara/Yaoi video/gallery scraper (multi-lang factory) | **Fixed & Rebuilt** (`v14.3`, `156cfd5`: CF Turnstile gated) |
+| `pornhub` | `all.pornhub` | Adult tube (HLS / MP4) | **Upgraded & Rebuilt** (`v14.69`: `:lib:m3u8server` HLS + `/media` MP4 512 KB byte-range seek-cache) |
+| `rouvideo` | `all.rouvideo` | Asian adult (TanStack Start + PNG-HLS proxy) | **Rebuilt** (`v14.27`: inherits upgraded `:lib:m3u8server` hybrid RAM+Disk LRU cache & lookahead prefetch) |
+| `sextb` | `all.sextb` | JAV multi-embed streaming | **Rebuilt** (`v14.19`: inherits upgraded `:lib:m3u8server` hybrid RAM+Disk LRU cache & lookahead prefetch) |
+| `supjav` | `all.supjav` | JAV multi-embed streaming (CF protected) | **Rebuilt** (`v14.103`: inherits upgraded `:lib:m3u8server` hybrid RAM+Disk LRU cache & lookahead prefetch) |
+| `supjav2` | `all.supjav2` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.30`: parity with `SupJav` — parallel `ExecutorCompletionService`, `hls4` + `m3u8Server`, fixed `/popular`, 3-min `pageCache`, multi-select Categories/Tags/Makers/Actresses, seek-cache) |
+| `xmoviesforyou` | `all.xmoviesforyou` | Adult movies (direct HLS + mirrors) | **Upgraded & Rebuilt** (`v14.4`: `disableRelatedAnimes`, upgraded `:lib:m3u8server` seek-cache + prefetch for direct HLS and mirrors) |
+| `xnxx` | `all.xnxx` | Adult tube | **Upgraded & Rebuilt** (`v14.23`: `:lib:m3u8server` HLS/MP4 seek-cache + lookahead prefetch) |
+| `xvideos` | `all.xvideos` | Adult tube | **Upgraded & Rebuilt** (`v14.24`: `:lib:m3u8server` HLS/MP4 seek-cache + lookahead prefetch) |
 
 ---
 
@@ -76,7 +76,7 @@ Repository structure and usage-based partitioning for the **110 published extens
 
 - **R1 — Arabic Anime (8)**: `anime4up`, `animeblkom`, `animeiat`, `animelek`, `animerco`, `arabanime`, `okanime`, `witanime`
 - **R2 — Arabic Movies & Series (7)**: `arabseed`, `asia2tv`, `cimaleek`, `cimalight`, `egydead`, `faselhd`, `tuktukcinema`
-- **R3 — Arabic Adult +18 (8)**: `aflamk1`, `arabshentai`, `arabx`, `arabxn`, `hentaiaraby`, `nxxhentai`, `sexalarab`, `sexmahali`
+- **R3 — Arabic Adult +18 (8 — All Audited & Upgraded with Seek-Cache)**: `aflamk1` (`v14.15`), `arabshentai` (`v14.40`: parallel DooPlay + `hls4`/`m3u8Server`), `arabx` (`v14.19`), `arabxn` (`v14.19`), `hentaiaraby` (`v14.3`), `nxxhentai` (`v14.38`: `hls4`/`m3u8Server`), `sexalarab` (`v14.23`), `sexmahali` (`v14.20`)
 
 ---
 
@@ -88,4 +88,4 @@ Repository structure and usage-based partitioning for the **110 published extens
   - `anikototheme`: `anikoto`, `animesogo`, `aniwave`, `kotokai`
   - `wcotheme`: `wcoanimedub`, `wcoanimesub`, `wcoforever`, `wcofun`, `wcostream`, `wcotv`
 - **E3 — English Movies, Asian Drama & Tokusatsu (15)**: `asiaflix`, `blzone`, `cineby`, `hexawatch`, `jpfilms`, `kimoitv`, `kisskh`, `mapple`, `moviesmod`, `myrunningman`, `pinoymoviepedia`, `superstream`, `tokuzilla`, `uhdmovies`, `uniquestream`
-- **E4 — English Adult +18 (6)**: `hahomoe`, `hanime`, `hentaimama`, `hstream`, `oppaistream`, `rule34video`
+- **E4 — English Adult +18 (6 — All Audited & Upgraded)**: `hahomoe` (`v14.23`: Referer + 25s timeout + `pageCache` + MP4 seek-cache), `hanime` (`v14.39`: HLS seek-cache), `hentaimama` (`v14.20`: 2023–2026 years + response closing + `\u0026` + seek-cache), `hstream` (`v14.23`: safe XSRF + headers + `1080i`/`2160i`), `oppaistream` (`v14.7`: migrated to `POST /api/search.php` + new `storageBase`/`folder`/`layout` player + seek-cache), `rule34video` (`v14.23`: fixed `/most-popular/`, fixed `tag_ids`, multi-select Categories, `pageCache`, MP4 seek-cache)

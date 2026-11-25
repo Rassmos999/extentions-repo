@@ -65,6 +65,10 @@ class XMoviesForYou :
 
     override val supportsLatest = true
 
+    override val disableRelatedAnimes = true
+
+    override val disableRelatedAnimesBySearch = true
+
     private val preferences: SharedPreferences by getPreferencesLazy()
 
     private val fastClient: OkHttpClient by lazy {
@@ -405,7 +409,14 @@ class XMoviesForYou :
         if (distinct.isEmpty()) {
             throw IOException("No playable video stream found on XMoviesForYou.")
         }
-        return distinct
+        return m3u8Server.wrapVideosForCache(
+            videos = distinct,
+            cacheHls = true,
+            cacheMp4 = true,
+            defaultReferer = "$baseUrl/",
+            defaultOrigin = baseUrl,
+            defaultUserAgent = headers["User-Agent"],
+        )
     }
 
     private fun fetchStreamApiUrl(videoId: String, target: String, referer: String): String? {

@@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.animeextension.all.missav
 
 import android.util.Log
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.javcoverfetcher.JavCoverFetcher
 import aniyomi.lib.javcoverfetcher.JavCoverFetcher.fetchHDCovers
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -309,7 +311,20 @@ class MissAV :
                     videoHeaders = hlsHeaders,
                 )
             }.getOrDefault(emptyList())
-            if (extracted.isNotEmpty()) return extracted
+            if (extracted.isNotEmpty()) {
+                return if (preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)) {
+                    m3u8Server.wrapVideosForCache(
+                        videos = extracted,
+                        cacheHls = true,
+                        cacheMp4 = false,
+                        defaultReferer = referer,
+                        defaultOrigin = origin,
+                        defaultUserAgent = docHeaders["User-Agent"],
+                    )
+                } else {
+                    extracted
+                }
+            }
         }
         return emptyList()
     }
@@ -362,7 +377,16 @@ class MissAV :
         )
 
         JavCoverFetcher.addPreferenceToScreen(screen)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SEEK_CACHE_KEY
+            title = "Enable local seek/skip cache"
+            summary = "Caches watched HLS segments locally (20 min TTL) and prefetches ahead for faster skip/rewind."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
     }
+
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
 
     override fun animeDetailsRequest(anime: SAnime): Request = GET(baseUrl + anime.url, docHeaders)
 
@@ -411,6 +435,7 @@ class MissAV :
         private val PREF_QUALITY_DEFAULT = PREF_QUALITY_VALUES[1]
 
         private const val PREF_UUID_KEY = "missav_uuid"
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
 
         private val regexWhitespace = Regex("\\s+")
         private val regexSpecialCharacters =

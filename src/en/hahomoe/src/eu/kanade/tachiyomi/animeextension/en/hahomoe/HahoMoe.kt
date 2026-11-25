@@ -2,6 +2,8 @@ package eu.kanade.tachiyomi.animeextension.en.hahomoe
 
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -11,15 +13,22 @@ import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 class HahoMoe :
     ParsedAnimeHttpSource(),
@@ -35,15 +44,26 @@ class HahoMoe :
 
     private val preferences by getPreferencesLazy()
 
+    // haho.moe detail pages can take 10-15s under load; give read timeout breathing room.
+    override val client: OkHttpClient by lazy {
+        network.cloudflareClient.newBuilder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(25, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
+    private val pageCache = ConcurrentHashMap<String, Pair<Long, String>>()
+
     init {
-        // Save the cookie that enables thumbnails in results (popular, latest, search...)
         val httpUrl = baseUrl.toHttpUrl()
         val cookie = Cookie.parse(httpUrl, "loop-view=thumb")!!
         client.cookieJar.saveFromResponse(httpUrl, listOf(cookie))
     }
 
     // ============================== Popular ===============================
-    override fun popularAnimeRequest(page: Int) = GET("$baseUrl/anime?s=vdy-d&page=$page")
+    override fun popularAnimeRequest(page: Int) = GET("$baseUrl/anime?s=vdy-d&page=$page", headers)
 
     override fun popularAnimeSelector() = "ul.anime-loop.loop > li > a"
 
@@ -76,7 +96,7 @@ class HahoMoe :
     override fun popularAnimeNextPageSelector() = "ul.pagination li.page-item a[rel=next], ul.pagination a[rel=next], a.page-link[rel=next]"
 
     // =============================== Latest ===============================
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/anime?s=rel-d&page=$page")
+    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/anime?s=rel-d&page=$page", headers)
 
     override fun latestUpdatesSelector() = popularAnimeSelector()
 
@@ -102,7 +122,7 @@ class HahoMoe :
             }
         }.let { URLEncoder.encode(it, "UTF-8") }
 
-        return GET("$baseUrl/anime?page=$page&s=$orderBy$ordering&q=$httpQuery")
+        return GET("$baseUrl/anime?page=$page&s=$orderBy$ordering&q=$httpQuery", headers)
     }
 
     override fun searchAnimeSelector() = popularAnimeSelector()
@@ -112,10 +132,16 @@ class HahoMoe :
     override fun searchAnimeNextPageSelector() = popularAnimeNextPageSelector()
 
     // =========================== Anime Details ============================
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+        val fullUrl = toAbsoluteUrl(anime.url)
+        val html = fetchPageCached(fullUrl)
+        animeDetailsParse(Jsoup.parse(html, fullUrl))
+    }
+
     override fun animeDetailsParse(document: Document) = SAnime.create().apply {
         setUrlWithoutDomain(document.location())
         thumbnail_url = document.selectFirst("img.cover-image.img-thumbnail")?.getImageUrl()
-        title = document.selectFirst("li.breadcrumb-item.active")!!.text()
+        title = document.selectFirst("li.breadcrumb-item.active, h1")?.text().orEmpty()
         genre = document.select("li.genre span.value, div.genre-tree ul > li > a").joinToString { it.text() }
         description = document.selectFirst("div.card-body")?.text()
         author = document.select("li.production span.value").joinToString { it.text() }
@@ -134,13 +160,26 @@ class HahoMoe :
 
     private fun episodeNextPageSelector() = popularAnimeNextPageSelector()
 
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
+        val fullUrl = toAbsoluteUrl(anime.url)
+        val html = fetchPageCached(fullUrl)
+        parseEpisodesFromDoc(Jsoup.parse(html, fullUrl))
+    }
+
     override fun episodeListParse(response: Response): List<SEpisode> {
-        var doc = response.asJsoup()
+        val url = response.request.url.toString()
+        val html = response.body.string()
+        cachePage(url, html)
+        return parseEpisodesFromDoc(Jsoup.parse(html, url))
+    }
+
+    private fun parseEpisodesFromDoc(initialDoc: Document): List<SEpisode> {
+        var doc = initialDoc
         return buildList {
             do {
                 if (isNotEmpty()) {
                     val url = doc.selectFirst(episodeNextPageSelector())!!.absUrl("href")
-                    doc = client.newCall(GET(url)).execute().asJsoup()
+                    doc = client.newCall(GET(url, headers)).execute().use { it.asJsoup() }
                 }
 
                 doc.select(episodeListSelector())
@@ -168,12 +207,37 @@ class HahoMoe :
     // ============================ Video Links =============================
     override fun videoListParse(response: Response): List<Video> {
         val document = response.asJsoup()
-        val iframe = document.selectFirst("iframe")!!.attr("src")
-        val newHeaders = headersBuilder().set("referer", document.location()).build()
-        val iframeResponse = client.newCall(GET(iframe, newHeaders)).execute()
-            .asJsoup()
+        val iframe = document.selectFirst("iframe[src]")?.absUrl("src")
+            ?.takeIf(String::isNotBlank)
+            ?: throw IOException("No player iframe found on haho.moe.")
+        val iframeHeaders = headersBuilder().set("Referer", document.location()).build()
+        val iframeResponse = client.newCall(GET(iframe, iframeHeaders)).execute().use { it.asJsoup() }
 
-        return iframeResponse.select(videoListSelector()).map(::videoFromElement)
+        val videoHeaders = headersBuilder()
+            .set("Referer", iframe)
+            .set("Origin", baseUrl)
+            .build()
+
+        val rawVideos = iframeResponse.select(videoListSelector()).mapNotNull { el ->
+            val src = el.attr("src").trim()
+            if (src.isBlank()) return@mapNotNull null
+            val quality = el.attr("title").ifBlank { el.attr("label").ifBlank { "Default" } }
+            Video(src, quality, src, headers = videoHeaders)
+        }
+
+        val useSeekCache = preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)
+        return if (useSeekCache) {
+            m3u8Server.wrapVideosForCache(
+                videos = rawVideos,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = iframe,
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            rawVideos
+        }
     }
 
     override fun videoListSelector() = "source"
@@ -191,17 +255,41 @@ class HahoMoe :
             entryValues = PREF_QUALITY_VALUES
             setDefaultValue(PREF_QUALITY_DEFAULT)
             summary = "%s"
+        }.also(screen::addPreference)
 
-            setOnPreferenceChangeListener { _, newValue ->
-                val selected = newValue as String
-                val index = findIndexOfValue(selected)
-                val entry = entryValues[index] as String
-                preferences.edit().putString(key, entry).commit()
-            }
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SEEK_CACHE_KEY
+            title = "Enable local seek/skip cache"
+            summary = "Caches watched MP4 blocks locally (20 min TTL) for instant skip/rewind."
+            setDefaultValue(true)
         }.also(screen::addPreference)
     }
 
     // ============================= Utilities ==============================
+    private fun toAbsoluteUrl(url: String): String = when {
+        url.startsWith("http://") || url.startsWith("https://") -> url
+        url.startsWith("//") -> "https:$url"
+        else -> "$baseUrl/${url.trimStart('/')}"
+    }
+
+    private fun fetchPageCached(url: String): String {
+        val now = System.currentTimeMillis()
+        pageCache[url]?.let { (ts, body) ->
+            if (now - ts < PAGE_CACHE_TTL_MS) return body
+        }
+        val html = client.newCall(GET(url, headers)).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
+            resp.body.string()
+        }
+        cachePage(url, html)
+        return html
+    }
+
+    private fun cachePage(url: String, html: String) {
+        if (pageCache.size > 30) pageCache.clear()
+        pageCache[url] = System.currentTimeMillis() to html
+    }
+
     private fun String.toDate(): Long {
         val fixedDate = trim().replace(DATE_REGEX, "").replace("'", "")
         return runCatching { DATE_FORMATTER.parse(fixedDate)?.time }
@@ -210,13 +298,14 @@ class HahoMoe :
 
     override fun List<Video>.sort(): List<Video> {
         val quality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
-
         return sortedWith(
             compareBy { it.quality.contains(quality) },
         ).reversed()
     }
 
     companion object {
+        private const val PAGE_CACHE_TTL_MS = 3 * 60 * 1000L
+
         private val DATE_FORMATTER by lazy {
             SimpleDateFormat("dd 'of' MMM, yyyy", Locale.ENGLISH)
         }
@@ -228,5 +317,6 @@ class HahoMoe :
         private const val PREF_QUALITY_DEFAULT = "720p"
         private val PREF_QUALITY_ENTRIES = arrayOf("1080p", "720p", "480p", "360p")
         private val PREF_QUALITY_VALUES = PREF_QUALITY_ENTRIES
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
     }
 }

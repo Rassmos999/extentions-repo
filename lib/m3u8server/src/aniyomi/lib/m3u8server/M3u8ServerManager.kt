@@ -1,10 +1,11 @@
 package aniyomi.lib.m3u8server
 
 import android.util.Log
+import eu.kanade.tachiyomi.animesource.model.Video
 import okhttp3.OkHttpClient
 
 /**
- * M3U8 Server manager to facilitate usage
+ * M3U8 & Media Caching Server manager to facilitate usage across extensions.
  */
 class M3u8ServerManager(
     private val client: OkHttpClient,
@@ -14,8 +15,7 @@ class M3u8ServerManager(
     private var server: M3u8HttpServer? = null
 
     /**
-     * Starts the M3U8 server on the specified port
-     * @param port Port where the server will run (0 for random port, default: 0)
+     * Starts the local HTTP proxy server on the specified port (0 = random port).
      */
     @Synchronized
     fun startServer(port: Int = 0) {
@@ -36,7 +36,7 @@ class M3u8ServerManager(
     }
 
     /**
-     * Stops the M3U8 server
+     * Stops the local HTTP server and releases its prefetch threads and RAM cache.
      */
     @Synchronized
     fun stopServer() {
@@ -45,25 +45,12 @@ class M3u8ServerManager(
         Log.d(tag, "M3U8 HTTP Server stopped")
     }
 
-    /**
-     * Checks if the server is running
-     */
     fun isRunning(): Boolean = server?.isRunning() ?: false
 
-    /**
-     * Gets the server base URL
-     */
     fun getServerUrl(): String? = server?.let { "http://localhost:${it.port}" }
 
     /**
-     * Processes an M3U8 file through the server.
-     *
-     * @param m3u8Url Original M3U8 file URL
-     * @param referer optional Referer to encode into the proxied URL — see
-     *   [M3u8HttpServer.createLocalUrl] for why this is the root-cause fix
-     *   for Cloudflare-fronted CDNs that 403 on null-Referer requests.
-     * @param userAgent optional User-Agent to encode alongside the referer.
-     * @return Processed M3U8 content as a local URL string
+     * Processes an M3U8 playlist URL through the caching/prefetching local server.
      */
     @JvmOverloads
     fun processM3u8Url(
@@ -71,19 +58,82 @@ class M3u8ServerManager(
         referer: String? = null,
         userAgent: String? = null,
         origin: String? = null,
-    ): String? = server?.createLocalUrl(m3u8Url, referer, userAgent, origin)
+        cookie: String? = null,
+    ): String? {
+        if (!isRunning()) startServer()
+        return server?.createLocalUrl(m3u8Url, referer, userAgent, origin, cookie)
+    }
 
     /**
-     * Processes a segment through the server
-     * @param segmentUrl Original segment URL
-     * @param headers Optional headers to use for the request
-     * @return Processed segment data
+     * Wraps a direct progressive media URL (e.g. MP4) through the local `/media`
+     * 512 KB aligned byte-range block cache so seeking/rewinding replays locally.
      */
+    @JvmOverloads
+    fun processMediaUrl(
+        mediaUrl: String,
+        referer: String? = null,
+        userAgent: String? = null,
+        origin: String? = null,
+        cookie: String? = null,
+    ): String? {
+        if (!isRunning()) startServer()
+        return server?.createMediaUrl(mediaUrl, referer, userAgent, origin, cookie)
+    }
+
     suspend fun processSegmentUrl(segmentUrl: String, headers: Map<String, String> = emptyMap()): ByteArray? = server?.processSegmentUrl(segmentUrl, headers)
 
     /**
-     * Gets server information
+     * Routes eligible HLS (`.m3u8`) and/or progressive MP4/WebM streams in [videos]
+     * through the local caching/prefetching proxy while leaving localhost URLs,
+     * DASH `.mpd`, and magnet links untouched.
      */
+    @JvmOverloads
+    fun wrapVideosForCache(
+        videos: List<Video>,
+        cacheHls: Boolean = true,
+        cacheMp4: Boolean = true,
+        defaultReferer: String? = null,
+        defaultOrigin: String? = null,
+        defaultUserAgent: String? = null,
+    ): List<Video> {
+        if ((!cacheHls && !cacheMp4) || videos.isEmpty()) return videos
+        return videos.map { video ->
+            val rawUrl = (video.videoUrl ?: video.url).trim()
+            if (rawUrl.isBlank() ||
+                rawUrl.startsWith("http://localhost:", ignoreCase = true) ||
+                rawUrl.startsWith("http://127.0.0.1:", ignoreCase = true) ||
+                rawUrl.startsWith("magnet:", ignoreCase = true) ||
+                rawUrl.contains(".mpd", ignoreCase = true)
+            ) {
+                return@map video
+            }
+
+            val lower = rawUrl.lowercase()
+            val isHls = lower.contains(".m3u8") || lower.contains("application/vnd.apple.mpegurl")
+            val isProgressive = !isHls && (lower.startsWith("http://") || lower.startsWith("https://"))
+
+            val referer = video.headers?.get("Referer") ?: video.headers?.get("referer") ?: defaultReferer
+            val origin = video.headers?.get("Origin") ?: video.headers?.get("origin") ?: defaultOrigin
+            val userAgent = video.headers?.get("User-Agent") ?: video.headers?.get("user-agent") ?: defaultUserAgent
+            val cookie = video.headers?.get("Cookie") ?: video.headers?.get("cookie")
+
+            val proxied = when {
+                isHls && cacheHls -> processM3u8Url(rawUrl, referer, userAgent, origin, cookie)
+                isProgressive && cacheMp4 -> processMediaUrl(rawUrl, referer, userAgent, origin, cookie)
+                else -> null
+            } ?: return@map video
+
+            Video(
+                url = video.url,
+                quality = video.quality,
+                videoUrl = proxied,
+                headers = video.headers,
+                subtitleTracks = video.subtitleTracks,
+                audioTracks = video.audioTracks,
+            )
+        }
+    }
+
     fun getServerInfo(): String = if (isRunning()) {
         val serverUrl = getServerUrl() ?: "Unknown"
         """

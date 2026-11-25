@@ -1,13 +1,14 @@
 ext {
     extName = 'SexAlArab'
     extClass = '.SexAlArab'
-    extVersionCode = 22
-    overrideVersionCode = 21
+    extVersionCode = 23
+    overrideVersionCode = 23
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
+    implementation(project(':lib:m3u8server'))
     implementation(project(':lib:playlistutils'))
 }

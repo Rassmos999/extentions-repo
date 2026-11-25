@@ -42,8 +42,10 @@ class M3u8Integration(
      */
     private fun processM3u8Video(originalVideo: Video): Video {
         val referer = originalVideo.headers?.get("Referer")
+        val origin = originalVideo.headers?.get("Origin")
         val userAgent = originalVideo.headers?.get("User-Agent")
-        val processedUrl = serverManager.processM3u8Url(originalVideo.url, referer, userAgent)
+        val cookie = originalVideo.headers?.get("Cookie")
+        val processedUrl = serverManager.processM3u8Url(originalVideo.url, referer, userAgent, origin, cookie)
         return Video(
             videoUrl = processedUrl ?: originalVideo.url,
             url = originalVideo.url,

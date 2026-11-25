@@ -1,7 +1,11 @@
 package eu.kanade.tachiyomi.animeextension.all.jable
 
 import android.content.SharedPreferences
+import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.playlistutils.PlaylistUtils
+import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimeUpdateStrategy
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -20,7 +24,9 @@ import okhttp3.Response
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 
-class Jable(override val lang: String) : AnimeHttpSource() {
+class Jable(override val lang: String) :
+    AnimeHttpSource(),
+    ConfigurableAnimeSource {
     override val baseUrl: String
         get() = "https://jable.tv"
     override val name: String
@@ -31,7 +37,17 @@ class Jable(override val lang: String) : AnimeHttpSource() {
     private val preferences by getPreferencesLazy()
     private val json by injectLazy<Json>()
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
     private var tagsUpdated = false
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        SwitchPreferenceCompat(screen.context).apply {
+            key = "pref_seek_cache"
+            title = "Enable local seek/skip cache"
+            summary = "Caches watched HLS segments locally (20 min TTL) and prefetches ahead for faster skip/rewind."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
+    }
 
     override fun animeDetailsRequest(anime: SAnime): Request = GET("$baseUrl${anime.url}?lang=${lang.toRequestLang()}", headers)
 
@@ -69,7 +85,7 @@ class Jable(override val lang: String) : AnimeHttpSource() {
             .set("Referer", "$baseUrl/")
             .set("Origin", baseUrl)
             .build()
-        return runCatching {
+        val rawVideos = runCatching {
             playlistUtils.extractFromHls(
                 videoUrl,
                 referer = "$baseUrl/",
@@ -77,6 +93,18 @@ class Jable(override val lang: String) : AnimeHttpSource() {
             )
         }.getOrDefault(emptyList()).ifEmpty {
             listOf(Video(videoUrl, "Default", videoUrl, headers = videoHeaders))
+        }
+        return if (preferences.getBoolean("pref_seek_cache", true)) {
+            m3u8Server.wrapVideosForCache(
+                videos = rawVideos,
+                cacheHls = true,
+                cacheMp4 = false,
+                defaultReferer = "$baseUrl/",
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            rawVideos
         }
     }
 

@@ -1,6 +1,9 @@
 package eu.kanade.tachiyomi.animeextension.ar.arabshentai
 
+import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.doodextractor.DoodExtractor
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
@@ -81,6 +84,15 @@ class ArabsHentai :
             .build()
     }
 
+    private val streamProxyClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .writeTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val m3u8Server by lazy { M3u8ServerManager(streamProxyClient) }
     private val playlistUtils by lazy { PlaylistUtils(fastExtractorClient, headers) }
     private val doodExtractor by lazy { DoodExtractor(fastExtractorClient) }
     private val vidHideExtractor by lazy { VidHideExtractor(fastExtractorClient, headers) }
@@ -435,37 +447,31 @@ class ArabsHentai :
         }
 
         val document = Jsoup.parse(html, pageUrl)
-        val embedTasks = linkedMapOf<String, String>() // url -> serverLabel
+        val directEmbedTasks = linkedMapOf<String, String>() // url -> serverLabel
 
-        // 1) Resolve DooPlay player options via wp-json/dooplayer/v2/ (fallback admin-ajax.php)
+        // 1) Collect DooPlay player options to resolve + extract IN PARALLEL
         val playerOptions = document.select("#playeroptionsul li.dooplay_player_option, li.dooplay_player_option")
-            .filter { el ->
-                val post = el.attr("data-post").trim()
-                val nume = el.attr("data-nume").trim()
-                post.isNotBlank() && nume.isNotBlank() && !nume.equals("trailer", ignoreCase = true)
+            .mapNotNull { opt ->
+                val post = opt.attr("data-post").trim()
+                val nume = opt.attr("data-nume").trim()
+                if (post.isBlank() || nume.isBlank() || nume.equals("trailer", ignoreCase = true)) {
+                    return@mapNotNull null
+                }
+                val type = opt.attr("data-type").trim().ifBlank {
+                    if ("/movies/" in pageUrl.lowercase(Locale.ROOT)) "movie" else "tv"
+                }
+                val label = opt.selectFirst(".title")?.text()?.trim()
+                    ?.ifBlank { null }
+                    ?: opt.text().trim().ifBlank { "Server $nume" }
+                Triple(post, type, nume) to label
             }
-
-        for (opt in playerOptions) {
-            val post = opt.attr("data-post").trim()
-            val nume = opt.attr("data-nume").trim()
-            val type = opt.attr("data-type").trim().ifBlank {
-                if ("/movies/" in pageUrl.lowercase(Locale.ROOT)) "movie" else "tv"
-            }
-            val label = opt.selectFirst(".title")?.text()?.trim()
-                ?.ifBlank { null }
-                ?: opt.text().trim().ifBlank { "Server $nume" }
-            val embedUrl = resolveDooPlayerOption(post, type, nume, pageUrl)
-            if (!embedUrl.isNullOrBlank() && isUsefulEmbed(embedUrl)) {
-                embedTasks.putIfAbsent(embedUrl, label)
-            }
-        }
 
         // 2) Direct iframes already present on the page (if any)
         document.select("iframe.metaframe[src], #dooplay_player_response iframe[src], .play-box-iframe iframe[src], iframe[src]")
             .forEach { iframe ->
                 val src = iframe.absUrl("src").ifBlank { iframe.attr("src") }.trim().replace("&amp;", "&")
                 if (src.startsWith("http") && isUsefulEmbed(src)) {
-                    embedTasks.putIfAbsent(src, "Embed")
+                    directEmbedTasks.putIfAbsent(src, "Embed")
                 }
             }
 
@@ -479,16 +485,45 @@ class ArabsHentai :
             }
         }
 
-        // 4) Extract all embeds in parallel
-        if (embedTasks.isNotEmpty()) {
-            videos += extractEmbedsInParallel(embedTasks.entries.map { it.key to it.value })
+        // 4) Resolve DooPlay options AND extract all embeds in parallel
+        val jobs = mutableListOf<() -> List<Video>>()
+        playerOptions.forEach { (key, label) ->
+            val (post, type, nume) = key
+            jobs += {
+                val embedUrl = resolveDooPlayerOption(post, type, nume, pageUrl)
+                if (!embedUrl.isNullOrBlank() && isUsefulEmbed(embedUrl)) {
+                    runBlocking { extractFromEmbed(embedUrl, label) }
+                } else {
+                    emptyList()
+                }
+            }
+        }
+        directEmbedTasks.forEach { (embedUrl, label) ->
+            jobs += {
+                runBlocking { extractFromEmbed(embedUrl, label) }
+            }
+        }
+        if (jobs.isNotEmpty()) {
+            videos += runExtractionJobsInParallel(jobs)
         }
 
         val distinct = videos.distinctBy { it.videoUrl ?: it.url }
         if (distinct.isEmpty()) {
             throw IOException("لم يتم العثور على رابط تشغيل صالح لهذه الحلقة على ArabsHentai.")
         }
-        return distinct
+        val useSeekCache = preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)
+        return if (useSeekCache) {
+            m3u8Server.wrapVideosForCache(
+                videos = distinct,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = "$baseUrl/",
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            distinct
+        }
     }
 
     private fun resolveDooPlayerOption(post: String, type: String, nume: String, referer: String): String? {
@@ -547,15 +582,15 @@ class ArabsHentai :
         return URL_IN_TEXT_REGEX.find(raw)?.value
     }
 
-    private fun extractEmbedsInParallel(embeds: List<Pair<String, String>>): List<Video> {
-        val pool = Executors.newFixedThreadPool(embeds.size.coerceAtMost(4))
+    private fun runExtractionJobsInParallel(jobs: List<() -> List<Video>>): List<Video> {
+        val pool = Executors.newFixedThreadPool(jobs.size.coerceAtMost(4))
         val completion = ExecutorCompletionService<List<Video>>(pool)
         val futures = mutableListOf<Future<List<Video>>>()
         val collected = mutableListOf<Video>()
         try {
-            embeds.forEach { (url, label) ->
+            jobs.forEach { job ->
                 futures += completion.submit {
-                    runCatching { runBlocking { extractFromEmbed(url, label) } }.getOrDefault(emptyList())
+                    runCatching { job() }.getOrDefault(emptyList())
                 }
             }
             val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(MAX_EXTRACTION_WAIT_MS)
@@ -582,6 +617,13 @@ class ArabsHentai :
         return collected
     }
 
+    private fun proxyTransform(m3u8Url: String, referer: String, origin: String): String = m3u8Server.processM3u8Url(
+        m3u8Url = m3u8Url,
+        referer = referer,
+        userAgent = headers["User-Agent"],
+        origin = origin,
+    ) ?: m3u8Url
+
     private suspend fun extractFromEmbed(url: String, label: String): List<Video> {
         var clean = url.trim().replace("&amp;", "&").replace("\\/", "/")
         if (clean.startsWith("//")) clean = "https:$clean"
@@ -594,17 +636,17 @@ class ArabsHentai :
                 doodExtractor.videoFromUrl(clean, prefix = "$label - ")?.let(::listOf).orEmpty()
 
             VIDHIDE_HOSTS.any { it in lower } || "earnvids" in lowerLabel || "vidhide" in lowerLabel ->
-                runCatching { vidHideExtractor.videosFromUrl(clean) { q -> "$label - $q" } }
+                runCatching { vidHideExtractor.videosFromUrl(clean, { q -> "$label - $q" }, ::proxyTransform) }
                     .getOrDefault(emptyList())
                     .ifEmpty {
-                        runCatching { streamWishExtractor.videosFromUrl(clean, label) }.getOrDefault(emptyList())
+                        runCatching { streamWishExtractor.videosFromUrl(clean, { q -> "$label - $q" }, ::proxyTransform) }.getOrDefault(emptyList())
                     }
 
             STREAMWISH_HOSTS.any { it in lower } || "streamhg" in lowerLabel || "streamwish" in lowerLabel ->
-                runCatching { streamWishExtractor.videosFromUrl(clean, label) }
+                runCatching { streamWishExtractor.videosFromUrl(clean, { q -> "$label - $q" }, ::proxyTransform) }
                     .getOrDefault(emptyList())
                     .ifEmpty {
-                        runCatching { vidHideExtractor.videosFromUrl(clean) { q -> "$label - $q" } }.getOrDefault(emptyList())
+                        runCatching { vidHideExtractor.videosFromUrl(clean, { q -> "$label - $q" }, ::proxyTransform) }.getOrDefault(emptyList())
                     }
 
             "mixdrop" in lower || "mxdrop" in lower ->
@@ -628,7 +670,7 @@ class ArabsHentai :
                 streamFromUrl(clean, label, "$baseUrl/")
 
             else ->
-                runCatching { vidHideExtractor.videosFromUrl(clean) { q -> "$label - $q" } }
+                runCatching { vidHideExtractor.videosFromUrl(clean, { q -> "$label - $q" }, ::proxyTransform) }
                     .getOrDefault(emptyList())
                     .ifEmpty {
                         runCatching { universalExtractor.videosFromUrl(clean, headers, prefix = "$label - ") }
@@ -653,6 +695,16 @@ class ArabsHentai :
                 .thenByDescending { QUALITY_IN_URL.find(it.quality)?.groupValues?.get(1)?.toIntOrNull() ?: 0 }
                 .thenBy { if (it.quality.contains("earnvids", true) || it.quality.contains("streamhg", true)) 0 else 1 },
         )
+    }
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        super.setupPreferenceScreen(screen)
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SEEK_CACHE_KEY
+            title = "تفعيل كاش التقديم والترجيع (Local Seek Cache)"
+            summary = "تخزين مقاطع الفيديو مؤقتاً لمدة 20 دقيقة لتسريع التقديم والرجوع لنفس النقطة."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
     }
 
     // ============================== Filters ===============================
@@ -768,6 +820,7 @@ class ArabsHentai :
     }
 
     companion object {
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
         private const val MAX_PARALLEL_FILTERS = 4
         private const val MAX_EXTRACTION_WAIT_MS = 14_000L
         private const val EXTRA_WAIT_AFTER_FIRST_MS = 2_000L

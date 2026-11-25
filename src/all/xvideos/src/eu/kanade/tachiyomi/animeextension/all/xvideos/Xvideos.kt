@@ -1,6 +1,8 @@
 package eu.kanade.tachiyomi.animeextension.all.xvideos
 
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -45,6 +47,7 @@ class Xvideos :
     }
 
     private val player by lazy { AdultHtml5Player(client, headers) }
+    private val m3u8Server by lazy { M3u8ServerManager(client) }
 
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
@@ -326,8 +329,19 @@ class Xvideos :
     override fun videoListParse(response: Response): List<Video> {
         val document = response.asJsoup()
         val pageUrl = response.request.url.toString()
-        // Player no longer embeds setVideoUrl* in HTML; streams come from getvideo RPC
-        return player.videosFromPage(pageUrl, document.html(), baseUrl)
+        val rawVideos = player.videosFromPage(pageUrl, document.html(), baseUrl)
+        return if (preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)) {
+            m3u8Server.wrapVideosForCache(
+                videos = rawVideos,
+                cacheHls = true,
+                cacheMp4 = true,
+                defaultReferer = "$baseUrl/",
+                defaultOrigin = baseUrl,
+                defaultUserAgent = headers["User-Agent"],
+            )
+        } else {
+            rawVideos
+        }
     }
 
     override fun videoListSelector() = throw UnsupportedOperationException()
@@ -442,6 +456,12 @@ class Xvideos :
             default = PREF_QUALITY_DEFAULT,
             summary = "%s",
         )
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SEEK_CACHE_KEY
+            title = "Enable local seek/skip cache"
+            summary = "Caches watched HLS segments and MP4 blocks locally (20 min TTL) for instant skip/rewind."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
     }
 
     // =============================== Helpers ==============================
@@ -489,6 +509,7 @@ class Xvideos :
         private val PREF_DOMAIN_DEFAULT = PREF_DOMAIN_VALUES.first()
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
+        private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
         private const val PREF_QUALITY_TITLE = "Preferred quality"
         private val PREF_QUALITY_ENTRIES = listOf("1080", "720", "480", "360", "240", "HLS", "MP4")
         private const val PREF_QUALITY_DEFAULT = "1080"
