@@ -63,7 +63,7 @@ Repository structure and usage-based partitioning for the **110 published extens
 | `myreadingmanga` | `all.myreadingmanga` | Bara/Yaoi video/gallery scraper (multi-lang factory) | **Fixed & Rebuilt** (`v14.3`, `156cfd5`: CF Turnstile gated) |
 | `pornhub` | `all.pornhub` | Adult tube (HLS / MP4) | **Upgraded & Rebuilt** (`v14.69`: `:lib:m3u8server` HLS + `/media` MP4 512 KB byte-range seek-cache) |
 | `rouvideo` | `all.rouvideo` | Asian adult (TanStack Start + PNG-HLS proxy) | **Rebuilt** (`v14.27`: inherits upgraded `:lib:m3u8server` hybrid RAM+Disk LRU cache & lookahead prefetch) |
-| `sextb` | `all.sextb` | JAV multi-embed streaming | **Rebuilt** (`v14.19`: inherits upgraded `:lib:m3u8server` hybrid RAM+Disk LRU cache & lookahead prefetch) |
+| `sextb` | `all.sextb` | JAV multi-embed streaming | **Restructured** (`v14.20`: fixed F4 `src` HLS resolution, `hls4`/`hls3`/`hls2` fallback, `E_HUMAN` detection, dynamic rotated-hash resolution, expanded 140+ genres, new categories/TOP charts, `/ajax/search` movie+actress lookup, detail poster fix, preferences & seek-cache toggle) |
 | `supjav` | `all.supjav` | JAV multi-embed streaming (CF protected) | **Rebuilt** (`v14.103`: inherits upgraded `:lib:m3u8server` hybrid RAM+Disk LRU cache & lookahead prefetch) |
 | `supjav2` | `all.supjav2` | JAV multi-embed streaming | **Fixed & Rebuilt** (`v14.30`: parity with `SupJav` — parallel `ExecutorCompletionService`, `hls4` + `m3u8Server`, fixed `/popular`, 3-min `pageCache`, multi-select Categories/Tags/Makers/Actresses, seek-cache) |
 | `xmoviesforyou` | `all.xmoviesforyou` | Adult movies (direct HLS + mirrors) | **Upgraded & Rebuilt** (`v14.4`: `disableRelatedAnimes`, upgraded `:lib:m3u8server` seek-cache + prefetch for direct HLS and mirrors) |
