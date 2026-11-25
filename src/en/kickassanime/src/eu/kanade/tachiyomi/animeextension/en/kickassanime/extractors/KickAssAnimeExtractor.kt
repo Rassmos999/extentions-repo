@@ -48,12 +48,15 @@ class KickAssAnimeExtractor(
         return when {
             trimmed.startsWith("https://") || trimmed.startsWith("http://") ->
                 trimmed.replace(httpRegex, "$1//")
+
             trimmed.startsWith("//") ->
                 "https://${trimmed.substring(2)}"
+
             trimmed.startsWith("/") -> {
                 val base = baseUrl.toHttpUrl()
                 "${base.scheme}://${base.host}$trimmed"
             }
+
             else -> trimmed
         }
     }
@@ -91,9 +94,14 @@ class KickAssAnimeExtractor(
 
         val key = when (name) {
             "VidStreaming" -> "e13d38099bf562e8b9851a652d2043d3"
+
             "DuckStream" -> "4504447b74641ad972980a6b8ffd7631"
+
             "BirdStream" -> "4b14d0ff625163e3c9c7a47926484bf2"
-            "CatStream" -> "" // No keys to decrypt
+
+            "CatStream" -> ""
+
+            // No keys to decrypt
             else -> return emptyList()
         }.toByteArray()
 
@@ -225,8 +233,11 @@ class KickAssAnimeExtractor(
 
     private fun getSignature(html: String, server: String, query: String, key: ByteArray): Triple<String, String, String>? {
         val order = when (server) {
-            "VidStreaming", "DuckStream" -> listOf("IP", "USERAGENT", "ROUTE", "MID", "TIMESTAMP", "KEY") // Combined them as they were identical
+            "VidStreaming", "DuckStream" -> listOf("IP", "USERAGENT", "ROUTE", "MID", "TIMESTAMP", "KEY")
+
+            // Combined them as they were identical
             "BirdStream" -> listOf("IP", "USERAGENT", "ROUTE", "MID", "KEY")
+
             else -> return null
         }
 

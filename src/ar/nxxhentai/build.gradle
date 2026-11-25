@@ -2,8 +2,8 @@ ext {
     extName = 'NxxHentai'
     extClass = '.NxxHentai'
     themePkg = 'dooplay'
-    extVersionCode = 35
-    overrideVersionCode = 36
+    extVersionCode = 1
+    overrideVersionCode = 0
     baseUrl = 'https://nxxhentai.net'
     isNsfw = true
 }

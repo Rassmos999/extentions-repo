@@ -1,7 +1,7 @@
 ext {
     extName = 'Arab Seed'
     extClass = '.ArabSeed'
-    extVersionCode = 35
+    extVersionCode = 1
 }
 
 apply plugin: "kei.plugins.extension.legacy"
