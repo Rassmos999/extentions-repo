@@ -77,6 +77,12 @@ class SmartForYou :
 
     private val pageCache = ConcurrentHashMap<String, Pair<Long, String>>()
     private val seenFeedKeys = java.util.Collections.synchronizedSet(HashSet<String>())
+    private val sourceNextAllowedMs = ConcurrentHashMap<String, Long>()
+    private val sourceCooldownUntilMs = ConcurrentHashMap<String, Long>()
+    private val sourcePaceLock = Any()
+
+    @Volatile
+    private var lastSearchRecordedMs: Long = 0L
 
     private val baseHttpClient: OkHttpClient by lazy {
         network.client.newBuilder()
@@ -95,20 +101,16 @@ class SmartForYou :
             .build()
     }
 
+    // Use network.client + CfWebBridgeInterceptor (not cloudflareClient) so background
+    // executor threads never trigger CloudflareInterceptor's Looper/Toast NPE crash.
     private val sextbClient: OkHttpClient by lazy {
-        network.cloudflareClient.newBuilder()
-            .connectTimeout(7, TimeUnit.SECONDS)
-            .readTimeout(12, TimeUnit.SECONDS)
-            .callTimeout(16, TimeUnit.SECONDS)
+        baseHttpClient.newBuilder()
             .addInterceptor(CfWebBridgeInterceptor("https://sextb.net"))
             .build()
     }
 
     private val sexAlArabClient: OkHttpClient by lazy {
-        network.cloudflareClient.newBuilder()
-            .connectTimeout(7, TimeUnit.SECONDS)
-            .readTimeout(12, TimeUnit.SECONDS)
-            .callTimeout(16, TimeUnit.SECONDS)
+        baseHttpClient.newBuilder()
             .addInterceptor(CfWebBridgeInterceptor("https://sexalarab.tv"))
             .build()
     }
@@ -179,6 +181,12 @@ class SmartForYou :
         filters: AnimeFilterList,
     ): AnimesPage = withContext(Dispatchers.IO) {
         val cleanQuery = query.trim()
+        // Drop synthetic background queries emitted by Tadami's AnimeSearchFallbackEngine
+        // so opening a video never fans out 45 requests across 3 sources or pollutes taste!
+        if (cleanQuery.isNotBlank() && isSyntheticFallbackQuery(cleanQuery)) {
+            return@withContext AnimesPage(emptyList(), false)
+        }
+
         val checkedSourceIds = filters.filterIsInstance<SourceGroup>().firstOrNull()
             ?.state
             ?.filter { it.state }
@@ -188,7 +196,9 @@ class SmartForYou :
         val sources = resolveActiveSources(checkedSourceIds)
 
         if (cleanQuery.isNotBlank()) {
-            if (page == 1 && tasteEngine.isEnabled() && cleanQuery.length in 2..50) {
+            val now = System.currentTimeMillis()
+            if (page == 1 && tasteEngine.isEnabled() && cleanQuery.length in 2..45 && now - lastSearchRecordedMs > 1_500L) {
+                lastSearchRecordedMs = now
                 tasteEngine.recordSearchOrFilter(query = cleanQuery)
             }
             return@withContext searchAcrossSources(page, cleanQuery, sources)
@@ -222,15 +232,14 @@ class SmartForYou :
 
         Log.i(TAG, "ForYou mode=$mode sources=${sources.map { it.id }} core=$coreConcepts queries=$tasteQueries")
 
-        val hasTaste = mode == FeedMode.FOR_YOU && tasteQueries.isNotEmpty()
+        val useTasteDiscovery = (mode == FeedMode.FOR_YOU || mode == FeedMode.LATEST) && tasteQueries.isNotEmpty()
+        val preferNewest = mode == FeedMode.LATEST
         val batches = fetchInParallel(sources) { idx, src ->
             when {
-                hasTaste -> {
-                    // 1. Prefer native category/genre page when top core concept maps directly
-                    //    (e.g. threesome/foursome -> SexTB /genre/threesome--foursome, PornHub ?c=65).
+                useTasteDiscovery -> {
                     val conceptForSource = coreConcepts.getOrNull(idx % coreConcepts.size.coerceAtLeast(1))
                     val nativeCategoryPage = if (conceptForSource != null) {
-                        runCatching { browseSourceByConcept(src.id, page, conceptForSource) }.getOrNull()
+                        runCatching { browseSourceByConcept(src.id, page, conceptForSource, newest = preferNewest) }.getOrNull()
                     } else {
                         null
                     }
@@ -242,12 +251,12 @@ class SmartForYou :
                         if (searchHits != null && searchHits.animes.isNotEmpty()) {
                             searchHits
                         } else {
-                            browseSource(src.id, page, latest = false)
+                            browseSource(src.id, page, latest = preferNewest)
                         }
                     }
                 }
 
-                mode == FeedMode.LATEST -> browseSource(src.id, page, latest = true)
+                preferNewest -> browseSource(src.id, page, latest = true)
 
                 else -> browseSource(src.id, page, latest = false)
             }
@@ -258,7 +267,7 @@ class SmartForYou :
         val ranked = tasteEngine.rankCandidates(
             items = merged.animes,
             excludeWatched = true,
-            blendWithOriginalRank = mode != FeedMode.FOR_YOU,
+            blendWithOriginalRank = mode == FeedMode.TRENDING,
         ).filter { anime ->
             val keys = tasteEngine.extractKnownKeys(anime.url, anime.title)
             val alreadyShown = keys.any { it in seenFeedKeys }
@@ -268,21 +277,51 @@ class SmartForYou :
         return AnimesPage(ranked, merged.hasNextPage)
     }
 
-    private fun browseSourceByConcept(srcId: String, page: Int, concept: String): AnimesPage? = when (srcId) {
+    private fun browseSourceByConcept(
+        srcId: String,
+        page: Int,
+        concept: String,
+        newest: Boolean = false,
+    ): AnimesPage? = when (srcId) {
         "sextb" -> {
             val slug = SEXTB_CONCEPT_GENRES[concept] ?: return null
             val path = if (page > 1) "/genre/$slug/pg-$page" else "/genre/$slug"
-            val html = fetchHtml(sextbClient, "https://sextb.net$path?sort=viewed", "https://sextb.net/")
+            val sort = if (newest) "desc" else "viewed"
+            val html = fetchHtml(sextbClient, "https://sextb.net$path?sort=$sort", "https://sextb.net/")
             parseSexTbList(Jsoup.parse(html, "https://sextb.net"))
         }
 
         "pornhub" -> {
             val catId = PORNHUB_CONCEPT_CATEGORIES[concept] ?: return null
-            val html = fetchHtml(pornhubClient, "https://www.pornhub.com/video?c=$catId&o=ht&page=$page", "https://www.pornhub.com/")
+            val sort = if (newest) "cm" else "ht"
+            val html = fetchHtml(pornhubClient, "https://www.pornhub.com/video?c=$catId&o=$sort&page=$page", "https://www.pornhub.com/")
             parsePornHubList(Jsoup.parse(html, "https://www.pornhub.com"))
         }
 
         else -> null
+    }
+
+    private fun isSyntheticFallbackQuery(q: String): Boolean {
+        if (q.length > 55) return true
+        val lower = q.lowercase(Locale.ROOT)
+        if (lower.startsWith("source:") ||
+            lower.startsWith("label:") ||
+            lower.startsWith("studio:") ||
+            lower.startsWith("uploader:") ||
+            lower.startsWith("[sextb]") ||
+            lower.startsWith("[pornhub]") ||
+            lower.startsWith("[xvideos]") ||
+            lower.startsWith("[xnxx]") ||
+            lower.startsWith("[rule34]") ||
+            lower.startsWith("[sexalarab]") ||
+            lower == "featured actress" ||
+            lower == "single work" ||
+            lower == "solo work"
+        ) {
+            return true
+        }
+        // Detect Japanese+English raw metadata dumps emitted by host fallback engine
+        return q.any { it in '\u3040'..'\u30FF' || it in '\u4E00'..'\u9FFF' } && q.length > 24
     }
 
     private fun searchAcrossSources(
@@ -1052,15 +1091,40 @@ class SmartForYou :
         else -> baseHttpClient
     }
 
+    private fun acquireSourceSlot(hostKey: String) {
+        val waitMs: Long
+        synchronized(sourcePaceLock) {
+            val now = System.currentTimeMillis()
+            val cooldownUntil = sourceCooldownUntilMs[hostKey] ?: 0L
+            val gap = if (now < cooldownUntil) 1_800L else 420L
+            val scheduled = maxOf(now, sourceNextAllowedMs[hostKey] ?: 0L)
+            sourceNextAllowedMs[hostKey] = scheduled + gap
+            waitMs = scheduled - now
+        }
+        if (waitMs > 0L) {
+            runCatching { Thread.sleep(waitMs.coerceAtMost(2_500L)) }
+        }
+    }
+
     private fun fetchHtml(httpClient: OkHttpClient, url: String, referer: String): String {
         val now = System.currentTimeMillis()
         pageCache[url]?.takeIf { now - it.first < CACHE_TTL_MS }?.let { return it.second }
+        val hostKey = url.toHttpUrlOrNull()?.host?.lowercase(Locale.ROOT) ?: "default"
+        acquireSourceSlot(hostKey)
         httpClient.newCall(GET(url, desktopHeaders(referer))).execute().use { resp ->
+            if (resp.code == 429 || resp.code == 403) {
+                synchronized(sourcePaceLock) {
+                    val t = System.currentTimeMillis()
+                    sourceCooldownUntilMs[hostKey] = maxOf(sourceCooldownUntilMs[hostKey] ?: 0L, t + 25_000L)
+                    sourceNextAllowedMs[hostKey] = maxOf(sourceNextAllowedMs[hostKey] ?: 0L, t + 2_500L)
+                }
+                throw IOException("HTTP ${resp.code} for $url")
+            }
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
             val body = resp.body.string()
             if (body.length > 2000) {
-                if (pageCache.size > 60) pageCache.clear()
-                pageCache[url] = now to body
+                if (pageCache.size > 80) pageCache.clear()
+                pageCache[url] = System.currentTimeMillis() to body
             }
             return body
         }

@@ -221,7 +221,7 @@ class SmartTasteEngine(
         ensureFreshLoadedLocked()
         ProfileSnapshot(
             topSources = topKeys(sourceUsage, 10),
-            topConcepts = topKeys(concepts, 12),
+            topConcepts = topConceptsRanked(12),
             topPerformers = topKeys(performers, 8),
             topTags = topKeys(tags, 10),
             topKeywords = topKeys(keywords, 12),
@@ -232,6 +232,12 @@ class SmartTasteEngine(
             totalInteractions = totalInteractions,
         )
     }
+
+    private fun topConceptsRanked(limit: Int): List<String> = concepts.entries
+        .filter { (k, _) -> k !in FORMAT_ONLY_CONCEPTS }
+        .sortedByDescending { (k, w) -> w * (CONCEPT_SPECIFICITY[k] ?: 1.0) }
+        .take(limit)
+        .map { it.key }
 
     fun recordSourceUsage(sourceId: String, weight: Double = WEIGHT_BROWSE) {
         val clean = sourceId.trim().lowercase(Locale.ROOT)
@@ -450,15 +456,17 @@ class SmartTasteEngine(
 
         var score = 0.0
 
-        // 1. Core Canonical Concept match (highest signal — catches 3some/threesome, 4some/foursome, etc.)
+        // 1. Core Canonical Concept match (highest signal — weighted by theme specificity!)
         var matchedConceptCount = 0
         for (concept in candidateConcepts) {
+            if (concept in FORMAT_ONLY_CONCEPTS) continue
             val weight = concepts[concept] ?: continue
-            score += logWeight(weight) * 4.6
+            val spec = CONCEPT_SPECIFICITY[concept] ?: 1.0
+            score += logWeight(weight) * 4.8 * spec
             matchedConceptCount++
         }
         if (matchedConceptCount >= 2) {
-            score += (matchedConceptCount - 1) * 3.2
+            score += (matchedConceptCount - 1) * 3.6
         }
 
         // 2. Performer / Actress / Pornstar match
@@ -546,8 +554,8 @@ class SmartTasteEngine(
         ensureFreshLoadedLocked()
         val queries = mutableListOf<String>()
 
-        // 1. Core canonical concepts first!
-        val topCore = topKeys(concepts, 6)
+        // 1. Core canonical content themes first (never format tags like uncensored/subtitle)!
+        val topCore = topConceptsRanked(6)
         for (c in topCore) {
             if (queries.size >= maxQueries) break
             queries += c
@@ -621,11 +629,14 @@ class SmartTasteEngine(
             bump(sourceUsage, srcId, weight, MAX_SOURCES)
         }
 
-        // 1. Canonical core concepts (strongest weight — unites 3some/threesome, 4some/foursome, etc.)
+        // 1. Canonical core concepts (ignore video-format tags like uncensored/subtitle so
+        //    real content themes like threesome/foursome always dominate!)
         val expandedTags = tagsList.flatMap { splitMultiEntities(it) }
         val extractedConcepts = extractConcepts(title, expandedTags + categoriesList)
         for (concept in extractedConcepts) {
-            bump(concepts, concept, weight * 1.45, MAX_CONCEPTS)
+            if (concept in FORMAT_ONLY_CONCEPTS) continue
+            val spec = CONCEPT_SPECIFICITY[concept] ?: 1.0
+            bump(concepts, concept, weight * 1.45 * spec, MAX_CONCEPTS)
         }
 
         // 2. Title keywords & bigrams (lower secondary weight)
@@ -746,6 +757,7 @@ class SmartTasteEngine(
             lastAppliedSeed = root.optString("seed", "")
             readWeightMap(root.optJSONObject("src"), sourceUsage)
             readWeightMap(root.optJSONObject("cn"), concepts)
+            FORMAT_ONLY_CONCEPTS.forEach { concepts.remove(it) }
             readWeightMap(root.optJSONObject("kw"), keywords)
             readWeightMap(root.optJSONObject("bg"), bigrams)
             readWeightMap(root.optJSONObject("tg"), tags)
@@ -983,6 +995,41 @@ class SmartTasteEngine(
             "public" to Regex("""\b(?:public|outdoor|voyeur|flashing)\b"""),
             "hentai" to Regex("""\b(?:hentai|anime\s*porn|3d\s*hentai|rule34)\b"""),
             "english subtitle" to Regex("""\b(?:english\s*sub(?:title)?s?|eng\s*sub)\b"""),
+        )
+
+        // Video edition / format tags that appear on almost every JAV release and should
+        // NEVER crowd out actual content themes like threesome, foursome, cuckold, anal, etc.
+        private val FORMAT_ONLY_CONCEPTS = setOf("uncensored", "english subtitle")
+
+        // Specificity (IDF-like) multipliers: distinctive themes rank above generic universal traits.
+        private val CONCEPT_SPECIFICITY = mapOf(
+            "threesome" to 1.75,
+            "foursome" to 1.85,
+            "orgy" to 1.70,
+            "cuckold" to 1.55,
+            "anal" to 1.55,
+            "lesbian" to 1.50,
+            "bdsm" to 1.50,
+            "stepfamily" to 1.45,
+            "squirt" to 1.45,
+            "massage" to 1.45,
+            "interracial" to 1.45,
+            "cosplay" to 1.35,
+            "feet" to 1.45,
+            "public" to 1.40,
+            "hentai" to 1.45,
+            "arab" to 1.45,
+            "pov" to 1.25,
+            "milf" to 1.15,
+            "creampie" to 1.05,
+            "big tits" to 0.72,
+            "big ass" to 0.72,
+            "hardcore" to 0.65,
+            "blowjob" to 0.70,
+            "masturbation" to 0.70,
+            "amateur" to 0.75,
+            "asian" to 0.65,
+            "facial" to 0.75,
         )
 
         private val GENERIC_TAG_STOPWORDS = setOf(
