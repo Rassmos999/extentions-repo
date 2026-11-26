@@ -109,16 +109,30 @@ class SexTB :
     @Volatile
     private var webBridgeUntilMs: Long = 0L
 
-    // Adaptive global site request pacer so bursts (filters, paging, host fallback searches)
-    // never overwhelm sextb.net's strict per-IP rate limiter with HTTP 429 storms.
-    private val siteRateLock = Any()
-    private val highPriorityWaiters = AtomicInteger(0)
+    // Separate per-endpoint adaptive rate limiters so search traffic never blocks
+    // listings, filters, video details, or /ajax/player playback requests.
+    private enum class RateBucket(val normalGapMs: Long, val cooldownGapMs: Long) {
+        LISTING(LISTING_REQUEST_GAP_MS, LISTING_COOLDOWN_GAP_MS),
+        PLAYER(PLAYER_REQUEST_GAP_MS, PLAYER_COOLDOWN_GAP_MS),
+        SEARCH(SEARCH_REQUEST_GAP_MS, SEARCH_COOLDOWN_GAP_MS),
+    }
 
-    @Volatile
-    private var nextAllowedSiteRequestMs: Long = 0L
+    private class BucketPacer(val bucket: RateBucket) {
+        val lock = Any()
+        val highPriorityWaiters = AtomicInteger(0)
 
-    @Volatile
-    private var rateLimitCooldownUntilMs: Long = 0L
+        @Volatile
+        var nextAllowedMs: Long = 0L
+
+        @Volatile
+        var cooldownUntilMs: Long = 0L
+    }
+
+    private val pacers = mapOf(
+        RateBucket.LISTING to BucketPacer(RateBucket.LISTING),
+        RateBucket.PLAYER to BucketPacer(RateBucket.PLAYER),
+        RateBucket.SEARCH to BucketPacer(RateBucket.SEARCH),
+    )
 
     private class InFlightGet {
         val latch = CountDownLatch(1)
@@ -269,34 +283,52 @@ class SexTB :
     }
 
     private fun searchByMovieQuery(page: Int, query: String): AnimesPage {
+        val normalizedKey = "ajax-search:${query.lowercase(Locale.ROOT)}:$page"
+        val now = System.currentTimeMillis()
+        pageCache[normalizedKey]?.takeIf { (ts, cachedPage) ->
+            val ttl = if (cachedPage.animes.isEmpty()) EMPTY_PAGE_CACHE_TTL_MS else PAGE_CACHE_TTL_MS
+            now - ts < ttl
+        }?.let { return it.second }
+
+        // Prefer SexTB's lightweight JSON /ajax/search endpoint (~30KB, much higher rate limit
+        // than HTML /search/<slug> which is capped at ~4 req/min with a 60s window).
+        val ajaxResult = try {
+            searchViaAjaxMovies(query, page)
+        } catch (e: CloudflareBlockedException) {
+            throw e
+        } catch (e: Throwable) {
+            Log.w(TAG, "/ajax/search failed for '$query': ${e.message}")
+            null
+        }
+        if (ajaxResult != null) {
+            if (pageCache.size > 80) pageCache.clear()
+            pageCache[normalizedKey] = System.currentTimeMillis() to ajaxResult
+            return ajaxResult
+        }
+
+        // Fallback to HTML /search/<slug> only if /ajax/search itself failed.
         val primaryReq = buildMovieSearchRequest(page, query)
-        val primaryPage = try {
-            executeCachedListing(primaryReq, highPriority = false)
+        return try {
+            executeCachedListing(primaryReq, highPriority = false, bucket = RateBucket.SEARCH)
         } catch (e: HttpStatusException) {
             if (e.code == 404) AnimesPage(emptyList(), false) else throw e
         }
-        if (primaryPage.animes.isNotEmpty() || page > 1) return primaryPage
-
-        // Only hit /ajax/search fallback for concise real searches when not in 429 cooldown.
-        if (query.length > 60 || System.currentTimeMillis() < rateLimitCooldownUntilMs) {
-            return primaryPage
-        }
-        val ajaxPage = runCatching { searchViaAjaxMovies(query, page) }.getOrNull()
-        return if (ajaxPage != null && ajaxPage.animes.isNotEmpty()) ajaxPage else primaryPage
     }
 
-    private fun searchViaAjaxMovies(query: String, page: Int): AnimesPage {
+    private fun searchViaAjaxMovies(query: String, page: Int): AnimesPage? {
+        val curPage = page.coerceAtLeast(1)
         val resp = executeSitePost(
             url = "$baseUrl/ajax/search",
             formParams = listOf(
                 "q" to query,
-                "page" to page.coerceAtLeast(1).toString(),
+                "page" to curPage.toString(),
                 "type" to "movie",
             ),
             referer = "$baseUrl/",
             highPriority = false,
+            bucket = RateBucket.SEARCH,
         )
-        if (resp.status !in 200..299) return AnimesPage(emptyList(), false)
+        if (resp.status !in 200..299) return null
         val json = JSONObject(resp.body)
         val hits = json.optJSONArray("hits") ?: return AnimesPage(emptyList(), false)
         val animes = buildList {
@@ -307,6 +339,7 @@ class SexTB :
                 val rawName = Jsoup.parse(obj.optString("name")).text().trim()
                 val runtime = obj.optString("runtimes").trim()
                 val isLtx = obj.optBoolean("ltx", false)
+                val version = obj.optString("version").trim()
                 val poster = obj.optString("poster").trim()
                 add(
                     SAnime.create().apply {
@@ -316,7 +349,9 @@ class SexTB :
                             if (!rawName.contains(upper, ignoreCase = true)) {
                                 append("[").append(upper).append("] ")
                             }
-                            if (isLtx && !rawName.contains("LTX", ignoreCase = true)) {
+                            if (version.isNotBlank() && !rawName.contains(version, ignoreCase = true)) {
+                                append("[").append(version).append("] ")
+                            } else if (isLtx && !rawName.contains("LTX", ignoreCase = true)) {
                                 append("[LTX] ")
                             }
                             append(rawName.ifBlank { upper })
@@ -329,7 +364,10 @@ class SexTB :
                 )
             }
         }
-        return AnimesPage(animes, false)
+        val totalPages = json.optInt("totalPages", 1)
+        val hasNext = animes.isNotEmpty() && curPage < totalPages
+        Log.i(TAG, "AjaxSearch q='$query' p=$curPage/$totalPages count=${animes.size} viaWeb=${resp.viaWebView}")
+        return AnimesPage(animes, hasNext)
     }
 
     private fun searchByActressQuery(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
@@ -362,6 +400,8 @@ class SexTB :
                     "type" to "actor",
                 ),
                 referer = "$baseUrl/",
+                highPriority = true,
+                bucket = RateBucket.SEARCH,
             )
             if (resp.status !in 200..299) return@runCatching null
             val json = JSONObject(resp.body)
@@ -718,6 +758,7 @@ class SexTB :
         request: Request,
         cardMode: CardMode = CardMode.ALL,
         highPriority: Boolean = true,
+        bucket: RateBucket = RateBucket.LISTING,
     ): AnimesPage {
         val key = if (cardMode == CardMode.ALL) request.url.toString() else "${request.url}#${cardMode.name}"
         val now = System.currentTimeMillis()
@@ -727,11 +768,13 @@ class SexTB :
         }
         if (cached != null) return cached.second
 
-        val siteResp = executeSiteGet(request, highPriority = highPriority)
+        val siteResp = executeSiteGet(request, highPriority = highPriority, bucket = bucket)
         rememberCatalogPathFromUrl(siteResp.finalUrl)
-        val result = parseListingDocument(Jsoup.parse(siteResp.body, siteResp.finalUrl), cardMode)
+        val doc = Jsoup.parse(siteResp.body, siteResp.finalUrl)
+        harvestHashedCatalogLinks(doc)
+        val result = parseListingDocument(doc, cardMode)
         Log.i(TAG, "Listing parsed url=${siteResp.finalUrl} mode=$cardMode count=${result.animes.size} hasNext=${result.hasNextPage} viaWeb=${siteResp.viaWebView}")
-        if (pageCache.size > 60) pageCache.clear()
+        if (pageCache.size > 80) pageCache.clear()
         pageCache[key] = System.currentTimeMillis() to result
         return result
     }
@@ -1074,44 +1117,60 @@ class SexTB :
 
         var token = initialToken
         var key = initialKey
-        val resolvedPlayers = mutableListOf<PlayerTarget>()
         var sawHumanCheck = false
 
-        for (button in playerButtons) {
-            val episodeId = button.attr("data-id").trim()
-            val filmId = button.attr("data-source").ifBlank { fallbackFilmId }.trim()
-            if (episodeId.isBlank() || filmId.isBlank()) continue
+        fun resolveBatch(buttons: List<Element>): List<PlayerTarget> {
+            val batch = mutableListOf<PlayerTarget>()
+            for (button in buttons) {
+                val episodeId = button.attr("data-id").trim()
+                val filmId = button.attr("data-source").ifBlank { fallbackFilmId }.trim()
+                if (episodeId.isBlank() || filmId.isBlank()) continue
 
-            val payload = fetchPlayerPayload(episodeId, filmId, token, referer) ?: continue
-            if (payload.humanCheckRequired) {
-                sawHumanCheck = true
+                val payload = fetchPlayerPayload(episodeId, filmId, token, referer) ?: continue
+                if (payload.humanCheckRequired) {
+                    sawHumanCheck = true
+                    token = payload.nextToken.ifBlank { token }
+                    key = payload.nextKey.ifBlank { key }
+                    break
+                }
+
+                val decrypted = xorDecrypt(payload.encryptedPlayer, key)
                 token = payload.nextToken.ifBlank { token }
                 key = payload.nextKey.ifBlank { key }
-                break
+                if (decrypted.isBlank()) continue
+
+                val label = normalizeServerLabel(button.text())
+                extractPlayerUrls(decrypted, referer).forEach { url ->
+                    batch += PlayerTarget(label, url.redirectHgLink(), referer)
+                }
             }
+            return batch.distinctBy { it.url }.sortedBy { serverPriority(it.label) }
+        }
 
-            val decrypted = xorDecrypt(payload.encryptedPlayer, key)
-            token = payload.nextToken.ifBlank { token }
-            key = payload.nextKey.ifBlank { key }
-            if (decrypted.isBlank()) continue
+        // Resolve top 2 prioritized servers first (cuts /ajax/player calls in half & speeds up Play);
+        // only fall back to remaining servers if the first wave yields no playable stream.
+        val firstWaveButtons = playerButtons.take(INITIAL_SERVERS_TO_RESOLVE)
+        val fallbackButtons = playerButtons.drop(INITIAL_SERVERS_TO_RESOLVE)
 
-            val label = normalizeServerLabel(button.text())
-            extractPlayerUrls(decrypted, referer).forEach { url ->
-                resolvedPlayers += PlayerTarget(label, url.redirectHgLink(), referer)
+        var prioritizedPlayers = resolveBatch(firstWaveButtons)
+        var rawVideos = if (prioritizedPlayers.isNotEmpty()) {
+            extractPlayersInParallel(prioritizedPlayers).distinctBy { it.videoUrl ?: it.url }
+        } else {
+            emptyList()
+        }
+
+        if (rawVideos.isEmpty() && !sawHumanCheck && fallbackButtons.isNotEmpty()) {
+            val fallbackPlayers = resolveBatch(fallbackButtons)
+            if (fallbackPlayers.isNotEmpty()) {
+                prioritizedPlayers = (prioritizedPlayers + fallbackPlayers).distinctBy { it.url }
+                rawVideos = extractPlayersInParallel(fallbackPlayers).distinctBy { it.videoUrl ?: it.url }
             }
         }
 
-        if (resolvedPlayers.isEmpty()) {
+        if (prioritizedPlayers.isEmpty()) {
             if (sawHumanCheck) throw HumanVerificationException()
             throw IOException("SexTB could not resolve any server. Open this video in WebView once, then retry.")
         }
-
-        val prioritizedPlayers = resolvedPlayers
-            .distinctBy { it.url }
-            .sortedBy { serverPriority(it.label) }
-
-        val rawVideos = extractPlayersInParallel(prioritizedPlayers)
-            .distinctBy { it.videoUrl ?: it.url }
 
         val finalVideos = if (isSeekCacheEnabled()) {
             m3u8Server.wrapVideosForCache(
@@ -1546,6 +1605,8 @@ class SexTB :
                 "ts" to "",
             ),
             referer = referer,
+            highPriority = true,
+            bucket = RateBucket.PLAYER,
         )
         if (resp.status !in 200..299) {
             null
@@ -1594,20 +1655,24 @@ class SexTB :
         return false
     }
 
-    private fun acquireSiteRequestSlot(highPriority: Boolean = true) {
-        if (highPriority) highPriorityWaiters.incrementAndGet()
+    private fun acquireSiteRequestSlot(
+        bucket: RateBucket = RateBucket.LISTING,
+        highPriority: Boolean = true,
+    ) {
+        val pacer = pacers.getValue(bucket)
+        if (highPriority) pacer.highPriorityWaiters.incrementAndGet()
         try {
             while (true) {
                 var sleepMs = 0L
-                synchronized(siteRateLock) {
+                synchronized(pacer.lock) {
                     val now = System.currentTimeMillis()
-                    if (!highPriority && highPriorityWaiters.get() > 0) {
-                        sleepMs = 150L
-                    } else if (now < nextAllowedSiteRequestMs) {
-                        sleepMs = nextAllowedSiteRequestMs - now
+                    if (!highPriority && pacer.highPriorityWaiters.get() > 0) {
+                        sleepMs = 120L
+                    } else if (now < pacer.nextAllowedMs) {
+                        sleepMs = pacer.nextAllowedMs - now
                     } else {
-                        val gap = if (now < rateLimitCooldownUntilMs) COOLDOWN_REQUEST_GAP_MS else MIN_SITE_REQUEST_GAP_MS
-                        nextAllowedSiteRequestMs = now + gap
+                        val gap = if (now < pacer.cooldownUntilMs) bucket.cooldownGapMs else bucket.normalGapMs
+                        pacer.nextAllowedMs = now + gap
                         return
                     }
                 }
@@ -1621,27 +1686,46 @@ class SexTB :
                 }
             }
         } finally {
-            if (highPriority) highPriorityWaiters.decrementAndGet()
+            if (highPriority) pacer.highPriorityWaiters.decrementAndGet()
         }
     }
 
-    private fun noteRateLimitHit(retryAfterSeconds: Long?, attempt: Int) {
+    private fun noteRateLimitHit(bucket: RateBucket, retryAfterSeconds: Long?, attempt: Int): Boolean {
+        // If search endpoint returns a long 60s Retry-After window, fail fast instead of
+        // stalling threads for a full minute (other buckets stay completely unaffected).
+        if (bucket == RateBucket.SEARCH && retryAfterSeconds != null && retryAfterSeconds > 15L) {
+            val pacer = pacers.getValue(bucket)
+            synchronized(pacer.lock) {
+                val now = System.currentTimeMillis()
+                pacer.cooldownUntilMs = maxOf(pacer.cooldownUntilMs, now + RATE_LIMIT_COOLDOWN_MS)
+                pacer.nextAllowedMs = maxOf(pacer.nextAllowedMs, now + 4_000L)
+            }
+            Log.w(TAG, "SexTB HTTP 429 on $bucket with Retry-After=${retryAfterSeconds}s; failing fast to avoid stall.")
+            return false
+        }
+
         val baseBackoff = when (attempt) {
             0 -> RATE_LIMIT_BACKOFF_1_MS
             1 -> RATE_LIMIT_BACKOFF_2_MS
             else -> RATE_LIMIT_BACKOFF_3_MS
         }
-        val headerBackoff = retryAfterSeconds?.coerceIn(1L, 12L)?.times(1_000L) ?: 0L
+        val headerBackoff = retryAfterSeconds?.coerceIn(1L, 8L)?.times(1_000L) ?: 0L
         val delayMs = maxOf(baseBackoff, headerBackoff)
-        synchronized(siteRateLock) {
+        val pacer = pacers.getValue(bucket)
+        synchronized(pacer.lock) {
             val now = System.currentTimeMillis()
-            rateLimitCooldownUntilMs = maxOf(rateLimitCooldownUntilMs, now + RATE_LIMIT_COOLDOWN_MS)
-            nextAllowedSiteRequestMs = maxOf(nextAllowedSiteRequestMs, now + delayMs)
+            pacer.cooldownUntilMs = maxOf(pacer.cooldownUntilMs, now + RATE_LIMIT_COOLDOWN_MS)
+            pacer.nextAllowedMs = maxOf(pacer.nextAllowedMs, now + delayMs)
         }
-        Log.w(TAG, "SexTB HTTP 429 (attempt ${attempt + 1}/$MAX_429_RETRIES); backing off ${delayMs}ms globally.")
+        Log.w(TAG, "SexTB HTTP 429 on $bucket (attempt ${attempt + 1}/$MAX_429_RETRIES); backing off ${delayMs}ms.")
+        return true
     }
 
-    private fun executeSiteGet(request: Request, highPriority: Boolean = true): SiteResponse {
+    private fun executeSiteGet(
+        request: Request,
+        highPriority: Boolean = true,
+        bucket: RateBucket = RateBucket.LISTING,
+    ): SiteResponse {
         val url = request.url.toString()
 
         // Single-flight coalescing: if another coroutine is already fetching the exact same URL,
@@ -1664,7 +1748,7 @@ class SexTB :
         }
 
         try {
-            val response = executeSiteGetInternal(request, url, highPriority)
+            val response = executeSiteGetInternal(request, url, highPriority, bucket)
             newHolder.result.set(response)
             return response
         } catch (t: Throwable) {
@@ -1676,9 +1760,14 @@ class SexTB :
         }
     }
 
-    private fun executeSiteGetInternal(request: Request, url: String, highPriority: Boolean): SiteResponse {
+    private fun executeSiteGetInternal(
+        request: Request,
+        url: String,
+        highPriority: Boolean,
+        bucket: RateBucket,
+    ): SiteResponse {
         for (attempt in 0..MAX_429_RETRIES) {
-            acquireSiteRequestSlot(highPriority)
+            acquireSiteRequestSlot(bucket, highPriority)
 
             if (!shouldUseWebBridge()) {
                 var switchedToBridge = false
@@ -1686,8 +1775,7 @@ class SexTB :
                     client.newCall(request).execute().use { resp ->
                         resp.throwIfCloudflareChallenge()
                         if (resp.code == 429) {
-                            if (attempt < MAX_429_RETRIES) {
-                                noteRateLimitHit(resp.header("Retry-After")?.toLongOrNull(), attempt)
+                            if (attempt < MAX_429_RETRIES && noteRateLimitHit(bucket, resp.header("Retry-After")?.toLongOrNull(), attempt)) {
                                 continue
                             }
                             throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
@@ -1709,7 +1797,7 @@ class SexTB :
                     switchedToBridge = true
                 }
                 if (switchedToBridge) {
-                    acquireSiteRequestSlot(highPriority)
+                    acquireSiteRequestSlot(bucket, highPriority)
                 }
             }
 
@@ -1721,8 +1809,7 @@ class SexTB :
                 ),
             )
             if (webResp.status == 429) {
-                if (attempt < MAX_429_RETRIES) {
-                    noteRateLimitHit(webResp.retryAfterSeconds, attempt)
+                if (attempt < MAX_429_RETRIES && noteRateLimitHit(bucket, webResp.retryAfterSeconds, attempt)) {
                     continue
                 }
                 throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
@@ -1745,13 +1832,14 @@ class SexTB :
         formParams: List<Pair<String, String>>,
         referer: String,
         highPriority: Boolean = true,
+        bucket: RateBucket = RateBucket.PLAYER,
     ): SiteResponse {
         val encodedForm = formParams.joinToString("&") { (k, v) ->
             "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
         }
 
         for (attempt in 0..MAX_429_RETRIES) {
-            acquireSiteRequestSlot(highPriority)
+            acquireSiteRequestSlot(bucket, highPriority)
 
             if (!shouldUseWebBridge()) {
                 val form = FormBody.Builder().apply {
@@ -1768,8 +1856,7 @@ class SexTB :
                     fastExtractorClient.newCall(POST(url, ajaxHeaders, form)).execute().use { resp ->
                         resp.throwIfCloudflareChallenge()
                         if (resp.code == 429) {
-                            if (attempt < MAX_429_RETRIES) {
-                                noteRateLimitHit(resp.header("Retry-After")?.toLongOrNull(), attempt)
+                            if (attempt < MAX_429_RETRIES && noteRateLimitHit(bucket, resp.header("Retry-After")?.toLongOrNull(), attempt)) {
                                 continue
                             }
                             throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
@@ -1787,7 +1874,7 @@ class SexTB :
                     switchedToBridge = true
                 }
                 if (switchedToBridge) {
-                    acquireSiteRequestSlot(highPriority)
+                    acquireSiteRequestSlot(bucket, highPriority)
                 }
             }
 
@@ -1802,8 +1889,7 @@ class SexTB :
                 ),
             )
             if (webResp.status == 429) {
-                if (attempt < MAX_429_RETRIES) {
-                    noteRateLimitHit(webResp.retryAfterSeconds, attempt)
+                if (attempt < MAX_429_RETRIES && noteRateLimitHit(bucket, webResp.retryAfterSeconds, attempt)) {
                     continue
                 }
                 throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
@@ -1932,6 +2018,16 @@ class SexTB :
 
     private fun Response.rememberCatalogPath() {
         rememberCatalogPathFromUrl(request.url.toString())
+    }
+
+    private fun harvestHashedCatalogLinks(document: Document) {
+        if (resolvedCatalogPaths.size > 200) return
+        document.select("a[href^=\"/jav-\"], a[href^=\"/genre/\"], a[href^=\"/studio/\"]").forEach { link ->
+            val href = link.attr("href").trim()
+            if (href.startsWith("/")) {
+                rememberCatalogPathFromUrl("$baseUrl$href")
+            }
+        }
     }
 
     private fun rememberCatalogPathFromUrl(url: String) {
@@ -2093,6 +2189,7 @@ class SexTB :
         private const val TOP_MONTH_SENTINEL = "__TOP_MONTH__"
 
         private const val MAX_PLAYER_DEPTH = 1
+        private const val INITIAL_SERVERS_TO_RESOLVE = 2
         private const val MAX_SERVERS_TO_RESOLVE = 4
         private const val MAX_MULTI_SELECT = 5
         private const val MAX_MULTI_TARGETS = 4
@@ -2104,13 +2201,17 @@ class SexTB :
         private const val VIDEO_CACHE_TTL_MS = 3 * 60 * 1000L
         private const val TOP_CHART_CACHE_TTL_MS = 10 * 60 * 1000L
         private const val WEB_BRIDGE_TTL_MS = 15 * 60 * 1000L
-        private const val MIN_SITE_REQUEST_GAP_MS = 650L
-        private const val COOLDOWN_REQUEST_GAP_MS = 1_600L
-        private const val RATE_LIMIT_COOLDOWN_MS = 20_000L
-        private const val RATE_LIMIT_BACKOFF_1_MS = 1_600L
-        private const val RATE_LIMIT_BACKOFF_2_MS = 3_200L
-        private const val RATE_LIMIT_BACKOFF_3_MS = 5_500L
-        private const val MAX_429_RETRIES = 3
+        private const val LISTING_REQUEST_GAP_MS = 220L
+        private const val LISTING_COOLDOWN_GAP_MS = 1_200L
+        private const val PLAYER_REQUEST_GAP_MS = 250L
+        private const val PLAYER_COOLDOWN_GAP_MS = 1_200L
+        private const val SEARCH_REQUEST_GAP_MS = 280L
+        private const val SEARCH_COOLDOWN_GAP_MS = 1_500L
+        private const val RATE_LIMIT_COOLDOWN_MS = 15_000L
+        private const val RATE_LIMIT_BACKOFF_1_MS = 1_200L
+        private const val RATE_LIMIT_BACKOFF_2_MS = 2_500L
+        private const val RATE_LIMIT_BACKOFF_3_MS = 4_500L
+        private const val MAX_429_RETRIES = 2
         private const val SINGLE_FLIGHT_WAIT_MS = 25_000L
         private const val CHALLENGE_PEEK_BYTES = 512L * 1024L
         private const val UPN_AES_KEY = "kiemtienmua911ca"
