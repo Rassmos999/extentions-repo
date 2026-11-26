@@ -1,8 +1,10 @@
 package eu.kanade.tachiyomi.animeextension.all.pornhub
 
+import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -32,8 +34,10 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
 
 class PornHub :
     AnimeHttpSource(),
@@ -52,6 +56,17 @@ class PornHub :
     override val disableRelatedAnimesBySearch = true
 
     private val preferences by getPreferencesLazy()
+
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "pornhub").also { engine ->
+            engine.applySeedText(preferences.getString(PREF_TASTE_SEED_KEY, null))
+        }
+    }
+
+    private val seenSearchUrls = ConcurrentHashMap<String, MutableSet<String>>()
+
+    private fun isSmartTasteEnabled(): Boolean = preferences.getBoolean(PREF_SMART_TASTE_KEY, true)
+    private fun isForYouDefault(): Boolean = preferences.getString(PREF_DEFAULT_FEED_KEY, "ht") == PornHubFilters.FOR_YOU_SORT
 
     private val json by lazy {
         Json {
@@ -88,11 +103,17 @@ class PornHub :
     // ============================== Popular ===============================
 
     override suspend fun getPopularAnime(page: Int): AnimesPage = withContext(Dispatchers.IO) {
+        if (isSmartTasteEnabled() && isForYouDefault() && tasteEngine.hasLearnedProfile()) {
+            return@withContext fetchForYouPage(page)
+        }
         val pageResult = phClient.fetchPage(
             request = popularAnimeRequest(page),
             cacheTtlMs = PornHubClient.BROWSE_CACHE_TTL_MS,
+            bucket = PornHubClient.RateBucket.LISTING,
+            highPriority = true,
         )
-        parseListingDocument(Jsoup.parse(pageResult.html, pageResult.finalUrl))
+        val parsed = parseListingDocument(Jsoup.parse(pageResult.html, pageResult.finalUrl))
+        applySmartRerank(parsed)
     }
 
     override fun popularAnimeRequest(page: Int): Request = GET(browseUrl(page = page, sort = "ht"), headers)
@@ -105,8 +126,11 @@ class PornHub :
         val pageResult = phClient.fetchPage(
             request = latestUpdatesRequest(page),
             cacheTtlMs = PornHubClient.BROWSE_CACHE_TTL_MS,
+            bucket = PornHubClient.RateBucket.LISTING,
+            highPriority = true,
         )
-        parseListingDocument(Jsoup.parse(pageResult.html, pageResult.finalUrl))
+        val parsed = parseListingDocument(Jsoup.parse(pageResult.html, pageResult.finalUrl))
+        applySmartRerank(parsed)
     }
 
     override fun latestUpdatesRequest(page: Int): Request = GET(browseUrl(page = page, sort = "cm"), headers)
@@ -123,19 +147,198 @@ class PornHub :
         val cleanQuery = query.replace(DURATION_PREFIX_REGEX, "").trim()
         if (cleanQuery.equals("view video.php", ignoreCase = true) ||
             cleanQuery.equals("view_video.php", ignoreCase = true) ||
-            cleanQuery.startsWith("uploader:", ignoreCase = true)
+            cleanQuery.startsWith("uploader:", ignoreCase = true) ||
+            cleanQuery.startsWith("duration:", ignoreCase = true) ||
+            cleanQuery.startsWith("views:", ignoreCase = true) ||
+            cleanQuery.startsWith("rating:", ignoreCase = true)
         ) {
             return@withContext AnimesPage(emptyList(), false)
         }
+
+        val f = PornHubFilters.extract(filters)
+        if (cleanQuery.isBlank() && f.sort == PornHubFilters.FOR_YOU_SORT) {
+            return@withContext fetchForYouPage(page)
+        }
+
+        if (page == 1 && isSmartTasteEnabled()) {
+            val perfSignals = buildList {
+                if (f.pornstar.isNotBlank()) add(f.pornstar.replace('-', ' '))
+                if (f.targetName.isNotBlank()) add(f.targetName)
+            }
+            tasteEngine.recordSearchOrFilter(
+                query = cleanQuery.takeIf { it.isNotBlank() },
+                performersList = perfSignals,
+                categoriesList = f.categories,
+            )
+        }
+
+        // Multi-category selection (2–4 categories): fetch each category paced cleanly
+        // through RateBucket.LISTING and round-robin interleave so every selected category shows evenly.
+        if (cleanQuery.isBlank() && f.categories.size > 1 && resolveTargetRoute("", f) == null) {
+            return@withContext fetchMultiCategoryPage(page, f)
+        }
+
+        val isKeywordSearch = cleanQuery.isNotBlank()
         val pageResult = phClient.fetchPage(
             request = searchAnimeRequest(page, cleanQuery, filters),
             cacheTtlMs = PornHubClient.BROWSE_CACHE_TTL_MS,
             allow404Empty = true,
+            bucket = if (isKeywordSearch) PornHubClient.RateBucket.SEARCH else PornHubClient.RateBucket.LISTING,
+            highPriority = !isKeywordSearch,
         )
         if (pageResult.statusCode == 404 || pageResult.html.isBlank()) {
             return@withContext AnimesPage(emptyList(), false)
         }
-        parseListingDocument(Jsoup.parse(pageResult.html, pageResult.finalUrl), isSearch = true)
+        val parsed = parseListingDocument(Jsoup.parse(pageResult.html, pageResult.finalUrl), isSearch = isKeywordSearch)
+        if (isKeywordSearch) {
+            deduplicateSearchPage(cleanQuery.lowercase(Locale.ROOT), page, parsed)
+        } else {
+            applySmartRerank(parsed)
+        }
+    }
+
+    private fun deduplicateSearchPage(normQuery: String, page: Int, rawPage: AnimesPage): AnimesPage {
+        if (page <= 1) {
+            if (seenSearchUrls.size > 40) seenSearchUrls.clear()
+            val fresh = Collections.synchronizedSet(HashSet<String>())
+            val unique = rawPage.animes.filter { fresh.add(it.url.lowercase(Locale.ROOT)) }
+            seenSearchUrls[normQuery] = fresh
+            return AnimesPage(unique, rawPage.hasNextPage && unique.isNotEmpty())
+        }
+        val seen = seenSearchUrls.computeIfAbsent(normQuery) { Collections.synchronizedSet(HashSet()) }
+        val unique = rawPage.animes.filter { seen.add(it.url.lowercase(Locale.ROOT)) }
+        return AnimesPage(unique, rawPage.hasNextPage && unique.isNotEmpty())
+    }
+
+    private fun fetchMultiCategoryPage(page: Int, f: PornHubFilters.FilterData): AnimesPage {
+        val pages = mutableListOf<AnimesPage>()
+        var firstError: Throwable? = null
+        for (cat in f.categories) {
+            val req = GET(
+                browseUrl(
+                    page = page,
+                    sort = f.sort,
+                    category = cat,
+                    orientation = f.orientation,
+                    production = f.production,
+                    duration = f.duration,
+                    hd = f.quality,
+                ),
+                headers,
+            )
+            try {
+                val res = phClient.fetchPage(
+                    request = req,
+                    cacheTtlMs = PornHubClient.BROWSE_CACHE_TTL_MS,
+                    allow404Empty = true,
+                    bucket = PornHubClient.RateBucket.LISTING,
+                    highPriority = true,
+                )
+                if (res.statusCode != 404 && res.html.isNotBlank()) {
+                    pages += parseListingDocument(Jsoup.parse(res.html, res.finalUrl))
+                }
+            } catch (t: Throwable) {
+                if (firstError == null) firstError = t
+            }
+        }
+        if (pages.isEmpty()) {
+            if (firstError != null) throw firstError
+            return AnimesPage(emptyList(), false)
+        }
+        val interleaved = mutableListOf<SAnime>()
+        val seen = HashSet<String>()
+        val maxLen = pages.maxOfOrNull { it.animes.size } ?: 0
+        for (i in 0 until maxLen) {
+            for (p in pages) {
+                val item = p.animes.getOrNull(i) ?: continue
+                if (seen.add(item.url.lowercase(Locale.ROOT))) interleaved += item
+            }
+        }
+        return applySmartRerank(AnimesPage(interleaved, pages.any { it.hasNextPage }))
+    }
+
+    private fun applySmartRerank(page: AnimesPage): AnimesPage {
+        if (!isSmartTasteEnabled() || page.animes.size < 3 || !tasteEngine.hasLearnedProfile()) {
+            return page
+        }
+        return AnimesPage(
+            tasteEngine.rankCandidates(page.animes, excludeWatched = false, blendWithOriginalRank = true),
+            page.hasNextPage,
+        )
+    }
+
+    private fun fetchForYouPage(page: Int): AnimesPage {
+        val snap = tasteEngine.snapshot()
+        val requests = mutableListOf<Pair<Request, PornHubClient.RateBucket>>()
+
+        // 1. Top learned category (local PornHub category ID or matched from global learned tags).
+        val matchedCat = snap.topCategories.firstOrNull()
+            ?: snap.topTags.firstNotNullOfOrNull { PornHubFilters.findCategoryValueByName(it) }
+        if (!matchedCat.isNullOrBlank()) {
+            requests += GET(browseUrl(page = page, sort = "ht", category = matchedCat), headers) to PornHubClient.RateBucket.LISTING
+        }
+
+        // 2. Top learned title topic / keywords (from saved titles, watched titles, or seed text).
+        val titleQueries = tasteEngine.buildTitleSearchQueries(maxQueries = 2)
+        titleQueries.firstOrNull()?.let { q ->
+            requests += buildKeywordSearchRequest(page, q) to PornHubClient.RateBucket.SEARCH
+        }
+
+        // 3. Top learned performer/star (or second title query / trending fallback).
+        val topStar = snap.topPerformers.firstOrNull()
+        if (!topStar.isNullOrBlank() && requests.size < 3) {
+            requests += buildKeywordSearchRequest(page, topStar) to PornHubClient.RateBucket.SEARCH
+        } else if (titleQueries.size > 1 && requests.size < 3) {
+            requests += buildKeywordSearchRequest(page, titleQueries[1]) to PornHubClient.RateBucket.SEARCH
+        }
+
+        if (requests.isEmpty()) {
+            val fallbackRes = phClient.fetchPage(
+                request = popularAnimeRequest(page),
+                cacheTtlMs = PornHubClient.BROWSE_CACHE_TTL_MS,
+                bucket = PornHubClient.RateBucket.LISTING,
+                highPriority = true,
+            )
+            return parseListingDocument(Jsoup.parse(fallbackRes.html, fallbackRes.finalUrl))
+        }
+
+        val combined = mutableListOf<SAnime>()
+        val seen = HashSet<String>()
+        var anyNext = false
+        for ((req, bucket) in requests.take(3)) {
+            val res = runCatching {
+                phClient.fetchPage(
+                    request = req,
+                    cacheTtlMs = PornHubClient.BROWSE_CACHE_TTL_MS,
+                    allow404Empty = true,
+                    bucket = bucket,
+                    highPriority = true,
+                )
+            }.getOrNull() ?: continue
+            if (res.statusCode == 404 || res.html.isBlank()) continue
+            val parsed = parseListingDocument(Jsoup.parse(res.html, res.finalUrl), isSearch = bucket == PornHubClient.RateBucket.SEARCH)
+            if (parsed.hasNextPage) anyNext = true
+            for (item in parsed.animes) {
+                if (seen.add(item.url.lowercase(Locale.ROOT))) {
+                    combined += item
+                }
+            }
+        }
+
+        val ranked = tasteEngine.rankCandidates(combined, excludeWatched = true, blendWithOriginalRank = false)
+        return AnimesPage(ranked, anyNext)
+    }
+
+    private fun buildKeywordSearchRequest(page: Int, query: String): Request {
+        val clean = query.replace(SEARCH_SANITIZE_REGEX, " ").replace(WHITESPACE_REGEX, " ").trim().lowercase(Locale.ROOT)
+        val url = baseUrl.toHttpUrl().newBuilder()
+            .addPathSegments("video/search")
+            .addEncodedQueryParameter("search", URLEncoder.encode(clean, "UTF-8"))
+            .apply {
+                if (page > 1) addQueryParameter("page", page.toString())
+            }
+            .build()
+        return GET(url, headers)
     }
 
     override fun searchAnimeRequest(
@@ -217,8 +420,20 @@ class PornHub :
         val pageResult = phClient.fetchPage(
             request = animeDetailsRequest(anime),
             cacheTtlMs = PornHubClient.VIDEO_CACHE_TTL_MS,
+            bucket = PornHubClient.RateBucket.VIDEO,
+            highPriority = true,
         )
-        parseDetailsDocument(Jsoup.parse(pageResult.html, pageResult.finalUrl), pageResult.html)
+        val details = parseDetailsDocument(Jsoup.parse(pageResult.html, pageResult.finalUrl), pageResult.html)
+        if (isSmartTasteEnabled()) {
+            tasteEngine.recordBrowse(
+                url = anime.url,
+                title = details.title.ifBlank { anime.title },
+                tagsList = details.genre?.split(',')?.map(String::trim).orEmpty(),
+                performersList = listOfNotNull(details.artist),
+                studiosList = listOfNotNull(details.author),
+            )
+        }
+        details
     }
 
     override fun animeDetailsRequest(anime: SAnime): Request {
@@ -239,6 +454,16 @@ class PornHub :
     // ============================== Episodes ==============================
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        // Also learn from saved Library entries whenever Library Update runs.
+        if (isSmartTasteEnabled() && anime.title.isNotBlank()) {
+            tasteEngine.recordBrowse(
+                url = anime.url,
+                title = anime.title,
+                tagsList = anime.genre?.split(',')?.map(String::trim).orEmpty(),
+                performersList = listOfNotNull(anime.artist),
+                studiosList = listOfNotNull(anime.author),
+            )
+        }
         val fullUrl = if (anime.url.startsWith("http", ignoreCase = true)) anime.url else "$baseUrl${anime.url}"
         val cachedHtml = phClient.getCachedPage(fullUrl, PornHubClient.VIDEO_CACHE_TTL_MS)?.html
         val publishedDate = cachedHtml?.let { extractPublishedDate(it) } ?: System.currentTimeMillis()
@@ -278,6 +503,8 @@ class PornHub :
         var pageResult = phClient.fetchPage(
             request = request,
             cacheTtlMs = PornHubClient.VIDEO_CACHE_TTL_MS,
+            bucket = PornHubClient.RateBucket.VIDEO,
+            highPriority = true,
         )
         var videos = extractor.extractVideos(pageResult, preferredFormat, preferredQuality)
 
@@ -289,6 +516,8 @@ class PornHub :
                 request = request,
                 cacheTtlMs = PornHubClient.VIDEO_CACHE_TTL_MS,
                 bypassCache = true,
+                bucket = PornHubClient.RateBucket.VIDEO,
+                highPriority = true,
             )
             val refreshed = extractor.extractVideos(pageResult, preferredFormat, preferredQuality)
             if (refreshed.isNotEmpty()) {
@@ -298,6 +527,20 @@ class PornHub :
 
         if (videos.isEmpty()) {
             throw Exception("No playable video streams found for this video.")
+        }
+        if (isSmartTasteEnabled() && pageResult.html.isNotBlank()) {
+            runCatching {
+                val doc = Jsoup.parse(pageResult.html, pageResult.finalUrl)
+                val details = parseDetailsDocument(doc, pageResult.html)
+                val stars = doc.select("div.pornstarsWrapper a").mapNotNull { it.text().trim().takeIf(String::isNotBlank) }
+                tasteEngine.recordPlay(
+                    url = episode.url,
+                    title = details.title,
+                    tagsList = details.genre?.split(',')?.map(String::trim).orEmpty(),
+                    performersList = (stars + listOfNotNull(details.artist)).distinct(),
+                    studiosList = listOfNotNull(details.author),
+                )
+            }
         }
         wrapWithSeekCache(videos)
     }
@@ -363,6 +606,14 @@ class PornHub :
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         screen.addListPreference(
+            key = PREF_DEFAULT_FEED_KEY,
+            title = "Default Popular feed",
+            entries = PREF_DEFAULT_FEED_ENTRIES,
+            entryValues = PREF_DEFAULT_FEED_VALUES,
+            default = "ht",
+            summary = "%s",
+        )
+        screen.addListPreference(
             key = PREF_FORMAT_KEY,
             title = PREF_FORMAT_TITLE,
             entries = PREF_FORMAT_ENTRIES,
@@ -383,6 +634,41 @@ class PornHub :
             title = "Enable local seek/skip cache"
             summary = "Caches watched HLS segments and MP4 blocks locally (20 min TTL) for instant skip/rewind."
             setDefaultValue(true)
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SMART_TASTE_KEY
+            title = "Smart Taste learning & re-rank (shared)"
+            summary = "Learns titles, tags & performers from Library updates, opens, and plays across extensions to power 'For You' and smart ranking."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = PREF_TASTE_SEED_KEY
+            title = "Seed taste from favorite titles / keywords"
+            dialogTitle = "Paste favorite titles, stars, or keywords"
+            dialogMessage = "Separate entries by commas or new lines. Learned profile is shared across Smart Taste extensions."
+            summary = tasteEngine.summaryText()
+            setOnPreferenceChangeListener { pref, newValue ->
+                val text = newValue as? String
+                tasteEngine.applySeedText(text)
+                pref.summary = tasteEngine.summaryText()
+                true
+            }
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_TASTE_RESET_KEY
+            title = "Reset learned Smart Taste profile"
+            summary = "Tap to clear all learned titles, tags, stars, and watched history."
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { _, newValue ->
+                if (newValue == true) {
+                    tasteEngine.reset()
+                    preferences.edit().remove(PREF_TASTE_SEED_KEY).apply()
+                }
+                false
+            }
         }.also(screen::addPreference)
     }
 
@@ -752,6 +1038,13 @@ class PornHub :
             PornHubExtractor.FORMAT_ALL,
             PornHubExtractor.FORMAT_HLS_ONLY,
         )
+
+        private const val PREF_DEFAULT_FEED_KEY = "pref_default_feed"
+        private val PREF_DEFAULT_FEED_ENTRIES = listOf("Hot / Trending", "For You (Smart Taste)")
+        private val PREF_DEFAULT_FEED_VALUES = listOf("ht", PornHubFilters.FOR_YOU_SORT)
+        private const val PREF_SMART_TASTE_KEY = "pref_smart_taste_enabled"
+        private const val PREF_TASTE_SEED_KEY = "pref_smart_taste_seed"
+        private const val PREF_TASTE_RESET_KEY = "pref_smart_taste_reset"
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"

@@ -2,11 +2,13 @@ package eu.kanade.tachiyomi.animeextension.all.sextb
 
 import android.util.Base64
 import android.util.Log
+import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.uqloadextractor.UqloadExtractor
@@ -104,6 +106,11 @@ class SexTB :
     private val uqloadExtractor by lazy { UqloadExtractor(fastExtractorClient) }
     private val m3u8Server by lazy { M3u8ServerManager(streamProxyClient) }
     private val webBridge by lazy { SexTbWebBridge(baseUrl) }
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "sextb").also { engine ->
+            engine.applySeedText(preferences.getString(PREF_TASTE_SEED_KEY, null))
+        }
+    }
 
     // Switch to same-origin WebView fetch when OkHttp hits Cloudflare JA4 fingerprint mismatch.
     @Volatile
@@ -164,20 +171,27 @@ class SexTB :
     private val topChartPathCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
     private fun isSeekCacheEnabled(): Boolean = preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)
+    private fun isSmartTasteEnabled(): Boolean = preferences.getBoolean(PREF_SMART_TASTE_KEY, true)
     private fun preferredServer(): String = preferences.getString(PREF_SERVER_KEY, PREF_SERVER_DEFAULT) ?: PREF_SERVER_DEFAULT
     private fun preferredQuality(): String = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) ?: PREF_QUALITY_DEFAULT
     private fun defaultCategoryPath(): String = preferences.getString(PREF_DEFAULT_CATEGORY_KEY, DEFAULT_CATEGORY) ?: DEFAULT_CATEGORY
 
     // ============================== Popular ===============================
-    override fun popularAnimeRequest(page: Int): Request = catalogRequest(
-        page = page,
-        categoryPath = defaultCategoryPath(),
-        sort = "viewed",
-    )
+    override fun popularAnimeRequest(page: Int): Request {
+        val cat = defaultCategoryPath().let { if (it == FOR_YOU_SENTINEL) DEFAULT_CATEGORY else it }
+        return catalogRequest(
+            page = page,
+            categoryPath = cat,
+            sort = "viewed",
+        )
+    }
 
     override suspend fun getPopularAnime(page: Int): AnimesPage = withContext(Dispatchers.IO) {
+        if (isSmartTasteEnabled() && defaultCategoryPath() == FOR_YOU_SENTINEL && tasteEngine.hasLearnedProfile()) {
+            return@withContext fetchForYouPage(page)
+        }
         val request = popularAnimeRequest(page)
-        executeCachedListing(request)
+        applySmartRerank(executeCachedListing(request))
     }
 
     // Listing pages start with an ad-card tray-item linking to /advertise.
@@ -228,15 +242,18 @@ class SexTB :
     }
 
     // =============================== Latest ===============================
-    override fun latestUpdatesRequest(page: Int): Request = catalogRequest(
-        page = page,
-        categoryPath = defaultCategoryPath(),
-        sort = "desc",
-    )
+    override fun latestUpdatesRequest(page: Int): Request {
+        val cat = defaultCategoryPath().let { if (it == FOR_YOU_SENTINEL) DEFAULT_CATEGORY else it }
+        return catalogRequest(
+            page = page,
+            categoryPath = cat,
+            sort = "desc",
+        )
+    }
 
     override suspend fun getLatestUpdates(page: Int): AnimesPage = withContext(Dispatchers.IO) {
         val request = latestUpdatesRequest(page)
-        executeCachedListing(request)
+        applySmartRerank(executeCachedListing(request))
     }
 
     override fun latestUpdatesSelector(): String = popularAnimeSelector()
@@ -266,13 +283,35 @@ class SexTB :
                 return@withContext AnimesPage(emptyList(), false)
             }
             if (searchMode == "actor") {
+                if (page == 1 && isSmartTasteEnabled()) {
+                    tasteEngine.recordSearchOrFilter(performersList = cleanQuery.split(',').map(String::trim))
+                }
                 return@withContext searchByActressQuery(page, cleanQuery, filters)
+            }
+            if (page == 1 && isSmartTasteEnabled() && cleanQuery.length <= 50) {
+                tasteEngine.recordSearchOrFilter(query = cleanQuery)
             }
             return@withContext searchByMovieQuery(page, cleanQuery)
         }
 
+        if (page == 1 && isSmartTasteEnabled()) {
+            val params = extractCommonFilterParams(filters)
+            val checkedCats = extractCheckedCategories(filters).filterNot { it == FOR_YOU_SENTINEL || it == TOP_WEEK_SENTINEL || it == TOP_MONTH_SENTINEL }
+            val checkedActressNames = filters.filterIsInstance<ActressGroup>().firstOrNull()
+                ?.state?.filter { it.state }?.map { it.name }.orEmpty()
+            val typedActressNames = filters.filterIsInstance<ActressTextFilter>().firstOrNull()
+                ?.state?.split(',')?.map(String::trim)?.filter(String::isNotBlank).orEmpty()
+            tasteEngine.recordSearchOrFilter(
+                tagsList = params.selectedGenres.map { it.replace('-', ' ') },
+                performersList = checkedActressNames + typedActressNames,
+                studiosList = params.selectedStudios.map { it.replace('-', ' ') },
+                categoriesList = checkedCats,
+            )
+        }
+
         val plan = buildFilterPlan(page, filters)
-        executeFilterPlan(plan)
+        val result = executeFilterPlan(plan)
+        if (plan.targets.any { it is FilterTarget.ForYou }) result else applySmartRerank(result)
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
@@ -526,6 +565,7 @@ class SexTB :
         ) : FilterTarget()
 
         data class TopChart(val kind: String, val page: Int) : FilterTarget()
+        data class ForYou(val page: Int) : FilterTarget()
     }
 
     private data class FilterPlan(
@@ -685,6 +725,8 @@ class SexTB :
         if (checkedCategories.isNotEmpty()) {
             val targets = checkedCategories.map { path ->
                 when (path) {
+                    FOR_YOU_SENTINEL -> FilterTarget.ForYou(page)
+
                     TOP_WEEK_SENTINEL -> FilterTarget.TopChart("week", page)
 
                     TOP_MONTH_SENTINEL -> FilterTarget.TopChart("month", page)
@@ -806,6 +848,78 @@ class SexTB :
     private fun executeFilterTarget(target: FilterTarget): AnimesPage = when (target) {
         is FilterTarget.Catalog -> executeCachedListing(target.request, target.cardMode)
         is FilterTarget.TopChart -> fetchTopChart(target.kind, target.page)
+        is FilterTarget.ForYou -> fetchForYouPage(target.page)
+    }
+
+    private fun applySmartRerank(page: AnimesPage): AnimesPage {
+        if (!isSmartTasteEnabled() || page.animes.size < 3 || !tasteEngine.hasLearnedProfile()) {
+            return page
+        }
+        return AnimesPage(
+            tasteEngine.rankCandidates(page.animes, excludeWatched = false, blendWithOriginalRank = true),
+            page.hasNextPage,
+        )
+    }
+
+    private fun findSexTbGenreSlug(tag: String): String? {
+        val needle = tag.trim().lowercase(Locale.ROOT)
+        if (needle.isBlank()) return null
+        return GENRES.firstOrNull { (name, slug) ->
+            name.equals(needle, ignoreCase = true) ||
+                slug.equals(needle.replace(' ', '-'), ignoreCase = true)
+        }?.second
+    }
+
+    private fun fetchForYouPage(page: Int): AnimesPage {
+        val snap = tasteEngine.snapshot()
+        val combined = mutableListOf<SAnime>()
+        val seen = HashSet<String>()
+        var anyNext = false
+        var sourcesFetched = 0
+
+        fun collect(ap: AnimesPage?) {
+            if (ap == null) return
+            if (ap.hasNextPage) anyNext = true
+            for (item in ap.animes) {
+                if (seen.add(item.url.lowercase(Locale.ROOT))) combined += item
+            }
+            if (ap.animes.isNotEmpty()) sourcesFetched++
+        }
+
+        // 1. Top learned Genre(s) across all SexTB categories (1 single request!).
+        val matchedGenres = snap.topTags.mapNotNull(::findSexTbGenreSlug).distinct().take(2)
+        if (matchedGenres.isNotEmpty()) {
+            val extra = matchedGenres.drop(1).joinToString(",").ifBlank { "all" }
+            val req = catalogRequest(page = page, categoryPath = "/genre/${matchedGenres.first()}", genre = extra, sort = "viewed")
+            collect(runCatching { executeCachedListing(req) }.getOrNull())
+        }
+
+        // 2. Top learned Actress (resolved via cached actress path or live actor lookup).
+        val topActress = snap.topPerformers.firstOrNull()
+        if (!topActress.isNullOrBlank() && sourcesFetched < 3) {
+            val actressPath = runCatching { resolveActressPath(topActress) }.getOrNull()
+            if (actressPath != null) {
+                val req = catalogRequest(page = page, categoryPath = actressPath, sort = "desc")
+                collect(runCatching { executeCachedListing(req) }.getOrNull())
+            }
+        }
+
+        // 3. Top learned Title topic / keywords via fast JSON /ajax/search!
+        val titleQuery = tasteEngine.buildTitleSearchQueries(maxQueries = 1).firstOrNull()
+        if (!titleQuery.isNullOrBlank() && sourcesFetched < 3) {
+            collect(runCatching { searchViaAjaxMovies(titleQuery, page) }.getOrNull())
+        }
+
+        // 4. Fallback to preferred/learned SexTB category (e.g. LTX Decensored) if profile is still young.
+        if (combined.size < 10) {
+            val fallbackCat = snap.topCategories.firstOrNull()
+                ?: defaultCategoryPath().takeUnless { it == FOR_YOU_SENTINEL }
+                ?: DEFAULT_CATEGORY
+            collect(runCatching { executeCachedListing(catalogRequest(page = page, categoryPath = fallbackCat, sort = "viewed")) }.getOrNull())
+        }
+
+        val ranked = tasteEngine.rankCandidates(combined, excludeWatched = true, blendWithOriginalRank = false)
+        return AnimesPage(ranked, anyNext)
     }
 
     private fun fetchTopChart(kind: String, page: Int): AnimesPage {
@@ -1047,7 +1161,19 @@ class SexTB :
         val request = animeDetailsRequest(anime)
         val urlKey = request.url.toString()
         val html = fetchAndCacheVideoPage(request, urlKey)
-        animeDetailsParse(Jsoup.parse(html, urlKey))
+        val doc = Jsoup.parse(html, urlKey)
+        val details = animeDetailsParse(doc)
+        if (isSmartTasteEnabled()) {
+            val studio = doc.metadataText("Studio:")
+            tasteEngine.recordBrowse(
+                url = anime.url,
+                title = details.title.ifBlank { anime.title },
+                tagsList = details.genre?.split(',')?.map(String::trim).orEmpty(),
+                performersList = details.artist?.split(',')?.map(String::trim).orEmpty(),
+                studiosList = listOfNotNull(studio),
+            )
+        }
+        details
     }
 
     override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
@@ -1110,13 +1236,24 @@ class SexTB :
         ?.takeIf(String::isNotBlank)
 
     // ============================== Episodes ==============================
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = listOf(
-        SEpisode.create().apply {
-            name = "Video"
-            episode_number = 1F
-            url = anime.url
-        },
-    )
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        // Also learn from saved Library entries whenever Library Update runs.
+        if (isSmartTasteEnabled() && anime.title.isNotBlank()) {
+            tasteEngine.recordBrowse(
+                url = anime.url,
+                title = anime.title,
+                tagsList = anime.genre?.split(',')?.map(String::trim).orEmpty(),
+                performersList = anime.artist?.split(',')?.map(String::trim).orEmpty(),
+            )
+        }
+        return listOf(
+            SEpisode.create().apply {
+                name = "Video"
+                episode_number = 1F
+                url = anime.url
+            },
+        )
+    }
 
     override fun episodeListSelector(): String = "div.film-info"
 
@@ -1281,6 +1418,22 @@ class SexTB :
         Log.i(TAG, "VideoList RESOLVED targets=${prioritizedPlayers.size} raw=${rawVideos.size} final=${sortedVideos.size} qualities=${sortedVideos.map { it.quality }}")
         if (sortedVideos.isEmpty()) {
             throw IOException("SexTB servers were found, but none returned a playable stream. Retry or open the video in WebView.")
+        }
+        if (isSmartTasteEnabled()) {
+            runCatching {
+                val playTitle = document.selectFirst("h1.film-info-title, h1")?.text()?.trim()
+                val cast = document.metadataLinks("Cast(s):", "Cast:")?.split(',')?.map(String::trim).orEmpty()
+                val genres = document.metadataLinks("Genre(s):", "Genre:")?.split(',')?.map(String::trim).orEmpty()
+                val studio = document.metadataText("Studio:")
+                val relUrl = referer.toHttpUrlOrNull()?.encodedPath ?: referer
+                tasteEngine.recordPlay(
+                    url = relUrl,
+                    title = playTitle,
+                    tagsList = genres,
+                    performersList = cast,
+                    studiosList = listOfNotNull(studio),
+                )
+            }
         }
         return sortedVideos
     }
@@ -2288,6 +2441,41 @@ class SexTB :
             summary = "Caches watched HLS segments and MP4 ranges locally (RAM + temp storage) for faster seeking and rewinding."
             setDefaultValue(true)
         }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SMART_TASTE_KEY
+            title = "Smart Taste learning & re-rank (shared)"
+            summary = "Learns titles, genres & actresses from Library updates, opens, and plays across extensions to power 'For You' and smart ranking."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = PREF_TASTE_SEED_KEY
+            title = "Seed taste from favorite titles / keywords"
+            dialogTitle = "Paste favorite titles, actresses, or keywords"
+            dialogMessage = "Separate entries by commas or new lines. Learned profile is shared across Smart Taste extensions."
+            summary = tasteEngine.summaryText()
+            setOnPreferenceChangeListener { pref, newValue ->
+                val text = newValue as? String
+                tasteEngine.applySeedText(text)
+                pref.summary = tasteEngine.summaryText()
+                true
+            }
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_TASTE_RESET_KEY
+            title = "Reset learned Smart Taste profile"
+            summary = "Tap to clear all learned titles, tags, actresses, and watched history."
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { _, newValue ->
+                if (newValue == true) {
+                    tasteEngine.reset()
+                    preferences.edit().remove(PREF_TASTE_SEED_KEY).apply()
+                }
+                false
+            }
+        }.also(screen::addPreference)
     }
 
     override fun videoListSelector(): String = "button.btn-player[data-id]"
@@ -2330,6 +2518,7 @@ class SexTB :
     companion object {
         private const val TAG = "SexTB"
         private const val DEFAULT_CATEGORY = "/genre/ltx-encode"
+        private const val FOR_YOU_SENTINEL = "__FOR_YOU__"
         private const val TOP_WEEK_SENTINEL = "__TOP_WEEK__"
         private const val TOP_MONTH_SENTINEL = "__TOP_MONTH__"
 
@@ -2378,6 +2567,7 @@ class SexTB :
         private const val PREF_DEFAULT_CATEGORY_KEY = "pref_default_category"
         private val PREF_DEFAULT_CATEGORY_ENTRIES = arrayOf(
             "LTX Decensored",
+            "For You (Smart Taste)",
             "Censored",
             "Uncensored",
             "Uncensored Leaked",
@@ -2389,6 +2579,7 @@ class SexTB :
         )
         private val PREF_DEFAULT_CATEGORY_VALUES = arrayOf(
             "/genre/ltx-encode",
+            FOR_YOU_SENTINEL,
             "/jav-censored",
             "/jav-uncensored",
             "/genre/uncensored-leaked",
@@ -2409,6 +2600,9 @@ class SexTB :
         private val PREF_QUALITY_ENTRIES = arrayOf("1080p", "720p", "480p", "360p")
 
         private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
+        private const val PREF_SMART_TASTE_KEY = "pref_smart_taste_enabled"
+        private const val PREF_TASTE_SEED_KEY = "pref_smart_taste_seed"
+        private const val PREF_TASTE_RESET_KEY = "pref_smart_taste_reset"
 
         private val CLOUDFLARE_ERROR_CODES = setOf(403, 503)
         private val titleChallengeRegex =
@@ -2442,6 +2636,7 @@ class SexTB :
 
         // All live SexTB categories and newly added sections/charts (canonical auto-resolving paths).
         private val CATEGORIES = arrayOf(
+            "For You (Smart Taste)" to FOR_YOU_SENTINEL,
             "LTX Decensored" to "/genre/ltx-encode",
             "Censored" to "/jav-censored",
             "Uncensored" to "/jav-uncensored",
