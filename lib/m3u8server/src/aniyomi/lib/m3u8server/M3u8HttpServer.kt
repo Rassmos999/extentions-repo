@@ -333,20 +333,25 @@ class M3u8HttpServer(
                     return@executeWithFallback meta
                 }
             }
-            // Upstream returned 200 without Range support — cache meta as non-rangeable.
+            // Upstream returned 200 without Range support — cache meta as non-rangeable
+            // so subsequent requests fall through directly without repeating the probe.
             val fullLen = response.header("Content-Length")?.toLongOrNull() ?: -1L
-            MediaMeta(
+            val nonRangeMeta = MediaMeta(
                 contentLength = fullLen,
                 contentType = contentType,
                 acceptsRanges = false,
                 expiresAt = System.currentTimeMillis() + MEDIA_META_TTL_MS,
             )
+            if (mediaMetaCache.size > MAX_MEDIA_META) mediaMetaCache.clear()
+            mediaMetaCache[url] = nonRangeMeta
+            nonRangeMeta
         }
     }
 
     private fun fetchMediaBlock(url: String, headers: Map<String, String>, totalSize: Long, blockIndex: Long): ByteArray {
         val blockStart = blockIndex * MEDIA_BLOCK_SIZE
         val blockEnd = minOf(totalSize - 1L, blockStart + MEDIA_BLOCK_SIZE - 1L)
+        val expectedMaxBytes = (blockEnd - blockStart + 1L).coerceAtLeast(1L)
         val cacheKey = mediaBlockKey(url, blockIndex)
         return cache.getOrLoad(cacheKey) {
             val reqBuilder = Request.Builder()
@@ -359,6 +364,13 @@ class M3u8HttpServer(
             }
             reqBuilder.header("Accept-Encoding", "identity")
             executeWithFallback(reqBuilder.build(), url) { response ->
+                if (response.code != 206 && blockIndex > 0L) {
+                    throw UpstreamStatusException(response.code, url, "Expected 206 Partial Content for block $blockIndex")
+                }
+                val contentLen = response.header("Content-Length")?.toLongOrNull()
+                if (contentLen != null && contentLen > expectedMaxBytes + 64L * 1024L) {
+                    throw UpstreamStatusException(502, url, "Unexpected block size $contentLen > $expectedMaxBytes")
+                }
                 response.body.bytes()
             }
         }
@@ -556,7 +568,7 @@ class M3u8HttpServer(
         session.headers.forEach { (key, value) ->
             when (key.lowercase()) {
                 "user-agent", "referer", "origin", "accept", "accept-language",
-                "accept-encoding", "connection", "cache-control", "pragma", "cookie",
+                "connection", "cache-control", "pragma", "cookie",
                 -> {
                     headers[key.lowercase()] = value
                 }

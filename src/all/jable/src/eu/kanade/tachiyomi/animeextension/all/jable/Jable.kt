@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.all.jable
 import android.content.SharedPreferences
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -33,6 +34,10 @@ class Jable(override val lang: String) :
         get() = "Jable"
     override val supportsLatest: Boolean
         get() = true
+
+    override val client = network.cloudflareClient.newBuilder()
+        .addInterceptor(CfWebBridgeInterceptor { baseUrl })
+        .build()
 
     private val preferences by getPreferencesLazy()
     private val json by injectLazy<Json>()

@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.en.hentaimama
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -40,6 +41,10 @@ class HentaiMama :
     override val lang = "en"
 
     override val supportsLatest = true
+
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addInterceptor(CfWebBridgeInterceptor { baseUrl })
+        .build()
 
     private val preferences by getPreferencesLazy()
 

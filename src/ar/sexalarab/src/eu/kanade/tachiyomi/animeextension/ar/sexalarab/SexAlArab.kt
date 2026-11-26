@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.animeextension.ar.sexalarab
 
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
@@ -44,7 +45,7 @@ class SexAlArab :
 
     override val name = "SexAlArab"
 
-    override val baseUrl = "https://sexalarab.com"
+    override val baseUrl = "https://sexalarab.tv"
 
     override val lang = "ar"
 
@@ -53,6 +54,10 @@ class SexAlArab :
     override val disableRelatedAnimes = true
 
     override val disableRelatedAnimesBySearch = true
+
+    override val client = network.cloudflareClient.newBuilder()
+        .addInterceptor(CfWebBridgeInterceptor { baseUrl })
+        .build()
 
     private val preferences by getPreferencesLazy()
     private val pageCache = ConcurrentHashMap<String, Pair<Long, String>>()

@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.en.oppaistream
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animeextension.en.oppaistream.dto.AnilistResponseDto
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -45,6 +46,10 @@ class OppaiStream :
     override val baseUrl = "https://oppai.stream"
 
     override val supportsLatest = true
+
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addInterceptor(CfWebBridgeInterceptor { baseUrl })
+        .build()
 
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")

@@ -4,6 +4,7 @@ import android.util.Base64
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.doodextractor.DoodExtractor
+import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.voeextractor.VoeExtractor
@@ -55,6 +56,10 @@ class SexMahali :
     override val disableRelatedAnimes = true
 
     override val disableRelatedAnimesBySearch = true
+
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addInterceptor(CfWebBridgeInterceptor { baseUrl })
+        .build()
 
     private val preferences by getPreferencesLazy()
 

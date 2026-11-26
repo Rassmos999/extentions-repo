@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.all.supjav
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.doodextractor.DoodExtractor
+import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
@@ -64,8 +65,9 @@ class SupJav(override val lang: String = "en") :
 
     override val disableRelatedAnimesBySearch = true
 
-    override val client: OkHttpClient = network.client.newBuilder()
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .rateLimitHost(baseUrl.toHttpUrl(), 2, 1.seconds)
+        .addInterceptor(CfWebBridgeInterceptor { baseUrl })
         .build()
 
     /**

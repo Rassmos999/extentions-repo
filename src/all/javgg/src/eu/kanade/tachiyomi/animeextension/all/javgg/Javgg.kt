@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.animeextension.all.javgg
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.okruextractor.OkruExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
@@ -57,6 +58,10 @@ class Javgg :
     override val supportsLatest = true
 
     override val supportsRelatedAnimes = false
+
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addInterceptor(CfWebBridgeInterceptor { baseUrl })
+        .build()
 
     private val preferences by getPreferencesLazy()
 
@@ -559,8 +564,9 @@ class Javgg :
     }
 
     /**
-     * F4Stream API returns both `src` (frequently timing-out direct CDN) and a
-     * working proxy path `/v/...` in `v` / `file` / `proxy`. Prefer `/v/...` first.
+     * F4Stream API returns both `src` (direct HLS CDN) and `/v/...` proxy URLs.
+     * Prefer `src` first (validating the playlist returns HTTP 200 `#EXTM3U`),
+     * falling back automatically to `/v/...`, `file`, or `proxy`.
      */
     private fun extractF4Videos(embedUrl: String): List<Video> {
         val parsedEmbed = embedUrl.toHttpUrlOrNull() ?: return emptyList()
@@ -571,21 +577,31 @@ class Javgg :
         val apiUrl = parsedEmbed.resolve(apiPath)?.toString() ?: return emptyList()
         val playUrl = "$apiUrl?ab=0&ad=1&r=${URLEncoder.encode("$baseUrl/", "UTF-8")}"
         val apiHeaders = headers.newBuilder().set("Referer", embedUrl).build()
-        val streamUrl = fastExtractorClient.newCall(GET(playUrl, apiHeaders)).execute().use { resp ->
+        val candidates = fastExtractorClient.newCall(GET(playUrl, apiHeaders)).execute().use { resp ->
             if (!resp.isSuccessful) return emptyList()
             val json = JSONObject(resp.body.string())
-            val candidates = listOf(
+            listOf(
+                json.optString("src"),
+                json.optString("file"),
                 json.optString("v"),
                 json.optString("proxy"),
-                json.optString("file"),
-                json.optString("src"),
-            ).map { it.trim().replace("\\u0026", "&").replace("\\/", "/") }.filter(String::isNotBlank)
-            val preferred = candidates.firstOrNull { "/v/" in it } ?: candidates.firstOrNull()
-            preferred?.let { raw ->
-                if (raw.startsWith("http")) raw else parsedEmbed.resolve(raw)?.toString()
-            }
+            ).map { it.trim().replace("\\u0026", "&").replace("\\/", "/") }
+                .filter(String::isNotBlank)
+                .mapNotNull { raw -> if (raw.startsWith("http")) raw else parsedEmbed.resolve(raw)?.toString() }
+                .distinct()
         }
-        if (streamUrl.isNullOrBlank()) return emptyList()
+        if (candidates.isEmpty()) return emptyList()
+        val probeHeaders = headers.newBuilder()
+            .set("Referer", "$embedOrigin/")
+            .set("Origin", embedOrigin)
+            .build()
+        val streamUrl = candidates.firstOrNull { cand ->
+            runCatching {
+                fastExtractorClient.newCall(GET(cand, probeHeaders)).execute().use { resp ->
+                    resp.isSuccessful && resp.body.string().trimStart().startsWith("#EXTM3U")
+                }
+            }.getOrDefault(false)
+        } ?: candidates.first()
         val localUrl = proxyTransform(streamUrl, "$embedOrigin/", embedOrigin)
         return listOf(Video(localUrl, "F4Stream - HLS", localUrl))
     }

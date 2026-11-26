@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.animeextension.all.rouvideo
 
+import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
 import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoDto.toAnimePage
 import eu.kanade.tachiyomi.animeextension.all.rouvideo.RouVideoFilter.ALL_VIDEOS
@@ -51,6 +52,10 @@ class RouVideo(
     private val apiUrl = "https://rou.video/api"
 
     override val supportsLatest = true
+
+    override val client = network.cloudflareClient.newBuilder()
+        .addInterceptor(CfWebBridgeInterceptor { videoUrl })
+        .build()
 
     private val json: Json by injectLazy()
 
