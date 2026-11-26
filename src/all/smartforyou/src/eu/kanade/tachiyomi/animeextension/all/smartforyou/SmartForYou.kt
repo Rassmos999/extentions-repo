@@ -298,9 +298,10 @@ class SmartForYou :
         }
 
         val merged = interleaveUnique(batches)
-        // Final non-JAV duration guard: never let 4-6 min clips sneak onto For You / Latest
-        // when the user's non-JAV target duration is >= 20m (unless total feed would starve).
-        val cleanPool = if (nonJavMinMin >= 20 && mode != FeedMode.TRENDING) {
+        // Final non-JAV duration guard: strictly enforce >=20m (target 25m+) on non-JAV tubes
+        // so 4-15 min clips (including 10-min clips) NEVER pollute the feed!
+        val minFloor = (nonJavMinMin - 5).coerceAtLeast(20)
+        val cleanPool = if (nonJavMinMin >= 20) {
             val noShortNonJav = merged.animes.filter { anime ->
                 val srcId = detectSourceId(anime.url)
                 val isJavOrShort = srcId != null && (tasteEngine.isJavSource(srcId) || tasteEngine.isShortFormSource(srcId))
@@ -308,10 +309,10 @@ class SmartForYou :
                     true
                 } else {
                     val d = tasteEngine.extractDurationMinutes(anime.title)
-                    d == null || d >= 15
+                    d == null || d >= minFloor
                 }
             }
-            if (noShortNonJav.size >= 6) noShortNonJav else merged.animes
+            if (noShortNonJav.size >= 4) noShortNonJav else merged.animes
         } else {
             merged.animes
         }
@@ -398,7 +399,8 @@ class SmartForYou :
         newest: Boolean,
     ): AnimesPage {
         val applyNonJavDurGuard = !src.isJav && !src.isShortForm && nonJavMinMin >= 20
-        val hardMinDur = if (applyNonJavDurGuard) (nonJavMinMin - 5).coerceAtLeast(18) else 0
+        val hardMinDur = if (applyNonJavDurGuard) nonJavMinMin else 0
+        val softMinDur = if (applyNonJavDurGuard) (nonJavMinMin - 5).coerceAtLeast(20) else 0
         val wantDurFilter = applyNonJavDurGuard && (src.supportsDurationQuery || src.isArabic)
         val collected = mutableListOf<SAnime>()
         val softMediumPool = mutableListOf<SAnime>()
@@ -415,8 +417,8 @@ class SmartForYou :
                 if (hardMinDur > 0) {
                     val dur = tasteEngine.extractDurationMinutes(item.title)
                     if (dur != null && dur < hardMinDur) {
-                        // Never accept 1–14 min clips (e.g. 4m / 6m) when non-JAV target is 25m+!
-                        if (dur >= 15) softMediumPool += item
+                        // Never accept <20m clips (e.g. 4m / 6m / 10m / 15m) when non-JAV target is 25m+!
+                        if (dur >= softMinDur) softMediumPool += item
                         continue
                     }
                 }
@@ -605,10 +607,6 @@ class SmartForYou :
         ) {
             return true
         }
-        val detailTs = recentDetailEntities[lower]
-        if (detailTs != null && System.currentTimeMillis() - detailTs < 14_000L) {
-            return true
-        }
         return q.any { it in '\u3040'..'\u30FF' || it in '\u4E00'..'\u9FFF' } && q.length > 24
     }
 
@@ -617,24 +615,209 @@ class SmartForYou :
         query: String,
         sources: List<SourceDef>,
     ): AnimesPage {
+        val queryConcepts = tasteEngine.extractConcepts(query)
+        val hasArabic = query.any { it in '\u0600'..'\u06FF' }
+        val nonJavMinMin = tasteEngine.preferredNonJavMinMinutes()
         val batches = fetchInParallel(sources) { _, src ->
-            searchSource(src.id, page, query, minDurationMin = 0, newest = false)
+            val translated = translateSearchQueryForSource(src, query, queryConcepts, hasArabic)
+                ?: return@fetchInParallel AnimesPage(emptyList(), false)
+            val durMin = if (!src.isJav && !src.isShortForm && src.supportsDurationQuery && nonJavMinMin >= 20) {
+                nonJavMinMin
+            } else {
+                0
+            }
+            val strictHits = runCatching {
+                searchSource(src.id, page, translated, minDurationMin = durMin, newest = false)
+            }.getOrNull()
+            if (strictHits != null && strictHits.animes.size >= 4) {
+                strictHits
+            } else if (durMin > 0) {
+                // Relax duration URL param if search was narrow
+                val relaxed = runCatching {
+                    searchSource(src.id, page, translated, minDurationMin = 0, newest = false)
+                }.getOrNull()
+                val mergedItems = (strictHits?.animes.orEmpty() + relaxed?.animes.orEmpty()).distinctBy { it.url.lowercase(Locale.ROOT) }
+                AnimesPage(mergedItems, strictHits?.hasNextPage == true || relaxed?.hasNextPage == true)
+            } else {
+                strictHits ?: AnimesPage(emptyList(), false)
+            }
         }
         val merged = interleaveUnique(batches)
-        if (page <= 1) seenFeedKeys.clear()
-        val ranked = (
-            if (tasteEngine.hasLearnedProfile()) {
-                tasteEngine.rankCandidates(merged.animes, excludeWatched = false, blendWithOriginalRank = true)
-            } else {
-                merged.animes
+        val searchPool = if (nonJavMinMin >= 20) {
+            val minFloor = (nonJavMinMin - 5).coerceAtLeast(20)
+            val longMatches = merged.animes.filter { anime ->
+                val srcId = detectSourceId(anime.url)
+                val isJavOrShort = srcId != null && (tasteEngine.isJavSource(srcId) || tasteEngine.isShortFormSource(srcId))
+                if (isJavOrShort) {
+                    true
+                } else {
+                    val d = tasteEngine.extractDurationMinutes(anime.title)
+                    d == null || d >= minFloor
+                }
             }
-            ).filter { anime ->
+            if (longMatches.size >= 6) longMatches else merged.animes
+        } else {
+            merged.animes
+        }
+        if (page <= 1) seenFeedKeys.clear()
+        val ranked = rankSearchResults(query, queryConcepts, searchPool).filter { anime ->
             val keys = tasteEngine.extractKnownKeys(anime.url, anime.title)
             val alreadyShown = keys.any { it in seenFeedKeys }
             if (!alreadyShown) seenFeedKeys.addAll(keys)
             !alreadyShown
         }
         return AnimesPage(ranked, merged.hasNextPage)
+    }
+
+    /**
+     * Translates user search intent across English, Arabic & JAV sources so:
+     * - Searching English (`gangbang`, `mmf`, `dp`, `foursome`, `milf`) also finds matching Arabic videos.
+     * - Searching Arabic (`جماعي`, `ولدين وبنت`, `شرموطة`, `امهات`) also finds matching PornHub/XVideos/XMovies/JAV videos!
+     * - Returns `null` for English-only sources when the query is a free-form Arabic sentence with no English concept.
+     */
+    private fun translateSearchQueryForSource(
+        src: SourceDef,
+        rawQuery: String,
+        queryConcepts: Set<String>,
+        hasArabic: Boolean,
+    ): String? {
+        val clean = rawQuery.trim()
+        val lower = clean.lowercase(Locale.ROOT)
+        val primaryConcept = queryConcepts.firstOrNull()
+
+        if (src.isArabic) {
+            if (hasArabic) return clean
+            // Map English concept search to Arabic equivalent if it's a pure concept query
+            if (primaryConcept != null && clean.split(Regex("""\s+""")).size <= 3) {
+                ARABIC_CONCEPT_QUERIES[primaryConcept]?.let { return it }
+            }
+            return clean
+        }
+
+        // Non-Arabic source (Western / JAV / Rule34)
+        if (hasArabic) {
+            return when (primaryConcept) {
+                "mmf" -> if (src.isJav) "3p" else "mmf threesome"
+
+                "threesome" -> if (src.isJav) "threesome" else "mmf threesome"
+
+                "foursome" -> if (src.isJav) "4p" else "foursome"
+
+                "gangbang" -> "gangbang"
+
+                "dp" -> if (src.id == "xmoviesforyou") {
+                    "dp"
+                } else if (src.isJav) {
+                    "anal"
+                } else {
+                    "double penetration"
+                }
+
+                "orgy" -> "orgy"
+
+                "slut" -> "slut"
+
+                "anal" -> "anal"
+
+                "milf" -> "milf"
+
+                "cuckold" -> "cuckold"
+
+                "stepfamily" -> "stepmom"
+
+                "lesbian" -> "lesbian"
+
+                "massage" -> "massage"
+
+                "creampie" -> "creampie"
+
+                else -> null // Don't send raw untranslatable Arabic sentence to PornHub/XVideos!
+            }
+        }
+
+        // Clean English query normalization per source
+        return when (lower) {
+            "dp" -> if (src.id == "xmoviesforyou") {
+                "dp"
+            } else if (src.isJav) {
+                "anal"
+            } else {
+                "double penetration"
+            }
+
+            "threesome", "3some" -> if (src.isJav) "threesome" else "mmf threesome"
+
+            "mmf" -> if (src.isJav) "3p" else "mmf threesome"
+
+            else -> clean
+        }
+    }
+
+    /**
+     * Ranks search hits by QUERY RELEVANCE FIRST (exact phrase + matched words + bilingual
+     * concept match), using SmartTasteEngine (MMF/FFM/25m+ duration) only as a gentle
+     * tie-breaker, then interleaving across sources for clean diversity.
+     */
+    private fun rankSearchResults(
+        query: String,
+        queryConcepts: Set<String>,
+        items: List<SAnime>,
+    ): List<SAnime> {
+        if (items.isEmpty()) return emptyList()
+        val lowerQ = query.trim().lowercase(Locale.ROOT)
+        val queryTokens = lowerQ.split(Regex("""[^\p{L}\p{N}]+"""))
+            .filter { it.length >= 2 }
+            .distinct()
+        val translatedTerms = queryConcepts.flatMap { c ->
+            listOfNotNull(c, ARABIC_CONCEPT_QUERIES[c])
+        }.distinct()
+
+        val bySource = LinkedHashMap<String, MutableList<Pair<SAnime, Double>>>()
+        items.forEachIndexed { idx, anime ->
+            val lowerTitle = anime.title.lowercase(Locale.ROOT)
+            var rel = 0.0
+            if (lowerQ.length >= 2 && lowerTitle.contains(lowerQ)) {
+                rel += 35.0
+            }
+            for (tok in queryTokens) {
+                if (lowerTitle.contains(tok)) rel += 14.0
+            }
+            if (queryConcepts.isNotEmpty()) {
+                val candConcepts = tasteEngine.extractConcepts(anime.title)
+                val overlap = queryConcepts.count { it in candConcepts }
+                rel += overlap * 24.0
+            }
+            for (term in translatedTerms) {
+                if (lowerTitle.contains(term)) rel += 12.0
+            }
+            // Gentle taste + duration tie-breaker (never overrides actual query match!)
+            val tasteTie = if (tasteEngine.hasLearnedProfile()) {
+                tasteEngine.scoreCandidate(anime.title, anime.url).coerceIn(-15.0, 25.0) * 0.25
+            } else {
+                0.0
+            }
+            val posTie = (items.size - idx).toDouble() / items.size.coerceAtLeast(1) * 2.0
+            val totalScore = rel + tasteTie + posTie
+            val srcId = detectSourceId(anime.url) ?: "other"
+            bySource.getOrPut(srcId) { mutableListOf() }.add(anime to totalScore)
+        }
+
+        val queues = bySource.values
+            .map { bucket -> bucket.sortedByDescending { it.second }.toMutableList() }
+            .sortedByDescending { it.firstOrNull()?.second ?: Double.NEGATIVE_INFINITY }
+
+        val out = ArrayList<SAnime>(items.size)
+        var progressed = true
+        while (progressed) {
+            progressed = false
+            for (q in queues) {
+                if (q.isNotEmpty()) {
+                    out += q.removeAt(0).first
+                    progressed = true
+                }
+            }
+        }
+        return out
     }
 
     private fun fetchInParallel(
@@ -1797,16 +1980,21 @@ class SmartForYou :
 
     private fun extractArabXVideos(pageUrl: String): List<Video> {
         val client = cfClientFor("https://www.arabx.cam")
-        val kvs = runCatching { extractKvsVideos(client, pageUrl, "ArabX") }.getOrDefault(emptyList())
+        val safePageUrl = pageUrl.toHttpUrlOrNull()?.toString() ?: pageUrl
+        val kvs = runCatching { extractKvsVideos(client, safePageUrl, "ArabX") }.getOrDefault(emptyList())
         if (kvs.isNotEmpty()) return kvs
-        val html = fetchHtml(client, pageUrl, "https://www.arabx.cam/")
-        val doc = Jsoup.parse(html, pageUrl)
-        val iframes = doc.select("div.player iframe[src], iframe[src]")
-            .map { it.attr("abs:src").ifBlank { it.attr("src") } }
-            .filter { it.startsWith("http") && "google" !in it && "exoclick" !in it }
-            .distinct().take(3)
+        val html = fetchHtml(client, safePageUrl, "https://www.arabx.cam/")
+        val doc = Jsoup.parse(html, safePageUrl)
+        val iframes = doc.select("div.player iframe[src], div.embed-wrap iframe[src], iframe[src]")
+            .map { it.attr("abs:src").ifBlank { it.attr("src") }.trim() }
+            .filter { it.startsWith("http") && "google" !in it && "exoclick" !in it && "doubleclick" !in it }
+            .distinct().take(4)
         for (iframe in iframes) {
-            val hits = extractGenericEmbed(iframe, pageUrl, "ArabX")
+            if ("arabx." in iframe.lowercase(Locale.ROOT) && "/embed/" in iframe) {
+                val embedKvs = runCatching { extractKvsVideos(client, iframe, "ArabX") }.getOrDefault(emptyList())
+                if (embedKvs.isNotEmpty()) return embedKvs
+            }
+            val hits = extractGenericEmbed(iframe, "https://www.arabx.cam/", "ArabX")
             if (hits.isNotEmpty()) return hits
         }
         return emptyList()
@@ -1868,13 +2056,19 @@ class SmartForYou :
             return listOf(Video(localUrl, "$badge - F4 HLS", localUrl))
         }
 
-        // Packed HLS / TurboVid / StreamWish / FileLions / VidHide / Direct MP4
+        // Packed HLS / TurboVid / StreamWish / FileLions / VidHide / Playeriz / Direct MP4
         val resp = runCatching { baseHttpClient.newCall(GET(embedUrl, desktopHeaders(referer))).execute() }.getOrNull() ?: return emptyList()
         val (finalUrl, body) = resp.use { it.request.url to it.body.string().replace("\\/", "/") }
         val doc = Jsoup.parse(body, finalUrl.toString())
         val scripts = doc.select("script").joinToString("\n") { s ->
             val d = s.data()
-            if ("eval(function(p,a,c" in d) autoUnpacker(d) ?: d else d
+            val evalIdx = d.indexOf("eval(function(p,a,c")
+            if (evalIdx >= 0) {
+                val packed = d.substring(evalIdx)
+                autoUnpacker(packed) ?: autoUnpacker(d) ?: d
+            } else {
+                d
+            }
         }
         val m3u8 = Regex(""""hls4"\s*:\s*"([^"]+)"""").find(scripts)?.groupValues?.get(1)
             ?: Regex(""""hls3"\s*:\s*"([^"]+)"""").find(scripts)?.groupValues?.get(1)
@@ -1961,6 +2155,18 @@ class SmartForYou :
                 videos += Video(decoded, "$badge - $res (MP4)", decoded, headers = playHeaders)
             }
         }
+        if (videos.isEmpty()) {
+            Regex("""https?://[^\s"'<>]+/get_file/[^\s"'<>]+\.mp4[^\s"'<>]*""", RegexOption.IGNORE_CASE)
+                .findAll(html)
+                .map { it.value }
+                .distinct()
+                .forEach { u ->
+                    val res = Regex("""(\d{3,4})p|_(\d{3,4})\.mp4""").find(u)
+                        ?.let { m -> (m.groupValues[1].ifBlank { m.groupValues[2] }) + "p" }
+                        ?: "MP4"
+                    videos += Video(u, "$badge - $res (MP4)", u, headers = playHeaders)
+                }
+        }
         return videos.distinctBy { it.videoUrl ?: it.url }
     }
 
@@ -2046,9 +2252,14 @@ class SmartForYou :
         }
     }
 
+    private fun safeAsciiReferer(raw: String): String {
+        val candidate = raw.toHttpUrlOrNull()?.toString() ?: "${originOf(raw)}/"
+        return if (candidate.all { it.code in 0x20..0x7E }) candidate else "${originOf(raw)}/"
+    }
+
     private fun desktopHeaders(referer: String): Headers = Headers.Builder()
         .set("User-Agent", DESKTOP_UA)
-        .set("Referer", referer)
+        .set("Referer", safeAsciiReferer(referer))
         .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
         .set("Accept-Language", "en-US,en;q=0.9")
         .build()

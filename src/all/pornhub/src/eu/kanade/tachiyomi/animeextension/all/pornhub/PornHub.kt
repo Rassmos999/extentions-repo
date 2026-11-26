@@ -359,7 +359,7 @@ class PornHub :
 
         // Adaptive duration guard: keep >=20m (or targetMin-5) videos on For You so 2-6 min
         // promoted/sidebar clips never pollute long-form feeds; relax to >=15m only if too few exist.
-        val hardMin = if (targetMinDur >= 20) (targetMinDur - 5).coerceAtLeast(18) else 0
+        val hardMin = if (targetMinDur >= 20) targetMinDur else 0
         val durationFiltered = if (hardMin > 0) {
             val strictLong = combined.filter { item ->
                 val d = tasteEngine.extractDurationMinutes(item.title)
@@ -371,7 +371,7 @@ class PornHub :
                 else -> {
                     val softLong = combined.filter { item ->
                         val d = tasteEngine.extractDurationMinutes(item.title)
-                        d == null || d >= 15
+                        d == null || d >= (targetMinDur - 5).coerceAtLeast(20)
                     }
                     if (softLong.size >= 4) softLong else combined
                 }

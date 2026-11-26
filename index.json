@@ -348,10 +348,10 @@
   {
     "name": "Aniyomi: PornHub",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.pornhub",
-    "apk": "aniyomi-all.pornhub-v14.10.apk",
+    "apk": "aniyomi-all.pornhub-v14.11.apk",
     "lang": "all",
-    "code": 10,
-    "version": "14.10",
+    "code": 11,
+    "version": "14.11",
     "nsfw": 1,
     "sources": [
       {
@@ -433,10 +433,10 @@
   {
     "name": "Aniyomi: Smart For You",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.smartforyou",
-    "apk": "aniyomi-all.smartforyou-v14.7.apk",
+    "apk": "aniyomi-all.smartforyou-v14.8.apk",
     "lang": "all",
-    "code": 7,
-    "version": "14.7",
+    "code": 8,
+    "version": "14.8",
     "nsfw": 1,
     "sources": [
       {
