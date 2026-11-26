@@ -3,11 +3,16 @@ package aniyomi.lib.m3u8server
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.preference.EditTextPreference
+import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import org.json.JSONArray
 import org.json.JSONObject
 import uy.kohesive.injekt.injectLazy
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.ln
 import kotlin.math.pow
 
@@ -63,6 +68,143 @@ class SmartTasteEngine(
     private val categories = LinkedHashMap<String, Double>()
     private val watchedUrls = LinkedHashSet<String>()
     private val recentBrowseAtMs = HashMap<String, Long>()
+    private val recentMetaByUrl = ConcurrentHashMap<String, CachedVideoMeta>()
+
+    private data class CachedVideoMeta(
+        val title: String?,
+        val tags: List<String>,
+        val performers: List<String>,
+        val studios: List<String>,
+        val categories: List<String>,
+    )
+
+    fun isEnabled(): Boolean = localPreferences.getBoolean(PREF_SMART_TASTE_KEY, true)
+
+    fun syncSeedFromPreferences() {
+        applySeedText(localPreferences.getString(PREF_TASTE_SEED_KEY, null))
+    }
+
+    fun rerankPage(page: AnimesPage): AnimesPage {
+        if (!isEnabled() || page.animes.size < 3 || !hasLearnedProfile()) return page
+        return AnimesPage(
+            rankCandidates(page.animes, excludeWatched = false, blendWithOriginalRank = true),
+            page.hasNextPage,
+        )
+    }
+
+    fun onSearchResult(page: Int, query: String, result: AnimesPage): AnimesPage {
+        if (!isEnabled()) return result
+        val clean = query.trim()
+        if (clean.isBlank()) return rerankPage(result)
+        if (page == 1 && clean.length in 2..50 &&
+            !clean.startsWith("Label:", true) &&
+            !clean.startsWith("Studio:", true) &&
+            !clean.startsWith("Uploader:", true) &&
+            !clean.startsWith("Duration:", true) &&
+            !clean.startsWith("Views:", true) &&
+            !clean.startsWith("Rating:", true)
+        ) {
+            recordSearchOrFilter(query = clean)
+        }
+        return result
+    }
+
+    fun recordDetails(sourceAnime: SAnime, parsedDetails: SAnime) {
+        if (!isEnabled()) return
+        val title = parsedDetails.title.ifBlank { sourceAnime.title }.takeIf(String::isNotBlank)
+        val tagsList = parsedDetails.genre?.split(',')?.map(String::trim)?.filter(String::isNotBlank).orEmpty()
+        val perfList = parsedDetails.artist?.split(',')?.map(String::trim)?.filter(String::isNotBlank).orEmpty()
+        val studioList = parsedDetails.author?.split(',')?.map(String::trim)?.filter(String::isNotBlank).orEmpty()
+        val url = sourceAnime.url.ifBlank { parsedDetails.url }
+        rememberMeta(url, title, tagsList, perfList, studioList, emptyList())
+        recordBrowse(
+            url = url,
+            title = title,
+            tagsList = tagsList,
+            performersList = perfList,
+            studiosList = studioList,
+        )
+    }
+
+    fun recordLibraryAnime(anime: SAnime) {
+        if (!isEnabled() || anime.title.isBlank()) return
+        val tagsList = anime.genre?.split(',')?.map(String::trim)?.filter(String::isNotBlank).orEmpty()
+        val perfList = anime.artist?.split(',')?.map(String::trim)?.filter(String::isNotBlank).orEmpty()
+        val studioList = anime.author?.split(',')?.map(String::trim)?.filter(String::isNotBlank).orEmpty()
+        rememberMeta(anime.url, anime.title, tagsList, perfList, studioList, emptyList())
+        recordBrowse(
+            url = anime.url,
+            title = anime.title,
+            tagsList = tagsList,
+            performersList = perfList,
+            studiosList = studioList,
+        )
+    }
+
+    fun recordPlayByUrl(url: String?, fallbackTitle: String? = null) {
+        if (!isEnabled()) return
+        val key = normalizeUrlKey(url)
+        val meta = key?.let { recentMetaByUrl[it] }
+        recordPlay(
+            url = url,
+            title = meta?.title ?: fallbackTitle,
+            tagsList = meta?.tags.orEmpty(),
+            performersList = meta?.performers.orEmpty(),
+            studiosList = meta?.studios.orEmpty(),
+            categoriesList = meta?.categories.orEmpty(),
+        )
+    }
+
+    fun attachPreferences(screen: PreferenceScreen) {
+        syncSeedFromPreferences()
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SMART_TASTE_KEY
+            title = "Smart Taste learning & re-rank (shared +18)"
+            summary = "Shares one unified +18 taste profile across extensions from Library updates, opens, plays, and searches."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = PREF_TASTE_SEED_KEY
+            title = "Seed taste from favorite titles / keywords"
+            dialogTitle = "Paste favorite titles, stars, or keywords"
+            dialogMessage = "Separate entries by commas or new lines. Shared automatically across all +18 Smart Taste extensions."
+            summary = summaryText()
+            setOnPreferenceChangeListener { pref, newValue ->
+                val text = newValue as? String
+                applySeedText(text)
+                pref.summary = summaryText()
+                true
+            }
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_TASTE_RESET_KEY
+            title = "Reset shared Smart Taste profile"
+            summary = "Tap to clear all learned titles, tags, stars, and watched history."
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { _, newValue ->
+                if (newValue == true) {
+                    reset()
+                    localPreferences.edit().remove(PREF_TASTE_SEED_KEY).apply()
+                }
+                false
+            }
+        }.also(screen::addPreference)
+    }
+
+    private fun rememberMeta(
+        url: String?,
+        title: String?,
+        tagsList: List<String>,
+        performersList: List<String>,
+        studiosList: List<String>,
+        categoriesList: List<String>,
+    ) {
+        val key = normalizeUrlKey(url) ?: return
+        if (recentMetaByUrl.size > 200) recentMetaByUrl.clear()
+        recentMetaByUrl[key] = CachedVideoMeta(title, tagsList, performersList, studiosList, categoriesList)
+    }
 
     private var lastDecayDay: Long = currentEpochDay()
     private var totalInteractions: Int = 0
@@ -581,6 +723,9 @@ class SmartTasteEngine(
     companion object {
         private const val GLOBAL_PREFS_NAME = "agy_global_taste_v1"
         private const val DEFAULT_STORAGE_KEY = "smart_taste_profile_v1"
+        const val PREF_SMART_TASTE_KEY = "pref_smart_taste_enabled"
+        const val PREF_TASTE_SEED_KEY = "pref_smart_taste_seed"
+        const val PREF_TASTE_RESET_KEY = "pref_smart_taste_reset"
         private const val MILLIS_PER_DAY = 86_400_000L
         private const val BROWSE_DEDUP_WINDOW_MS = 12L * 60L * 60L * 1000L
         private const val DAILY_DECAY_FACTOR = 0.94

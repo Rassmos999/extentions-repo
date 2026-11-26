@@ -4,8 +4,10 @@ import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
+import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
@@ -33,6 +35,17 @@ import java.util.concurrent.TimeUnit
 class HahoMoe :
     ParsedAnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "hahomoe").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
+
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, super.getSearchAnime(page, query, filters))
+
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = super.getVideoList(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
 
     override val name = "haho.moe"
 
@@ -132,7 +145,9 @@ class HahoMoe :
     override fun searchAnimeNextPageSelector() = popularAnimeNextPageSelector()
 
     // =========================== Anime Details ============================
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = getAnimeDetailsBase(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    private suspend fun getAnimeDetailsBase(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(anime.url)
         val html = fetchPageCached(fullUrl)
         animeDetailsParse(Jsoup.parse(html, fullUrl))
@@ -160,7 +175,12 @@ class HahoMoe :
 
     private fun episodeNextPageSelector() = popularAnimeNextPageSelector()
 
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return getEpisodeListBase(anime)
+    }
+
+    private suspend fun getEpisodeListBase(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(anime.url)
         val html = fetchPageCached(fullUrl)
         parseEpisodesFromDoc(Jsoup.parse(html, fullUrl))
@@ -248,6 +268,8 @@ class HahoMoe :
 
     // ============================== Settings ==============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         ListPreference(screen.context).apply {
             key = PREF_QUALITY_KEY
             title = PREF_QUALITY_TITLE

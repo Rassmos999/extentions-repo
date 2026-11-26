@@ -6,6 +6,7 @@ import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
@@ -54,6 +55,13 @@ import java.util.concurrent.TimeUnit
 class SupJav2(override val lang: String = "en") :
     ParsedAnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "supjav2").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
 
     override val name = "SupJav 2"
 
@@ -168,7 +176,9 @@ class SupJav2(override val lang: String = "en") :
     override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
 
     // =============================== Search ===============================
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, getSearchAnimeBase(page, query, filters))
+
+    private suspend fun getSearchAnimeBase(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         if (query.startsWith("https://") || query.startsWith("http://")) {
             val url = runCatching { query.toHttpUrl() }.getOrNull()
                 ?: return AnimesPage(emptyList(), false)
@@ -396,7 +406,9 @@ class SupJav2(override val lang: String = "en") :
     private class CastGroup(items: List<CastCheckBox>) : AnimeFilter.Group<CastCheckBox>("Popular Actresses (multi-select)", items)
 
     // =========================== Anime Details ============================
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = getAnimeDetailsBase(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    private suspend fun getAnimeDetailsBase(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(anime.url)
         val html = fetchPageCached(fullUrl)
         animeDetailsParse(Jsoup.parse(html, fullUrl))
@@ -433,7 +445,12 @@ class SupJav2(override val lang: String = "en") :
     private fun Elements.textsOrNull() = eachText().joinToString().takeUnless(String::isEmpty)
 
     // ============================== Episodes ==============================
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = listOf(
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return getEpisodeListBase(anime)
+    }
+
+    private suspend fun getEpisodeListBase(anime: SAnime): List<SEpisode> = listOf(
         SEpisode.create().apply {
             name = "JAV"
             episode_number = 1F
@@ -456,7 +473,9 @@ class SupJav2(override val lang: String = "en") :
     override fun episodeFromElement(element: Element): SEpisode = throw UnsupportedOperationException()
 
     // ============================ Video Links =============================
-    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListBase(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
+
+    private suspend fun getVideoListBase(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(episode.url)
         val html = fetchPageCached(fullUrl)
         parseVideosFromHtml(html, fullUrl).sort()
@@ -843,6 +862,8 @@ class SupJav2(override val lang: String = "en") :
 
     // ============================== Settings ==============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         ListPreference(screen.context).apply {
             key = PREF_QUALITY_KEY
             title = PREF_QUALITY_TITLE

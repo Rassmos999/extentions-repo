@@ -1,7 +1,7 @@
 ext {
     extName = 'JavDB'
     extClass = '.JavDB'
-    extVersionCode = 4
+    extVersionCode = 5
     isTorrent = true
     isNsfw = true
 }

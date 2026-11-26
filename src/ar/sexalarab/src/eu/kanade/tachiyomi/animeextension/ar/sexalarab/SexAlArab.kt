@@ -4,6 +4,7 @@ import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -42,6 +43,13 @@ import kotlin.math.abs
 class SexAlArab :
     ParsedAnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "sexalarab").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
 
     override val name = "SexAlArab"
 
@@ -137,7 +145,9 @@ class SexAlArab :
 
     // =============================== Search ===============================
 
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, getSearchAnimeBase(page, query, filters))
+
+    private suspend fun getSearchAnimeBase(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val sort = filters.firstInstanceOrNull<SortFilter>()?.selected.orEmpty()
         if (query.isBlank()) {
             val targets = collectFilterRequests(page, sort, filters)
@@ -213,7 +223,9 @@ class SexAlArab :
 
     // =========================== Anime Details ============================
 
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = getAnimeDetailsBase(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    private suspend fun getAnimeDetailsBase(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
         val fullUrl = cleanUrl(anime.url)
         val html = fetchPageCached(fullUrl)
         animeDetailsParse(Jsoup.parse(html, fullUrl))
@@ -274,7 +286,12 @@ class SexAlArab :
 
     // ============================== Episodes ==============================
 
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return getEpisodeListBase(anime)
+    }
+
+    private suspend fun getEpisodeListBase(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
         val fullUrl = cleanUrl(anime.url)
         listOf(
             SEpisode.create().apply {
@@ -301,7 +318,9 @@ class SexAlArab :
 
     // ============================ Video Links =============================
 
-    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListBase(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
+
+    private suspend fun getVideoListBase(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
         val fullUrl = cleanUrl(episode.url)
         val html = fetchPageCached(fullUrl)
         parseVideosFromHtml(html).sort()
@@ -435,6 +454,8 @@ class SexAlArab :
     // ============================= Preferences ============================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         screen.addListPreference(
             key = PREF_QUALITY_KEY,
             title = PREF_QUALITY_TITLE,

@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.animeextension.all.javdb
 
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -37,6 +38,20 @@ import kotlin.time.Duration.Companion.seconds
 class JavDB :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "javdb").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = super.getAnimeDetails(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return super.getEpisodeList(anime)
+    }
 
     override val name = "JavDB"
 
@@ -113,7 +128,9 @@ class JavDB :
     override fun latestUpdatesParse(response: Response) = movieListParse(response)
 
     // =============================== Search ===============================
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, getSearchAnimeBase(page, query, filters))
+
+    private suspend fun getSearchAnimeBase(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val text = query.trim()
         val siteUrl = text.toHttpUrlOrNull()?.takeIf { it.host == SITE_HOST }
 
@@ -290,7 +307,9 @@ class JavDB :
     }
 
     // ============================ Video Links =============================
-    override suspend fun getVideoList(episode: SEpisode): List<Video> {
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListBase(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
+
+    private suspend fun getVideoListBase(episode: SEpisode): List<Video> {
         val document = client.newCall(GET(baseUrl + episode.url, headers)).awaitSuccess().useAsJsoup()
         val code = document.infoBlocks()["ID"]?.text()?.trim()
             ?: document.selectFirst("h2.title strong")?.text()?.trim()
@@ -419,6 +438,8 @@ class JavDB :
 
     // ============================== Settings ==============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         screen.addListPreference(
             key = PREF_LOCALE_KEY,
             default = PREF_LOCALE_DEFAULT,

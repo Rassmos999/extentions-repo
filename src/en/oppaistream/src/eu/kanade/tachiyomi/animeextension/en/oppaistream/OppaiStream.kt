@@ -5,6 +5,7 @@ import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import eu.kanade.tachiyomi.animeextension.en.oppaistream.dto.AnilistResponseDto
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter.TriState.Companion.STATE_EXCLUDE
@@ -38,6 +39,15 @@ import java.util.concurrent.TimeUnit
 class OppaiStream :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "oppaistream").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
+
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, super.getSearchAnime(page, query, filters))
 
     override val name = "Oppai Stream"
 
@@ -193,7 +203,9 @@ class OppaiStream :
     }
 
     // =========================== Anime Details ============================
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = getAnimeDetailsBase(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    private suspend fun getAnimeDetailsBase(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(anime.url)
         val html = fetchPageCached(fullUrl)
         parseDetails(Jsoup.parse(html, fullUrl))
@@ -246,7 +258,12 @@ class OppaiStream :
     }
 
     // ============================== Episodes ==============================
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return getEpisodeListBase(anime)
+    }
+
+    private suspend fun getEpisodeListBase(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(anime.url)
         val html = fetchPageCached(fullUrl)
         parseEpisodes(Jsoup.parse(html, fullUrl), fullUrl)
@@ -298,7 +315,9 @@ class OppaiStream :
     }
 
     // ============================ Video Links =============================
-    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListBase(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
+
+    private suspend fun getVideoListBase(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(episode.url)
         val html = fetchPageCached(fullUrl)
         parseVideos(Jsoup.parse(html, fullUrl), html).sort()
@@ -434,6 +453,8 @@ class OppaiStream :
 
     // ============================== Settings ==============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         ListPreference(screen.context).apply {
             key = PREF_QUALITY_KEY
             title = PREF_QUALITY_TITLE

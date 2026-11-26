@@ -4,6 +4,7 @@ import android.text.InputType
 import android.util.Log
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
@@ -40,6 +41,9 @@ import java.util.Locale
 class Hanime :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "hanime").also { it.syncSeedFromPreferences() }
+    }
 
     override val name = "hanime.tv"
 
@@ -219,7 +223,9 @@ class Hanime :
 
     override fun popularAnimeParse(response: Response) = throw UnsupportedOperationException()
 
-    override suspend fun getPopularAnime(page: Int): AnimesPage {
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(getPopularAnimeBase(page))
+
+    private suspend fun getPopularAnimeBase(page: Int): AnimesPage {
         val allHits = fetchSearchHits()
         return paginateHits(allHits, page, orderBy = "likes", ordering = "desc")
     }
@@ -239,7 +245,9 @@ class Hanime :
 
     override fun searchAnimeParse(response: Response) = throw UnsupportedOperationException()
 
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, getSearchAnimeBase(page, query, filters))
+
+    private suspend fun getSearchAnimeBase(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val (includedTags, blackListedTags, brands, tagsMode, orderBy, ordering) = getSearchParameters(filters)
         val allHits = fetchSearchHits()
         return paginateHits(
@@ -261,7 +269,9 @@ class Hanime :
 
     override fun latestUpdatesParse(response: Response) = throw UnsupportedOperationException()
 
-    override suspend fun getLatestUpdates(page: Int): AnimesPage {
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(getLatestUpdatesBase(page))
+
+    private suspend fun getLatestUpdatesBase(page: Int): AnimesPage {
         val allHits = fetchSearchHits()
         return paginateHits(allHits, page, orderBy = "created_at_unix", ordering = "desc")
     }
@@ -449,7 +459,9 @@ class Hanime :
 
     // ── Anime Details ──────────────────────────────────────────────────
 
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = getAnimeDetailsBase(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    private suspend fun getAnimeDetailsBase(anime: SAnime): SAnime {
         val slug = anime.url.substringAfterLast("/").substringBefore("?")
         // Prefer search-hit metadata (rich description/tags) over redesigned HTML.
         runCatching {
@@ -496,7 +508,9 @@ class Hanime :
 
     // ── Video List ─────────────────────────────────────────────────────
 
-    override suspend fun getVideoList(episode: SEpisode): List<Video> {
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListBase(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
+
+    private suspend fun getVideoListBase(episode: SEpisode): List<Video> {
         setAuthCookie()
         val slug = extractSlugFromUrl(episode.url)
         if (slug.isBlank()) {
@@ -650,6 +664,11 @@ class Hanime :
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return getEpisodeListBase(anime)
+    }
+
+    private suspend fun getEpisodeListBase(anime: SAnime): List<SEpisode> {
         val slug = anime.url.substringAfterLast("/").substringBefore("?")
         val allHits = fetchSearchHits()
         val current = allHits.find { it.slug == slug }
@@ -1086,6 +1105,8 @@ class Hanime :
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         // Preferred Quality
         screen.addListPreference(
             key = PREF_QUALITY_KEY,

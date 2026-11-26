@@ -5,6 +5,7 @@ import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
@@ -66,6 +67,13 @@ class ArabsHentai :
         "ArabsHentai",
         "https://arabshentai.com",
     ) {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "arabshentai").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
 
     override val disableRelatedAnimes = true
 
@@ -154,7 +162,9 @@ class ArabsHentai :
     // =============================== Search ===============================
     override val fetchGenres = false
 
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, getSearchAnimeBase(page, query, filters))
+
+    private suspend fun getSearchAnimeBase(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val cleanQuery = query.trim()
         val selectedGenres = filters.filterIsInstance<GenreGroup>()
             .firstOrNull()?.state?.filter { it.state }?.map { it.slug }.orEmpty()
@@ -302,7 +312,9 @@ class ArabsHentai :
     }
 
     // =========================== Anime Details ============================
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = getAnimeDetailsBase(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    private suspend fun getAnimeDetailsBase(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(anime.url)
         val html = fetchPageCached(fullUrl)
         val initialDoc = Jsoup.parse(html, fullUrl)
@@ -351,7 +363,12 @@ class ArabsHentai :
     }
 
     // ============================== Episodes ==============================
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return getEpisodeListBase(anime)
+    }
+
+    private suspend fun getEpisodeListBase(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(anime.url)
         val html = fetchPageCached(fullUrl)
         val initialDoc = Jsoup.parse(html, fullUrl)
@@ -433,7 +450,9 @@ class ArabsHentai :
     }
 
     // ============================ Video Links =============================
-    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListBase(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
+
+    private suspend fun getVideoListBase(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(episode.url)
         val html = fetchPageCached(fullUrl)
         parseVideosFromHtml(html, fullUrl).sort()
@@ -704,6 +723,8 @@ class ArabsHentai :
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         super.setupPreferenceScreen(screen)
+
+        tasteEngine.attachPreferences(screen)
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SEEK_CACHE_KEY
             title = "تفعيل كاش التقديم والترجيع (Local Seek Cache)"

@@ -7,6 +7,7 @@ import aniyomi.lib.javcoverfetcher.JavCoverFetcher
 import aniyomi.lib.javcoverfetcher.JavCoverFetcher.fetchHDCovers
 import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -39,6 +40,19 @@ import java.util.concurrent.ConcurrentHashMap
 class MissAV :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "missav").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
+
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, super.getSearchAnime(page, query, filters))
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = super.getAnimeDetails(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = super.getVideoList(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
 
     override val name = "MissAV"
 
@@ -256,7 +270,12 @@ class MissAV :
         .joinToString()
         .takeIf(String::isNotBlank)
 
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = listOf(
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return getEpisodeListBase(anime)
+    }
+
+    private suspend fun getEpisodeListBase(anime: SAnime): List<SEpisode> = listOf(
         SEpisode.create().apply {
             url = anime.url
             name = "Episode"
@@ -359,6 +378,8 @@ class MissAV :
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         screen.addListPreference(
             key = PREF_DOMAIN_KEY,
             title = PREF_DOMAIN_TITLE,

@@ -8,6 +8,7 @@ import aniyomi.lib.javcoverfetcher.JavCoverFetcher
 import aniyomi.lib.javcoverfetcher.JavCoverFetcher.fetchHDCovers
 import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
 import aniyomi.lib.streamwishextractor.StreamWishExtractor
@@ -51,6 +52,20 @@ import kotlin.math.min
 class JavGuru :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "javguru").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = super.getAnimeDetails(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return super.getEpisodeList(anime)
+    }
+
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = super.getVideoList(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
 
     override val name = "Jav Guru"
 
@@ -78,7 +93,9 @@ class JavGuru :
 
     // ========================= Popular =========================
 
-    override suspend fun getPopularAnime(page: Int): AnimesPage = if (page == 1) {
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(getPopularAnimeBase(page))
+
+    private suspend fun getPopularAnimeBase(page: Int): AnimesPage = if (page == 1) {
         client.newCall(popularAnimeRequest(page))
             .awaitSuccess()
             .use(::popularAnimeParse)
@@ -159,7 +176,9 @@ class JavGuru :
 
     // ========================= Search =========================
 
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, getSearchAnimeBase(page, query, filters))
+
+    private suspend fun getSearchAnimeBase(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val queryUrl = query.toHttpUrlOrNull()
         if (queryUrl?.host == baseUrl.toHttpUrl().host) {
             val cleanSegments = queryUrl.pathSegments.filter { it.isNotEmpty() }
@@ -653,6 +672,8 @@ class JavGuru :
     override fun getFilterList() = getFilters()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         screen.addListPreference(
             key = PREF_QUALITY,
             title = PREF_QUALITY_TITLE,

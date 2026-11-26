@@ -1,7 +1,7 @@
 ext {
     extName = 'haho.moe'
     extClass = '.HahoMoe'
-    extVersionCode = 24
+    extVersionCode = 25
     isNsfw = true
 }
 

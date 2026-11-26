@@ -5,6 +5,7 @@ import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -28,6 +29,20 @@ import java.io.IOException
 class Jable(override val lang: String) :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "jable").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
+
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, super.getSearchAnime(page, query, filters))
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = super.getAnimeDetails(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = super.getVideoList(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
+
     override val baseUrl: String
         get() = "https://jable.tv"
     override val name: String
@@ -46,6 +61,8 @@ class Jable(override val lang: String) :
     private var tagsUpdated = false
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         SwitchPreferenceCompat(screen.context).apply {
             key = "pref_seek_cache"
             title = "Enable local seek/skip cache"
@@ -72,7 +89,12 @@ class Jable(override val lang: String) :
 
     override fun episodeListParse(response: Response) = throw UnsupportedOperationException()
 
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = listOf(
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return getEpisodeListBase(anime)
+    }
+
+    private suspend fun getEpisodeListBase(anime: SAnime): List<SEpisode> = listOf(
         SEpisode.create().apply {
             name = "Episode"
             url = anime.url

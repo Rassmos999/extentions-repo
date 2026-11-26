@@ -5,6 +5,7 @@ import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
@@ -46,6 +47,13 @@ import java.util.concurrent.TimeUnit
 class HentaiAraby :
     AnimeHttpSource(),
     ConfigurableAnimeSource {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "hentaiaraby").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
 
     override val name = "HentaiAraby"
 
@@ -107,7 +115,9 @@ class HentaiAraby :
     override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
 
     // =============================== Search ===============================
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, getSearchAnimeBase(page, query, filters))
+
+    private suspend fun getSearchAnimeBase(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val cleanQuery = query.trim()
         val selectedCategories = filters.filterIsInstance<CategoryGroup>()
             .firstOrNull()?.state?.filter { it.state }?.map { it.slug }.orEmpty()
@@ -253,7 +263,9 @@ class HentaiAraby :
     // =========================== Anime Details ============================
     override fun animeDetailsRequest(anime: SAnime): Request = GET(getAnimeUrl(anime), headers)
 
-    override suspend fun getAnimeDetails(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = getAnimeDetailsBase(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    private suspend fun getAnimeDetailsBase(anime: SAnime): SAnime = withContext(Dispatchers.IO) {
         val slug = extractSlug(anime.url)
         val detail = fetchVideoDetail(slug)
         toDetailedSAnime(detail, anime.url)
@@ -295,7 +307,12 @@ class HentaiAraby :
     }
 
     // ============================== Episodes ==============================
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return getEpisodeListBase(anime)
+    }
+
+    private suspend fun getEpisodeListBase(anime: SAnime): List<SEpisode> = withContext(Dispatchers.IO) {
         val slug = extractSlug(anime.url)
         val detail = fetchVideoDetail(slug)
         buildEpisodeList(detail)
@@ -367,7 +384,9 @@ class HentaiAraby :
     }
 
     // ============================ Video Links =============================
-    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListBase(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
+
+    private suspend fun getVideoListBase(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
         val slug = extractSlug(episode.url)
         val detail = fetchVideoDetail(slug)
         extractVideos(detail).sort()
@@ -509,6 +528,8 @@ class HentaiAraby :
 
     // ============================ Preferences =============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        tasteEngine.attachPreferences(screen)
+
         ListPreference(screen.context).apply {
             key = PREF_QUALITY_KEY
             title = "الجودة المفضلة / Preferred Quality"

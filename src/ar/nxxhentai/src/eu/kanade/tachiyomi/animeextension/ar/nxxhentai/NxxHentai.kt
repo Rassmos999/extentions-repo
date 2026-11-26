@@ -5,6 +5,7 @@ import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
+import aniyomi.lib.m3u8server.SmartTasteEngine
 import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.playlistutils.PlaylistUtils
 import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
@@ -58,6 +59,20 @@ class NxxHentai :
         "NxxHentai",
         "https://nxxhentai.net",
     ) {
+    private val tasteEngine by lazy {
+        SmartTasteEngine(preferences, sourceKey = "nxxhentai").also { it.syncSeedFromPreferences() }
+    }
+
+    override suspend fun getPopularAnime(page: Int): AnimesPage = tasteEngine.rerankPage(super.getPopularAnime(page))
+
+    override suspend fun getLatestUpdates(page: Int): AnimesPage = tasteEngine.rerankPage(super.getLatestUpdates(page))
+
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime = super.getAnimeDetails(anime).also { tasteEngine.recordDetails(anime, it) }
+
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        tasteEngine.recordLibraryAnime(anime)
+        return super.getEpisodeList(anime)
+    }
 
     override val disableRelatedAnimes = true
 
@@ -102,6 +117,8 @@ class NxxHentai :
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         super.setupPreferenceScreen(screen)
+
+        tasteEngine.attachPreferences(screen)
         SwitchPreferenceCompat(screen.context).apply {
             key = "pref_seek_cache"
             title = "تفعيل كاش التقديم والترجيع (Local Seek Cache)"
@@ -158,7 +175,9 @@ class NxxHentai :
     // =============================== Search ===============================
     override val fetchGenres = false
 
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage = tasteEngine.onSearchResult(page, query, getSearchAnimeBase(page, query, filters))
+
+    private suspend fun getSearchAnimeBase(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val selectedGenres = filters.filterIsInstance<GenreGroup>()
             .firstOrNull()?.state?.filter { it.state }?.map { it.value }.orEmpty()
         if (query.isBlank() && selectedGenres.size > 1) {
@@ -401,7 +420,9 @@ class NxxHentai :
     }
 
     // ============================ Video Links =============================
-    override suspend fun getVideoList(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getVideoListBase(episode).also { if (it.isNotEmpty()) tasteEngine.recordPlayByUrl(episode.url) }
+
+    private suspend fun getVideoListBase(episode: SEpisode): List<Video> = withContext(Dispatchers.IO) {
         val fullUrl = toAbsoluteUrl(episode.url)
         val html = fetchPageCached(fullUrl)
         parseVideosFromHtml(html, fullUrl).sort()
