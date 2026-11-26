@@ -39,14 +39,20 @@ internal class SexTbWebBridge(private val baseUrl: String) {
         val status: Int,
         val finalUrl: String,
         val body: String,
+        val retryAfterSeconds: Long? = null,
     )
+
+    private sealed class CallOutcome {
+        data class Ok(val result: FetchResult) : CallOutcome()
+        data class Err(val error: Throwable) : CallOutcome()
+    }
 
     private class PendingCall {
         val latch = CountDownLatch(1)
-        val result = AtomicReference<Result<FetchResult>?>(null)
+        val outcome = AtomicReference<CallOutcome?>(null)
 
-        fun complete(value: Result<FetchResult>) {
-            if (result.compareAndSet(null, value)) {
+        fun complete(value: CallOutcome) {
+            if (outcome.compareAndSet(null, value)) {
                 latch.countDown()
             }
         }
@@ -56,6 +62,7 @@ internal class SexTbWebBridge(private val baseUrl: String) {
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val initLock = Any()
     private val requestCounter = AtomicInteger(0)
+    private val consecutiveTimeouts = AtomicInteger(0)
     private val pending = ConcurrentHashMap<String, PendingCall>()
 
     @Volatile
@@ -74,7 +81,7 @@ internal class SexTbWebBridge(private val baseUrl: String) {
         method: String = "GET",
         formBody: String? = null,
         extraHeaders: Map<String, String> = emptyMap(),
-        timeoutMs: Long = 12_000L,
+        timeoutMs: Long = 15_000L,
     ): FetchResult {
         ensureReady()
         val wv = webView ?: throw IOException("SexTB WebView bridge is unavailable.")
@@ -96,7 +103,7 @@ internal class SexTbWebBridge(private val baseUrl: String) {
                     var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
                     var timer = setTimeout(function() {
                         try { if (ctrl) ctrl.abort(); } catch (_) {}
-                    }, ${timeoutMs.coerceAtMost(15_000L)});
+                    }, ${timeoutMs.coerceAtMost(18_000L)});
                     var opts = {
                         method: ${JSONObject.quote(method)},
                         credentials: 'include',
@@ -107,12 +114,14 @@ internal class SexTbWebBridge(private val baseUrl: String) {
                     if ($bodyJs !== undefined) opts.body = $bodyJs;
                     fetch(${JSONObject.quote(url)}, opts)
                         .then(function(resp) {
+                            var ra = (resp.headers && resp.headers.get('retry-after')) || '';
                             return resp.text().then(function(txt) {
                                 clearTimeout(timer);
                                 window.$BRIDGE_NAME.onResult(
                                     ${JSONObject.quote(reqId)},
                                     resp.status || 0,
                                     resp.url || ${JSONObject.quote(url)},
+                                    ra,
                                     txt || ''
                                 );
                             });
@@ -136,21 +145,32 @@ internal class SexTbWebBridge(private val baseUrl: String) {
             try {
                 wv.evaluateJavascript(js, null)
             } catch (e: Exception) {
-                call.complete(Result.failure(IOException("WebView evaluateJavascript failed: ${e.message}", e)))
+                call.complete(CallOutcome.Err(IOException("WebView evaluateJavascript failed: ${e.message}", e)))
             }
         }
 
         return try {
             val finished = call.latch.await(timeoutMs + 1_500L, TimeUnit.MILLISECONDS)
             if (!finished) {
-                reset()
+                // Only recycle the shared WebView after repeated consecutive timeouts
+                // so one slow request never aborts unrelated in-flight requests.
+                if (consecutiveTimeouts.incrementAndGet() >= RESET_AFTER_TIMEOUTS) {
+                    consecutiveTimeouts.set(0)
+                    reset()
+                }
                 throw IOException("SexTB WebView request timed out for $url")
             }
-            val outcome = call.result.get()
-                ?: throw IOException("SexTB WebView request returned no result for $url")
-            outcome.getOrElse { err ->
-                if (err is IOException) throw err
-                throw IOException(err.message ?: "SexTB WebView fetch failed", err)
+            consecutiveTimeouts.set(0)
+            when (val outcome = call.outcome.get()) {
+                is CallOutcome.Ok -> outcome.result
+
+                is CallOutcome.Err -> {
+                    val err = outcome.error
+                    if (err is IOException) throw err
+                    throw IOException(err.message ?: "SexTB WebView fetch failed", err)
+                }
+
+                null -> throw IOException("SexTB WebView request returned no result for $url")
             }
         } finally {
             pending.remove(reqId)
@@ -171,7 +191,7 @@ internal class SexTbWebBridge(private val baseUrl: String) {
                     }
                 }
             }
-            pending.values.forEach { it.complete(Result.failure(IOException("SexTB WebView bridge reset"))) }
+            pending.values.forEach { it.complete(CallOutcome.Err(IOException("SexTB WebView bridge reset"))) }
             pending.clear()
         }
     }
@@ -248,13 +268,16 @@ internal class SexTbWebBridge(private val baseUrl: String) {
 
     private inner class JsBridge {
         @JavascriptInterface
-        fun onResult(reqId: String, status: Int, finalUrl: String, body: String) {
-            pending.remove(reqId)?.complete(Result.success(FetchResult(status, finalUrl, body)))
+        fun onResult(reqId: String, status: Int, finalUrl: String, retryAfter: String, body: String) {
+            val retryAfterSec = retryAfter.trim().toLongOrNull()
+            pending.remove(reqId)?.complete(
+                CallOutcome.Ok(FetchResult(status, finalUrl, body, retryAfterSec)),
+            )
         }
 
         @JavascriptInterface
         fun onError(reqId: String, error: String) {
-            pending.remove(reqId)?.complete(Result.failure(IOException("WebView fetch error: $error")))
+            pending.remove(reqId)?.complete(CallOutcome.Err(IOException("WebView fetch error: $error")))
         }
     }
 
@@ -262,5 +285,6 @@ internal class SexTbWebBridge(private val baseUrl: String) {
         private const val TAG = "SexTB"
         private const val BRIDGE_NAME = "SexTbBridge"
         private const val INIT_TIMEOUT_MS = 8_000L
+        private const val RESET_AFTER_TIMEOUTS = 3
     }
 }

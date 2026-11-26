@@ -42,10 +42,13 @@ import java.net.URLEncoder
 import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -105,6 +108,25 @@ class SexTB :
     // Switch to same-origin WebView fetch when OkHttp hits Cloudflare JA4 fingerprint mismatch.
     @Volatile
     private var webBridgeUntilMs: Long = 0L
+
+    // Adaptive global site request pacer so bursts (filters, paging, host fallback searches)
+    // never overwhelm sextb.net's strict per-IP rate limiter with HTTP 429 storms.
+    private val siteRateLock = Any()
+    private val highPriorityWaiters = AtomicInteger(0)
+
+    @Volatile
+    private var nextAllowedSiteRequestMs: Long = 0L
+
+    @Volatile
+    private var rateLimitCooldownUntilMs: Long = 0L
+
+    private class InFlightGet {
+        val latch = CountDownLatch(1)
+        val result = AtomicReference<SiteResponse?>(null)
+        val error = AtomicReference<Throwable?>(null)
+    }
+
+    private val inFlightGets = ConcurrentHashMap<String, InFlightGet>()
 
     // Dynamic in-memory caches so rotated SexTB hashes auto-heal without stale constants.
     private val resolvedCatalogPaths = ConcurrentHashMap<String, String>()
@@ -207,30 +229,22 @@ class SexTB :
         val searchMode = filters.filterIsInstance<SearchModeFilter>().firstOrNull()?.selected ?: "movie"
 
         if (cleanQuery.isNotBlank()) {
+            // Skip synthetic metadata queries emitted by host recommendation fallbacks
+            // (e.g. "Label: Moodyz Gati" scraped from our own description text).
+            if (cleanQuery.startsWith("Label:", ignoreCase = true) ||
+                cleanQuery.startsWith("Studio:", ignoreCase = true) ||
+                cleanQuery.startsWith("Release Date:", ignoreCase = true)
+            ) {
+                return@withContext AnimesPage(emptyList(), false)
+            }
             if (searchMode == "actor") {
                 return@withContext searchByActressQuery(page, cleanQuery, filters)
             }
             return@withContext searchByMovieQuery(page, cleanQuery)
         }
 
-        val targets = buildFilterTargets(page, filters)
-        if (targets.size <= 1) {
-            val target = targets.firstOrNull() ?: FilterTarget.Catalog(catalogRequest(page, defaultCategoryPath()))
-            return@withContext executeFilterTarget(target)
-        }
-
-        val pool = Executors.newFixedThreadPool(targets.size.coerceAtMost(MAX_PARALLEL_FILTERS))
-        try {
-            val futures = targets.map { target ->
-                pool.submit<AnimesPage?> {
-                    runCatching { executeFilterTarget(target) }.getOrNull()
-                }
-            }
-            val pages = futures.mapNotNull { runCatching { it.get(15, TimeUnit.SECONDS) }.getOrNull() }
-            if (pages.isEmpty()) AnimesPage(emptyList(), false) else mergePages(pages)
-        } finally {
-            pool.shutdownNow()
-        }
+        val plan = buildFilterPlan(page, filters)
+        executeFilterPlan(plan)
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
@@ -238,7 +252,7 @@ class SexTB :
         if (cleanQuery.isNotBlank()) {
             return buildMovieSearchRequest(page, cleanQuery)
         }
-        val first = buildFilterTargets(page, filters).firstOrNull()
+        val first = buildFilterPlan(page, filters).targets.firstOrNull()
         return (first as? FilterTarget.Catalog)?.request ?: catalogRequest(page, defaultCategoryPath())
     }
 
@@ -256,10 +270,17 @@ class SexTB :
 
     private fun searchByMovieQuery(page: Int, query: String): AnimesPage {
         val primaryReq = buildMovieSearchRequest(page, query)
-        val primaryPage = executeCachedListing(primaryReq)
+        val primaryPage = try {
+            executeCachedListing(primaryReq, highPriority = false)
+        } catch (e: HttpStatusException) {
+            if (e.code == 404) AnimesPage(emptyList(), false) else throw e
+        }
         if (primaryPage.animes.isNotEmpty() || page > 1) return primaryPage
 
-        // Fallback to SexTB's live JSON search endpoint (handles content IDs, Japanese text, etc.)
+        // Only hit /ajax/search fallback for concise real searches when not in 429 cooldown.
+        if (query.length > 60 || System.currentTimeMillis() < rateLimitCooldownUntilMs) {
+            return primaryPage
+        }
         val ajaxPage = runCatching { searchViaAjaxMovies(query, page) }.getOrNull()
         return if (ajaxPage != null && ajaxPage.animes.isNotEmpty()) ajaxPage else primaryPage
     }
@@ -273,6 +294,7 @@ class SexTB :
                 "type" to "movie",
             ),
             referer = "$baseUrl/",
+            highPriority = false,
         )
         if (resp.status !in 200..299) return AnimesPage(emptyList(), false)
         val json = JSONObject(resp.body)
@@ -314,32 +336,15 @@ class SexTB :
         val names = query.split(',')
             .map(String::trim)
             .filter(String::isNotBlank)
-            .take(MAX_PARALLEL_FILTERS)
+            .take(MAX_MULTI_TARGETS)
         val actressPaths = names.mapNotNull { resolveActressPath(it) }.distinct()
         if (actressPaths.isEmpty()) {
             return searchByMovieQuery(page, query)
         }
         val params = extractCommonFilterParams(filters)
-        val pages = actressPaths.mapNotNull { path ->
-            runCatching {
-                executeCachedListing(
-                    catalogRequest(
-                        page = page,
-                        categoryPath = path,
-                        genre = params.genreParam,
-                        studio = params.studioParam,
-                        quality = params.quality,
-                        year = params.year,
-                        sort = params.sort,
-                    ),
-                )
-            }.getOrNull()
-        }
-        return when {
-            pages.isEmpty() -> AnimesPage(emptyList(), false)
-            pages.size == 1 -> pages.first()
-            else -> mergePages(pages)
-        }
+        val checkedCategories = extractCheckedCategories(filters)
+        val targets = buildActressTargets(page, actressPaths, checkedCategories, params)
+        return executeFilterPlan(FilterPlan(targets = targets, boostOverlap = actressPaths.size > 1))
     }
 
     private fun resolveActressPath(nameQuery: String): String? {
@@ -388,6 +393,7 @@ class SexTB :
 
     private data class CommonFilterParams(
         val selectedGenres: List<String>,
+        val selectedStudios: List<String>,
         val genreParam: String,
         val studioParam: String,
         val quality: String,
@@ -395,10 +401,33 @@ class SexTB :
         val sort: String,
     )
 
+    private enum class CardMode {
+        ALL,
+        CENSORED_ONLY,
+        UNCENSORED_ONLY,
+    }
+
     private sealed class FilterTarget {
-        data class Catalog(val request: Request) : FilterTarget()
+        data class Catalog(
+            val request: Request,
+            val cardMode: CardMode = CardMode.ALL,
+        ) : FilterTarget()
+
         data class TopChart(val kind: String, val page: Int) : FilterTarget()
     }
+
+    private data class FilterPlan(
+        val targets: List<FilterTarget>,
+        val boostOverlap: Boolean = false,
+    )
+
+    private fun extractCheckedCategories(filters: AnimeFilterList): List<String> = filters.filterIsInstance<CategoryGroup>().firstOrNull()
+        ?.state
+        ?.filter { it.state }
+        ?.map { it.path }
+        ?.distinct()
+        ?.take(MAX_MULTI_TARGETS)
+        .orEmpty()
 
     private fun extractCommonFilterParams(filters: AnimeFilterList): CommonFilterParams {
         val quality = filters.filterIsInstance<QualityFilter>().firstOrNull()?.selected ?: "all"
@@ -425,6 +454,7 @@ class SexTB :
 
         return CommonFilterParams(
             selectedGenres = selectedGenres,
+            selectedStudios = selectedStudios,
             genreParam = genreParam,
             studioParam = studioParam,
             quality = quality,
@@ -433,56 +463,13 @@ class SexTB :
         )
     }
 
-    private fun buildFilterTargets(page: Int, filters: AnimeFilterList): List<FilterTarget> {
-        val params = extractCommonFilterParams(filters)
-
-        val checkedActresses = filters.filterIsInstance<ActressGroup>().firstOrNull()
-            ?.state
-            ?.filter { it.state }
-            ?.map { it.path }
-            .orEmpty()
-        val typedActresses = filters.filterIsInstance<ActressTextFilter>().firstOrNull()
-            ?.state
-            ?.split(',')
-            ?.map(String::trim)
-            ?.filter(String::isNotBlank)
-            ?.mapNotNull { resolveActressPath(it) }
-            .orEmpty()
-        val actressPaths = (checkedActresses + typedActresses).distinct().take(MAX_PARALLEL_FILTERS)
-
-        val checkedCategories = filters.filterIsInstance<CategoryGroup>().firstOrNull()
-            ?.state
-            ?.filter { it.state }
-            ?.map { it.path }
-            ?.distinct()
-            ?.take(MAX_PARALLEL_FILTERS)
-            .orEmpty()
-
-        // If user selected TOP Weekly or TOP Monthly charts directly:
-        if (actressPaths.isEmpty() && checkedCategories.isNotEmpty()) {
-            val targets = checkedCategories.map { path ->
-                when (path) {
-                    TOP_WEEK_SENTINEL -> FilterTarget.TopChart("week", page)
-
-                    TOP_MONTH_SENTINEL -> FilterTarget.TopChart("month", page)
-
-                    else -> FilterTarget.Catalog(
-                        catalogRequest(
-                            page = page,
-                            categoryPath = path,
-                            genre = params.genreParam,
-                            studio = params.studioParam,
-                            quality = params.quality,
-                            year = params.year,
-                            sort = params.sort,
-                        ),
-                    )
-                }
-            }
-            return targets
-        }
-
-        if (actressPaths.isNotEmpty()) {
+    private fun buildActressTargets(
+        page: Int,
+        actressPaths: List<String>,
+        checkedCategories: List<String>,
+        params: CommonFilterParams,
+    ): List<FilterTarget> {
+        if (checkedCategories.isEmpty()) {
             return actressPaths.map { path ->
                 FilterTarget.Catalog(
                     catalogRequest(
@@ -498,41 +485,214 @@ class SexTB :
             }
         }
 
-        // If user picked a SINGLE genre with NO category checked, browse `/genre/<slug>`
-        // directly so results span Censored + Uncensored + Amateur + Subtitle together!
-        if (params.selectedGenres.size == 1) {
-            return listOf(
-                FilterTarget.Catalog(
-                    catalogRequest(
+        val wantsCensored = "/jav-censored" in checkedCategories
+        val wantsUncensored = "/jav-uncensored" in checkedCategories
+        val genreCategorySlugs = checkedCategories.mapNotNull { CATEGORY_TO_GENRE_SLUG[it] }.distinct()
+
+        val targets = mutableListOf<FilterTarget>()
+        for (actressPath in actressPaths) {
+            if (wantsCensored || wantsUncensored) {
+                val mode = when {
+                    wantsCensored && wantsUncensored -> CardMode.ALL
+                    wantsCensored -> CardMode.CENSORED_ONLY
+                    else -> CardMode.UNCENSORED_ONLY
+                }
+                targets += FilterTarget.Catalog(
+                    request = catalogRequest(
                         page = page,
-                        categoryPath = "/genre/${params.selectedGenres.first()}",
-                        genre = "all",
+                        categoryPath = actressPath,
+                        genre = params.genreParam,
                         studio = params.studioParam,
                         quality = params.quality,
                         year = params.year,
                         sort = params.sort,
                     ),
+                    cardMode = mode,
+                )
+            }
+            for (catGenre in genreCategorySlugs) {
+                val combinedGenres = (listOf(catGenre) + params.selectedGenres).distinct().take(MAX_MULTI_SELECT)
+                targets += FilterTarget.Catalog(
+                    request = catalogRequest(
+                        page = page,
+                        categoryPath = actressPath,
+                        genre = combinedGenres.joinToString(","),
+                        studio = params.studioParam,
+                        quality = params.quality,
+                        year = params.year,
+                        sort = params.sort,
+                    ),
+                )
+            }
+            if (!wantsCensored && !wantsUncensored && genreCategorySlugs.isEmpty()) {
+                targets += FilterTarget.Catalog(
+                    catalogRequest(
+                        page = page,
+                        categoryPath = actressPath,
+                        genre = params.genreParam,
+                        studio = params.studioParam,
+                        quality = params.quality,
+                        year = params.year,
+                        sort = params.sort,
+                    ),
+                )
+            }
+        }
+        return targets.distinctBy { (it as? FilterTarget.Catalog)?.let { c -> c.request.url.toString() to c.cardMode } ?: it }
+            .take(MAX_MULTI_TARGETS)
+    }
+
+    private fun buildFilterPlan(page: Int, filters: AnimeFilterList): FilterPlan {
+        val params = extractCommonFilterParams(filters)
+
+        val checkedActresses = filters.filterIsInstance<ActressGroup>().firstOrNull()
+            ?.state
+            ?.filter { it.state }
+            ?.map { it.path }
+            .orEmpty()
+        val typedActresses = filters.filterIsInstance<ActressTextFilter>().firstOrNull()
+            ?.state
+            ?.split(',')
+            ?.map(String::trim)
+            ?.filter(String::isNotBlank)
+            ?.mapNotNull { resolveActressPath(it) }
+            .orEmpty()
+        val actressPaths = (checkedActresses + typedActresses).distinct().take(MAX_MULTI_TARGETS)
+        val checkedCategories = extractCheckedCategories(filters)
+
+        // 1. Actress(es) selected — combine with any checked categories, genres, studios, quality, year, sort.
+        if (actressPaths.isNotEmpty()) {
+            return FilterPlan(
+                targets = buildActressTargets(page, actressPaths, checkedCategories, params),
+                boostOverlap = actressPaths.size > 1,
+            )
+        }
+
+        // 2. One or more Categories / Charts selected — fetch ALL selected categories cleanly
+        //    and round-robin interleave so every selected category appears evenly.
+        if (checkedCategories.isNotEmpty()) {
+            val targets = checkedCategories.map { path ->
+                when (path) {
+                    TOP_WEEK_SENTINEL -> FilterTarget.TopChart("week", page)
+
+                    TOP_MONTH_SENTINEL -> FilterTarget.TopChart("month", page)
+
+                    else -> {
+                        // Avoid redundant self-genre intersection (e.g. /genre/reducing-mosaic?genre=reducing-mosaic).
+                        val ownSlug = CATEGORY_TO_GENRE_SLUG[path]
+                        val filteredGenres = if (ownSlug != null) {
+                            params.selectedGenres.filterNot { it == ownSlug }
+                        } else {
+                            params.selectedGenres
+                        }
+                        val effectiveGenre = if (filteredGenres.isEmpty()) "all" else filteredGenres.joinToString(",")
+                        FilterTarget.Catalog(
+                            catalogRequest(
+                                page = page,
+                                categoryPath = path,
+                                genre = effectiveGenre,
+                                studio = params.studioParam,
+                                quality = params.quality,
+                                year = params.year,
+                                sort = params.sort,
+                            ),
+                        )
+                    }
+                }
+            }
+            return FilterPlan(targets = targets, boostOverlap = false)
+        }
+
+        // 3. No Category checked, 1+ Genres checked -> browse `/genre/<first>` directly
+        //    with any extra genres as `?genre=<rest>` so results span ALL categories
+        //    (Censored + Uncensored + LTX + Amateur + Subtitle) instead of defaulting to LTX-only!
+        if (params.selectedGenres.isNotEmpty()) {
+            val primaryGenre = params.selectedGenres.first()
+            val extraGenres = params.selectedGenres.drop(1)
+            return FilterPlan(
+                targets = listOf(
+                    FilterTarget.Catalog(
+                        catalogRequest(
+                            page = page,
+                            categoryPath = "/genre/$primaryGenre",
+                            genre = if (extraGenres.isEmpty()) "all" else extraGenres.joinToString(","),
+                            studio = params.studioParam,
+                            quality = params.quality,
+                            year = params.year,
+                            sort = params.sort,
+                        ),
+                    ),
                 ),
             )
         }
 
-        return listOf(
-            FilterTarget.Catalog(
-                catalogRequest(
-                    page = page,
-                    categoryPath = defaultCategoryPath(),
-                    genre = params.genreParam,
-                    studio = params.studioParam,
-                    quality = params.quality,
-                    year = params.year,
-                    sort = params.sort,
+        // 4. No Category & no Genre checked, 1+ Studios checked -> browse `/studio/<slug>`
+        //    directly across ALL categories instead of restricting to defaultCategoryPath().
+        if (params.selectedStudios.isNotEmpty()) {
+            val targets = params.selectedStudios.take(MAX_MULTI_TARGETS).map { studioSlug ->
+                FilterTarget.Catalog(
+                    catalogRequest(
+                        page = page,
+                        categoryPath = "/studio/$studioSlug",
+                        genre = "all",
+                        studio = "all",
+                        quality = params.quality,
+                        year = params.year,
+                        sort = params.sort,
+                    ),
+                )
+            }
+            return FilterPlan(targets = targets, boostOverlap = false)
+        }
+
+        // 5. Only Sort / Quality / Year changed with no category/genre/studio/actress -> default category.
+        return FilterPlan(
+            targets = listOf(
+                FilterTarget.Catalog(
+                    catalogRequest(
+                        page = page,
+                        categoryPath = defaultCategoryPath(),
+                        genre = "all",
+                        studio = "all",
+                        quality = params.quality,
+                        year = params.year,
+                        sort = params.sort,
+                    ),
                 ),
             ),
         )
     }
 
+    private fun executeFilterPlan(plan: FilterPlan): AnimesPage {
+        if (plan.targets.isEmpty()) {
+            return executeCachedListing(catalogRequest(1, defaultCategoryPath()))
+        }
+        if (plan.targets.size == 1) {
+            return executeFilterTarget(plan.targets.first())
+        }
+
+        // Execute multi-target filters sequentially through the adaptive site pacer instead
+        // of firing a parallel burst that triggers HTTP 429 and silently drops categories.
+        val pages = mutableListOf<AnimesPage>()
+        var firstError: Throwable? = null
+        for (target in plan.targets) {
+            try {
+                pages += executeFilterTarget(target)
+            } catch (e: CloudflareBlockedException) {
+                throw e
+            } catch (e: Throwable) {
+                if (firstError == null) firstError = e
+                Log.w(TAG, "Multi-filter target failed ($target): ${e.message}")
+            }
+        }
+        if (pages.isEmpty()) {
+            throw firstError ?: IOException("SexTB returned no results for the selected filters.")
+        }
+        return if (pages.size == 1) pages.first() else mergePages(pages, boostOverlap = plan.boostOverlap)
+    }
+
     private fun executeFilterTarget(target: FilterTarget): AnimesPage = when (target) {
-        is FilterTarget.Catalog -> executeCachedListing(target.request)
+        is FilterTarget.Catalog -> executeCachedListing(target.request, target.cardMode)
         is FilterTarget.TopChart -> fetchTopChart(target.kind, target.page)
     }
 
@@ -554,26 +714,63 @@ class SexTB :
         return executeCachedListing(GET("$baseUrl$chartPath", headers))
     }
 
-    private fun executeCachedListing(request: Request): AnimesPage {
-        val key = request.url.toString()
-        val cached = pageCache[key]?.takeIf { System.currentTimeMillis() - it.first < PAGE_CACHE_TTL_MS }
+    private fun executeCachedListing(
+        request: Request,
+        cardMode: CardMode = CardMode.ALL,
+        highPriority: Boolean = true,
+    ): AnimesPage {
+        val key = if (cardMode == CardMode.ALL) request.url.toString() else "${request.url}#${cardMode.name}"
+        val now = System.currentTimeMillis()
+        val cached = pageCache[key]?.takeIf { (ts, page) ->
+            val ttl = if (page.animes.isEmpty()) EMPTY_PAGE_CACHE_TTL_MS else PAGE_CACHE_TTL_MS
+            now - ts < ttl
+        }
         if (cached != null) return cached.second
 
-        val siteResp = executeSiteGet(request)
+        val siteResp = executeSiteGet(request, highPriority = highPriority)
         rememberCatalogPathFromUrl(siteResp.finalUrl)
-        val result = parseListingDocument(Jsoup.parse(siteResp.body, siteResp.finalUrl))
-        Log.i(TAG, "Listing parsed url=${siteResp.finalUrl} count=${result.animes.size} hasNext=${result.hasNextPage} viaWeb=${siteResp.viaWebView}")
-        if (result.animes.isNotEmpty()) {
-            if (pageCache.size > 40) pageCache.clear()
-            pageCache[key] = System.currentTimeMillis() to result
-        }
+        val result = parseListingDocument(Jsoup.parse(siteResp.body, siteResp.finalUrl), cardMode)
+        Log.i(TAG, "Listing parsed url=${siteResp.finalUrl} mode=$cardMode count=${result.animes.size} hasNext=${result.hasNextPage} viaWeb=${siteResp.viaWebView}")
+        if (pageCache.size > 60) pageCache.clear()
+        pageCache[key] = System.currentTimeMillis() to result
         return result
     }
 
-    private fun parseListingDocument(document: Document): AnimesPage {
-        val trayItems = document.select(popularAnimeSelector())
-        if (trayItems.isNotEmpty()) {
-            val animes = trayItems.map(::popularAnimeFromElement)
+    private fun isUncensoredCard(element: Element): Boolean {
+        if (element.hasClass("tray-item-uncensored")) return true
+        val ribbon = element.selectFirst("span.tray-item-ribbon")?.text()?.trim().orEmpty()
+        if (ribbon.contains("Decensored", ignoreCase = true) ||
+            ribbon.contains("Uncensored", ignoreCase = true) ||
+            ribbon.contains("LTX", ignoreCase = true)
+        ) {
+            return true
+        }
+        val code = element.selectFirst("div.tray-item-code")?.text()?.trim().orEmpty()
+        return code.endsWith("-RM", ignoreCase = true) || code.endsWith("-UNC", ignoreCase = true)
+    }
+
+    private fun parseListingDocument(document: Document, cardMode: CardMode = CardMode.ALL): AnimesPage {
+        // Ignore secondary "Recommended Videos For You" tray shown when a search has 0 real hits.
+        val traySections = document.select("section.tray")
+            .filterNot { section ->
+                val heading = section.selectFirst("div.tray-title")?.text().orEmpty()
+                heading.contains("Recommended Videos", ignoreCase = true) ||
+                    heading.contains("Related Actress", ignoreCase = true)
+            }
+
+        val rawTrayItems = if (traySections.isNotEmpty()) {
+            traySections.flatMap { it.select(popularAnimeSelector()) }
+        } else {
+            document.select(popularAnimeSelector())
+        }
+
+        if (rawTrayItems.isNotEmpty()) {
+            val filteredItems = when (cardMode) {
+                CardMode.ALL -> rawTrayItems
+                CardMode.CENSORED_ONLY -> rawTrayItems.filterNot(::isUncensoredCard)
+                CardMode.UNCENSORED_ONLY -> rawTrayItems.filter(::isUncensoredCard)
+            }
+            val animes = filteredItems.map(::popularAnimeFromElement)
             val hasNext = document.selectFirst(popularAnimeNextPageSelector()) != null
             return AnimesPage(animes, hasNext)
         }
@@ -604,17 +801,25 @@ class SexTB :
     }
 
     /**
-     * Merges results from multiple selected actresses or categories:
-     * videos matching MORE THAN ONE selected filter (e.g., co-starring videos) rank first,
-     * followed by round-robin interleaved results from every selected filter.
+     * Merges results from multiple selected categories, studios, or actresses:
+     * - For categories/studios (`boostOverlap = false`): strict round-robin interleaving
+     *   so every selected category appears evenly right from the top.
+     * - For actresses (`boostOverlap = true`): co-starring videos matching more than one
+     *   selected actress rank first, followed by round-robin interleaved results.
      */
-    private fun mergePages(pages: List<AnimesPage>): AnimesPage {
-        val hitCounts = HashMap<String, Int>()
-        for (p in pages) {
-            for (anime in p.animes) {
-                hitCounts[anime.url] = (hitCounts[anime.url] ?: 0) + 1
+    private fun mergePages(pages: List<AnimesPage>, boostOverlap: Boolean = false): AnimesPage {
+        val hitCounts = if (boostOverlap) {
+            HashMap<String, Int>().also { map ->
+                for (p in pages) {
+                    for (anime in p.animes) {
+                        map[anime.url] = (map[anime.url] ?: 0) + 1
+                    }
+                }
             }
+        } else {
+            null
         }
+
         val interleaved = mutableListOf<SAnime>()
         val seen = HashSet<String>()
         val maxLen = pages.maxOfOrNull { it.animes.size } ?: 0
@@ -624,8 +829,12 @@ class SexTB :
                 if (seen.add(item.url)) interleaved.add(item)
             }
         }
-        val ranked = interleaved.sortedByDescending { hitCounts[it.url] ?: 1 }
-        return AnimesPage(ranked, pages.any { it.hasNextPage })
+        val finalList = if (hitCounts != null) {
+            interleaved.sortedByDescending { hitCounts[it.url] ?: 1 }
+        } else {
+            interleaved
+        }
+        return AnimesPage(finalList, pages.any { it.hasNextPage })
     }
 
     private fun catalogRequest(
@@ -1385,107 +1594,204 @@ class SexTB :
         return false
     }
 
-    private fun executeSiteGet(request: Request): SiteResponse {
-        val url = request.url.toString()
-        if (!shouldUseWebBridge()) {
-            try {
-                client.newCall(request).execute().use { resp ->
-                    resp.throwIfCloudflareChallenge()
-                    val finalUrl = resp.request.url.toString()
-                    val body = resp.body.string()
-                    if (body.isCloudflareChallengeHtml()) throw CloudflareBlockedException()
-                    if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
-                    return SiteResponse(resp.code, finalUrl, body, viaWebView = false)
+    private fun acquireSiteRequestSlot(highPriority: Boolean = true) {
+        if (highPriority) highPriorityWaiters.incrementAndGet()
+        try {
+            while (true) {
+                var sleepMs = 0L
+                synchronized(siteRateLock) {
+                    val now = System.currentTimeMillis()
+                    if (!highPriority && highPriorityWaiters.get() > 0) {
+                        sleepMs = 150L
+                    } else if (now < nextAllowedSiteRequestMs) {
+                        sleepMs = nextAllowedSiteRequestMs - now
+                    } else {
+                        val gap = if (now < rateLimitCooldownUntilMs) COOLDOWN_REQUEST_GAP_MS else MIN_SITE_REQUEST_GAP_MS
+                        nextAllowedSiteRequestMs = now + gap
+                        return
+                    }
                 }
-            } catch (t: Throwable) {
-                if (!isCloudflareThrowable(t)) throw t
-                if (!webBridge.hasClearanceCookie()) {
-                    Log.w(TAG, "Cloudflare blocked $url and no cf_clearance cookie exists in WebView.")
-                    throw CloudflareBlockedException()
+                if (sleepMs > 0L) {
+                    try {
+                        Thread.sleep(sleepMs.coerceAtMost(1_000L))
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        throw IOException("SexTB request cancelled while pacing.", e)
+                    }
                 }
-                Log.i(TAG, "OkHttp hit Cloudflare fingerprint mismatch on $url; switching to WebView session bridge.")
-                webBridgeUntilMs = System.currentTimeMillis() + WEB_BRIDGE_TTL_MS
             }
+        } finally {
+            if (highPriority) highPriorityWaiters.decrementAndGet()
+        }
+    }
+
+    private fun noteRateLimitHit(retryAfterSeconds: Long?, attempt: Int) {
+        val baseBackoff = when (attempt) {
+            0 -> RATE_LIMIT_BACKOFF_1_MS
+            1 -> RATE_LIMIT_BACKOFF_2_MS
+            else -> RATE_LIMIT_BACKOFF_3_MS
+        }
+        val headerBackoff = retryAfterSeconds?.coerceIn(1L, 12L)?.times(1_000L) ?: 0L
+        val delayMs = maxOf(baseBackoff, headerBackoff)
+        synchronized(siteRateLock) {
+            val now = System.currentTimeMillis()
+            rateLimitCooldownUntilMs = maxOf(rateLimitCooldownUntilMs, now + RATE_LIMIT_COOLDOWN_MS)
+            nextAllowedSiteRequestMs = maxOf(nextAllowedSiteRequestMs, now + delayMs)
+        }
+        Log.w(TAG, "SexTB HTTP 429 (attempt ${attempt + 1}/$MAX_429_RETRIES); backing off ${delayMs}ms globally.")
+    }
+
+    private fun executeSiteGet(request: Request, highPriority: Boolean = true): SiteResponse {
+        val url = request.url.toString()
+
+        // Single-flight coalescing: if another coroutine is already fetching the exact same URL,
+        // wait for its result instead of burning another rate-limit slot.
+        val newHolder = InFlightGet()
+        val existing = inFlightGets.putIfAbsent(url, newHolder)
+        if (existing != null) {
+            try {
+                if (!existing.latch.await(SINGLE_FLIGHT_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                    throw IOException("SexTB timed out waiting for coalesced request $url")
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IOException("SexTB request interrupted for $url", e)
+            }
+            existing.result.get()?.let { return it }
+            val err = existing.error.get()
+            if (err is IOException) throw err
+            throw IOException(err?.message ?: "SexTB coalesced request failed for $url", err)
         }
 
-        var webResp = webBridge.fetch(
-            url = url,
-            method = "GET",
-            extraHeaders = mapOf(
-                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            ),
-        )
-        if (webResp.status == 429) {
-            runCatching { Thread.sleep(RATE_LIMIT_BACKOFF_MS) }
-            webResp = webBridge.fetch(
+        try {
+            val response = executeSiteGetInternal(request, url, highPriority)
+            newHolder.result.set(response)
+            return response
+        } catch (t: Throwable) {
+            newHolder.error.set(t)
+            throw t
+        } finally {
+            newHolder.latch.countDown()
+            inFlightGets.remove(url, newHolder)
+        }
+    }
+
+    private fun executeSiteGetInternal(request: Request, url: String, highPriority: Boolean): SiteResponse {
+        for (attempt in 0..MAX_429_RETRIES) {
+            acquireSiteRequestSlot(highPriority)
+
+            if (!shouldUseWebBridge()) {
+                var switchedToBridge = false
+                try {
+                    client.newCall(request).execute().use { resp ->
+                        resp.throwIfCloudflareChallenge()
+                        if (resp.code == 429) {
+                            if (attempt < MAX_429_RETRIES) {
+                                noteRateLimitHit(resp.header("Retry-After")?.toLongOrNull(), attempt)
+                                continue
+                            }
+                            throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
+                        }
+                        val finalUrl = resp.request.url.toString()
+                        val body = resp.body.string()
+                        if (body.isCloudflareChallengeHtml()) throw CloudflareBlockedException()
+                        if (!resp.isSuccessful) throw HttpStatusException(resp.code, url)
+                        return SiteResponse(resp.code, finalUrl, body, viaWebView = false)
+                    }
+                } catch (t: Throwable) {
+                    if (!isCloudflareThrowable(t)) throw t
+                    if (!webBridge.hasClearanceCookie()) {
+                        Log.w(TAG, "Cloudflare blocked $url and no cf_clearance cookie exists in WebView.")
+                        throw CloudflareBlockedException()
+                    }
+                    Log.i(TAG, "OkHttp hit Cloudflare fingerprint mismatch on $url; switching to WebView session bridge.")
+                    webBridgeUntilMs = System.currentTimeMillis() + WEB_BRIDGE_TTL_MS
+                    switchedToBridge = true
+                }
+                if (switchedToBridge) {
+                    acquireSiteRequestSlot(highPriority)
+                }
+            }
+
+            val webResp = webBridge.fetch(
                 url = url,
                 method = "GET",
                 extraHeaders = mapOf(
                     "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 ),
             )
+            if (webResp.status == 429) {
+                if (attempt < MAX_429_RETRIES) {
+                    noteRateLimitHit(webResp.retryAfterSeconds, attempt)
+                    continue
+                }
+                throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
+            }
+            if (webResp.status in CLOUDFLARE_ERROR_CODES || webResp.body.isCloudflareChallengeHtml()) {
+                webBridgeUntilMs = 0L
+                Log.w(TAG, "WebView session bridge received Cloudflare challenge (${webResp.status}) for $url.")
+                throw CloudflareBlockedException()
+            }
+            if (webResp.status !in 200..299) {
+                throw HttpStatusException(webResp.status, url)
+            }
+            return SiteResponse(webResp.status, webResp.finalUrl, webResp.body, viaWebView = true)
         }
-        if (webResp.status == 429) {
-            throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
-        }
-        if (webResp.status in CLOUDFLARE_ERROR_CODES || webResp.body.isCloudflareChallengeHtml()) {
-            webBridgeUntilMs = 0L
-            Log.w(TAG, "WebView session bridge received Cloudflare challenge (${webResp.status}) for $url.")
-            throw CloudflareBlockedException()
-        }
-        if (webResp.status !in 200..299) {
-            throw IOException("HTTP ${webResp.status} for $url")
-        }
-        return SiteResponse(webResp.status, webResp.finalUrl, webResp.body, viaWebView = true)
+        throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
     }
 
     private fun executeSitePost(
         url: String,
         formParams: List<Pair<String, String>>,
         referer: String,
+        highPriority: Boolean = true,
     ): SiteResponse {
-        if (!shouldUseWebBridge()) {
-            val form = FormBody.Builder().apply {
-                formParams.forEach { (k, v) -> add(k, v) }
-            }.build()
-            val ajaxHeaders = headers.newBuilder()
-                .set("Referer", referer)
-                .set("Origin", baseUrl)
-                .set("X-Requested-With", "XMLHttpRequest")
-                .set("Accept", "application/json, text/javascript, */*; q=0.01")
-                .build()
-            try {
-                fastExtractorClient.newCall(POST(url, ajaxHeaders, form)).execute().use { resp ->
-                    resp.throwIfCloudflareChallenge()
-                    val finalUrl = resp.request.url.toString()
-                    val body = resp.body.string()
-                    if (body.isCloudflareChallengeHtml()) throw CloudflareBlockedException()
-                    return SiteResponse(resp.code, finalUrl, body, viaWebView = false)
-                }
-            } catch (t: Throwable) {
-                if (!isCloudflareThrowable(t)) throw t
-                if (!webBridge.hasClearanceCookie()) throw CloudflareBlockedException()
-                Log.i(TAG, "OkHttp POST hit Cloudflare mismatch on $url; switching to WebView session bridge.")
-                webBridgeUntilMs = System.currentTimeMillis() + WEB_BRIDGE_TTL_MS
-            }
-        }
-
         val encodedForm = formParams.joinToString("&") { (k, v) ->
             "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
         }
-        var webResp = webBridge.fetch(
-            url = url,
-            method = "POST",
-            formBody = encodedForm,
-            extraHeaders = mapOf(
-                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                "X-Requested-With" to "XMLHttpRequest",
-                "Accept" to "application/json, text/javascript, */*; q=0.01",
-            ),
-        )
-        if (webResp.status == 429) {
-            runCatching { Thread.sleep(RATE_LIMIT_BACKOFF_MS) }
-            webResp = webBridge.fetch(
+
+        for (attempt in 0..MAX_429_RETRIES) {
+            acquireSiteRequestSlot(highPriority)
+
+            if (!shouldUseWebBridge()) {
+                val form = FormBody.Builder().apply {
+                    formParams.forEach { (k, v) -> add(k, v) }
+                }.build()
+                val ajaxHeaders = headers.newBuilder()
+                    .set("Referer", referer)
+                    .set("Origin", baseUrl)
+                    .set("X-Requested-With", "XMLHttpRequest")
+                    .set("Accept", "application/json, text/javascript, */*; q=0.01")
+                    .build()
+                var switchedToBridge = false
+                try {
+                    fastExtractorClient.newCall(POST(url, ajaxHeaders, form)).execute().use { resp ->
+                        resp.throwIfCloudflareChallenge()
+                        if (resp.code == 429) {
+                            if (attempt < MAX_429_RETRIES) {
+                                noteRateLimitHit(resp.header("Retry-After")?.toLongOrNull(), attempt)
+                                continue
+                            }
+                            throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
+                        }
+                        val finalUrl = resp.request.url.toString()
+                        val body = resp.body.string()
+                        if (body.isCloudflareChallengeHtml()) throw CloudflareBlockedException()
+                        return SiteResponse(resp.code, finalUrl, body, viaWebView = false)
+                    }
+                } catch (t: Throwable) {
+                    if (!isCloudflareThrowable(t)) throw t
+                    if (!webBridge.hasClearanceCookie()) throw CloudflareBlockedException()
+                    Log.i(TAG, "OkHttp POST hit Cloudflare mismatch on $url; switching to WebView session bridge.")
+                    webBridgeUntilMs = System.currentTimeMillis() + WEB_BRIDGE_TTL_MS
+                    switchedToBridge = true
+                }
+                if (switchedToBridge) {
+                    acquireSiteRequestSlot(highPriority)
+                }
+            }
+
+            val webResp = webBridge.fetch(
                 url = url,
                 method = "POST",
                 formBody = encodedForm,
@@ -1495,15 +1801,20 @@ class SexTB :
                     "Accept" to "application/json, text/javascript, */*; q=0.01",
                 ),
             )
+            if (webResp.status == 429) {
+                if (attempt < MAX_429_RETRIES) {
+                    noteRateLimitHit(webResp.retryAfterSeconds, attempt)
+                    continue
+                }
+                throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
+            }
+            if (webResp.status in CLOUDFLARE_ERROR_CODES || webResp.body.isCloudflareChallengeHtml()) {
+                webBridgeUntilMs = 0L
+                throw CloudflareBlockedException()
+            }
+            return SiteResponse(webResp.status, webResp.finalUrl, webResp.body, viaWebView = true)
         }
-        if (webResp.status == 429) {
-            throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
-        }
-        if (webResp.status in CLOUDFLARE_ERROR_CODES || webResp.body.isCloudflareChallengeHtml()) {
-            webBridgeUntilMs = 0L
-            throw CloudflareBlockedException()
-        }
-        return SiteResponse(webResp.status, webResp.finalUrl, webResp.body, viaWebView = true)
+        throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
     }
 
     private fun xorDecrypt(encoded: String, key: String): String {
@@ -1602,11 +1913,22 @@ class SexTB :
         }
     }
 
-    private fun toSearchSlug(query: String): String = query.trim()
-        .replace(WHITESPACE_REGEX, "-")
-        .replace(MULTI_DASH_REGEX, "-")
-        .trim('-')
-        .ifBlank { query.trim() }
+    private fun toSearchSlug(query: String): String {
+        val cleaned = query
+            .replace('[', ' ')
+            .replace(']', ' ')
+            .replace('/', ' ')
+            .trim()
+            .replace(WHITESPACE_REGEX, "-")
+            .replace(MULTI_DASH_REGEX, "-")
+            .trim('-', ':', ',', '.')
+            .ifBlank { query.trim() }
+        return if (cleaned.length <= MAX_SEARCH_SLUG_LEN) {
+            cleaned
+        } else {
+            cleaned.substring(0, MAX_SEARCH_SLUG_LEN).substringBeforeLast('-', cleaned.substring(0, MAX_SEARCH_SLUG_LEN)).trim('-')
+        }
+    }
 
     private fun Response.rememberCatalogPath() {
         rememberCatalogPathFromUrl(request.url.toString())
@@ -1629,6 +1951,12 @@ class SexTB :
                 val tail = resolvedPath.removePrefix("/genre/")
                 val baseSlug = tail.replace(TRAILING_HASH_REGEX, "")
                 if (baseSlug != tail) "/genre/$baseSlug" else return
+            }
+
+            resolvedPath.startsWith("/studio/") -> {
+                val tail = resolvedPath.removePrefix("/studio/")
+                val baseSlug = tail.replace(TRAILING_HASH_REGEX, "")
+                if (baseSlug != tail) "/studio/$baseSlug" else return
             }
 
             else -> return
@@ -1752,6 +2080,8 @@ class SexTB :
         val referer: String,
     )
 
+    private class HttpStatusException(val code: Int, url: String) : IOException("HTTP $code for $url")
+
     private class CloudflareBlockedException : IOException("Cloudflare blocked SexTB. Open the page in WebView once, complete the challenge, then retry.")
 
     private class HumanVerificationException : IOException("SexTB requested human verification (Turnstile). Open this video in WebView once, confirm, then retry.")
@@ -1765,17 +2095,35 @@ class SexTB :
         private const val MAX_PLAYER_DEPTH = 1
         private const val MAX_SERVERS_TO_RESOLVE = 4
         private const val MAX_MULTI_SELECT = 5
-        private const val MAX_PARALLEL_FILTERS = 4
+        private const val MAX_MULTI_TARGETS = 4
+        private const val MAX_SEARCH_SLUG_LEN = 80
         private const val MAX_EXTRACTION_WAIT_MS = 10_000L
         private const val EXTRA_WAIT_AFTER_FIRST_MS = 1_800L
-        private const val PAGE_CACHE_TTL_MS = 3 * 60 * 1000L
+        private const val PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
+        private const val EMPTY_PAGE_CACHE_TTL_MS = 45 * 1000L
         private const val VIDEO_CACHE_TTL_MS = 3 * 60 * 1000L
         private const val TOP_CHART_CACHE_TTL_MS = 10 * 60 * 1000L
         private const val WEB_BRIDGE_TTL_MS = 15 * 60 * 1000L
-        private const val RATE_LIMIT_BACKOFF_MS = 900L
+        private const val MIN_SITE_REQUEST_GAP_MS = 650L
+        private const val COOLDOWN_REQUEST_GAP_MS = 1_600L
+        private const val RATE_LIMIT_COOLDOWN_MS = 20_000L
+        private const val RATE_LIMIT_BACKOFF_1_MS = 1_600L
+        private const val RATE_LIMIT_BACKOFF_2_MS = 3_200L
+        private const val RATE_LIMIT_BACKOFF_3_MS = 5_500L
+        private const val MAX_429_RETRIES = 3
+        private const val SINGLE_FLIGHT_WAIT_MS = 25_000L
         private const val CHALLENGE_PEEK_BYTES = 512L * 1024L
         private const val UPN_AES_KEY = "kiemtienmua911ca"
         private const val UPN_AES_IV = "1234567890oiuytr"
+
+        private val CATEGORY_TO_GENRE_SLUG = mapOf(
+            "/genre/ltx-encode" to "ltx-encode",
+            "/genre/uncensored-leaked" to "uncensored-leaked",
+            "/genre/reducing-mosaic" to "reducing-mosaic",
+            "/genre/sextb-encode" to "sextb-encode",
+            "/jav-amateur" to "amateur",
+            "/jav-subtitle" to "english-subtitle",
+        )
 
         private const val PREF_DEFAULT_CATEGORY_KEY = "pref_default_category"
         private val PREF_DEFAULT_CATEGORY_ENTRIES = arrayOf(
@@ -1875,7 +2223,6 @@ class SexTB :
             "Threesome / Foursome" to "threesome--foursome",
             "Squirting" to "squirting",
             "Cuckold" to "cuckold",
-            "Uncensored" to "jav-uncensored",
             "Drama" to "drama",
             "Nice Tits" to "nice-tits",
             "Gonzo" to "gonzo",
@@ -1909,10 +2256,7 @@ class SexTB :
             "Cheating Wife" to "cheating-wife",
             "Facial" to "facial",
             "Hardcore" to "hardcore",
-            // Additional & newly added categories/genres from /genres
-            "LTX Decensored" to "ltx-encode",
-            "SexTB Encode" to "sextb-encode",
-            "Uncensored Leaked" to "uncensored-leaked",
+            // Additional genres from /genres (categories like LTX / Uncensored Leaked live in Categories above)
             "Risky Mosaic" to "risky-mosaic",
             "Minimal Mosaic" to "minimal-mosaic",
             "30 Years Old" to "30-years-old",
