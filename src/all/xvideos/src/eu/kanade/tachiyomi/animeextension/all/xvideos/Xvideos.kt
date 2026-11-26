@@ -293,22 +293,36 @@ class Xvideos :
 
     override fun animeDetailsParse(document: Document): SAnime {
         val anime = SAnime.create()
-        anime.title = document.selectFirst("h2.page-title, #main h2")
+        val rawTitle = document.selectFirst("h2.page-title, #main h2")
             ?.ownText()
             ?.ifBlank { null }
             ?: document.selectFirst("h2.page-title, #main h2")?.text().orEmpty()
                 .ifBlank {
                     document.selectFirst("meta[property=og:title]")?.attr("content").orEmpty()
                 }
+        val duration = document.selectFirst("h2.page-title span.duration, span.duration")
+            ?.text()?.trim()?.ifBlank { null }
+            ?: document.selectFirst("meta[property=og:duration]")?.attr("content")?.toIntOrNull()?.let { sec ->
+                if (sec >= 60) "${sec / 60}m" else "${sec}s"
+            }
+        anime.title = if (!duration.isNullOrBlank() && rawTitle.isNotBlank() && !rawTitle.contains(duration, ignoreCase = true)) {
+            "[$duration] $rawTitle"
+        } else {
+            rawTitle
+        }
         anime.author = document.selectFirst(
             "div.video-metadata li.main-uploader a span.name, " +
                 "div.video-metadata a.main.uploader-tag span.name, " +
                 "div.video-metadata a.uploader-tag span.name",
         )?.text()?.trim()
             ?: document.selectFirst("div.video-metadata a.name, a.main.uploader-tag")?.text()?.trim()
-        anime.description = document.selectFirst("meta[property=og:description]")?.attr("content")
+        val metaDesc = document.selectFirst("meta[property=og:description]")?.attr("content")
             ?.ifBlank { null }
             ?: document.selectFirst("meta[name=description]")?.attr("content")
+        anime.description = buildList {
+            if (!duration.isNullOrBlank()) add("Duration: $duration")
+            if (!metaDesc.isNullOrBlank()) add(metaDesc)
+        }.joinToString("\n").ifBlank { null }
         anime.genre = document.select(
             "div.video-metadata ul li a span.name, " +
                 "div.video-metadata ul li a span, " +

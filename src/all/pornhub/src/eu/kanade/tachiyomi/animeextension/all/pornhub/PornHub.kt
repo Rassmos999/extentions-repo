@@ -353,7 +353,30 @@ class PornHub :
             runBatch(buildRequests(""))
         }
 
-        val ranked = tasteEngine.rankCandidates(combined, excludeWatched = true, blendWithOriginalRank = false)
+        // Adaptive duration guard: keep >=20m (or targetMin-5) videos on For You so 2-6 min
+        // promoted/sidebar clips never pollute long-form feeds; relax to >=15m only if too few exist.
+        val hardMin = if (targetMinDur >= 20) (targetMinDur - 5).coerceAtLeast(18) else 0
+        val durationFiltered = if (hardMin > 0) {
+            val strictLong = combined.filter { item ->
+                val d = tasteEngine.extractDurationMinutes(item.title)
+                d == null || d >= hardMin
+            }
+            when {
+                strictLong.size >= 6 -> strictLong
+
+                else -> {
+                    val softLong = combined.filter { item ->
+                        val d = tasteEngine.extractDurationMinutes(item.title)
+                        d == null || d >= 15
+                    }
+                    if (softLong.size >= 4) softLong else combined
+                }
+            }
+        } else {
+            combined
+        }
+
+        val ranked = tasteEngine.rankCandidates(durationFiltered, excludeWatched = true, blendWithOriginalRank = false)
         return AnimesPage(ranked, anyNext)
     }
 
@@ -826,8 +849,13 @@ class PornHub :
             ?: flashvars?.get("image_url")?.jsonPrimitive?.contentOrNull?.trim()?.ifBlank { null }
         phClient.rememberThumbnail(cover)
 
+        val formattedDur = durationSec?.takeIf { it > 0 }?.let(::formatDuration)
         return SAnime.create().apply {
-            title = videoTitle
+            title = if (!formattedDur.isNullOrBlank() && !videoTitle.contains(formattedDur)) {
+                "[$formattedDur] $videoTitle"
+            } else {
+                videoTitle
+            }
             author = uploader
             artist = uploader
             description = descParts.joinToString("\n").ifBlank { null }

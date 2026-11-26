@@ -244,23 +244,38 @@ class Xnxx :
 
     override fun animeDetailsParse(document: Document): SAnime {
         val anime = SAnime.create()
-        anime.title = document.selectFirst(
+        val rawTitle = document.selectFirst(
             "#video-content-metadata > div.clear-infobar strong, " +
                 "#video-content-metadata strong, h1, h2.page-title",
         )?.text().orEmpty()
             .ifBlank {
                 document.selectFirst("meta[property=og:title]")?.attr("content").orEmpty()
             }
+        val duration = document.selectFirst("span.metadata, #video-content-metadata span.metadata")?.text()?.let { text ->
+            Regex("""\b(\d+:\d+|\d+\s*min)\b""", RegexOption.IGNORE_CASE).find(text)?.value
+        }?.trim()?.ifBlank { null }
+            ?: document.selectFirst("meta[property=og:duration]")?.attr("content")?.toIntOrNull()?.let { sec ->
+                if (sec >= 60) "${sec / 60}m" else "${sec}s"
+            }
+        anime.title = if (!duration.isNullOrBlank() && rawTitle.isNotBlank() && !rawTitle.contains(duration, ignoreCase = true)) {
+            "[$duration] $rawTitle"
+        } else {
+            rawTitle
+        }
         anime.author = document.selectFirst(
             "#video-content-metadata > div.clear-infobar span a, " +
                 "#video-content-metadata a[href*=/porn-maker/], " +
                 "#video-content-metadata a[href*=/profiles/]",
         )?.text()?.trim()
-        anime.description = document.selectFirst("#video-content-metadata > p")?.text()
+        val metaDesc = document.selectFirst("#video-content-metadata > p")?.text()
             ?.replace("\n", " ")
             ?.trim()
             ?.ifBlank { null }
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
+        anime.description = buildList {
+            if (!duration.isNullOrBlank()) add("Duration: $duration")
+            if (!metaDesc.isNullOrBlank()) add(metaDesc)
+        }.joinToString("\n").ifBlank { null }
         anime.genre = document.select(
             "#video-content-metadata > div.metadata-row.video-tags > a, " +
                 "#video-content-metadata a[href*=/search/], " +

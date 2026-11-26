@@ -755,11 +755,11 @@ class SmartTasteEngine(
                     val targetMin = preferredNonJavMinMinutes()
                     if (targetMin >= 15) {
                         score += when {
-                            effDur in targetMin..120 -> 7.5
-                            effDur > 120 -> 6.0
-                            effDur >= (targetMin - 7).coerceAtLeast(15) -> 1.8
-                            effDur >= 12 -> -2.8
-                            else -> -9.5 // short <12m clips demoted strongly on non-JAV tubes
+                            effDur in targetMin..150 -> 10.5
+                            effDur > 150 -> 8.0
+                            effDur >= (targetMin - 5).coerceAtLeast(18) -> 2.5
+                            effDur >= 15 -> -10.0
+                            else -> -32.0 // short <15m clips (4m, 6m, 10m) heavily demoted on non-JAV tubes
                         }
                     }
                 }

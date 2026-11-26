@@ -1193,11 +1193,19 @@ class SexTB :
     override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
         document.throwIfCloudflareChallenge()
 
-        title = document.selectFirst("h1.film-info-title, h1")
+        val rawDetailTitle = document.selectFirst("h1.film-info-title, h1")
             ?.text()
             ?.replace(MULTI_SPACE_REGEX, " ")
             ?.trim()
             .orEmpty()
+        val detailRuntime = document.metadataText("Runtimes:", "Runtime:")
+            ?.replace(Regex("""(?i)\s*mins?\b"""), "m")
+            ?.trim()
+        title = if (!detailRuntime.isNullOrBlank() && rawDetailTitle.isNotBlank() && !rawDetailTitle.contains(detailRuntime, ignoreCase = true)) {
+            "[$detailRuntime] $rawDetailTitle"
+        } else {
+            rawDetailTitle
+        }
 
         val thumbnailElement: Element? = document.selectFirst(
             "div.covert img, #infomation img, div.col-3 img, #poster img, div.col-5 img, img[itemprop=image]",
@@ -2250,12 +2258,14 @@ class SexTB :
     private fun normalizeUrl(rawUrl: String): String? {
         val clean = rawUrl.trim().trim('"', '\'')
         if (clean.isBlank()) return null
-        return when {
+        val absolute = when {
             clean.startsWith("//") -> "https:$clean"
             clean.startsWith("/") -> "$baseUrl$clean"
             clean.startsWith("http://") || clean.startsWith("https://") -> clean
             else -> "$baseUrl/${clean.removePrefix("/")}"
         }
+        // Tadami's cover fetcher blacklists `cdna.sextb.net`; `cdn001.imggle.net` serves the identical path.
+        return absolute.replace(SEXTBN_DEAD_CDN_REGEX, "https://cdn001.imggle.net/")
     }
 
     private fun toSearchSlug(query: String): String {
@@ -2638,6 +2648,7 @@ class SexTB :
         private val NON_SLUG_REGEX = Regex("""[^a-z0-9-]+""")
         private val SEARCH_KEY_NOISE_REGEX = Regex("""[\s\-_:/\[\]().,!?]+""")
         private val WHITESPACE_REGEX = Regex("""\s+""")
+        private val SEXTBN_DEAD_CDN_REGEX = Regex("""https?://cdn[a-z0-9]*\.sextb\.net/""", RegexOption.IGNORE_CASE)
         private val MULTI_SPACE_REGEX = Regex("""\s+""")
         private val MULTI_DASH_REGEX = Regex("""-+""")
         private val TRAILING_HASH_REGEX = Regex("""-[a-z0-9]{8}$""")

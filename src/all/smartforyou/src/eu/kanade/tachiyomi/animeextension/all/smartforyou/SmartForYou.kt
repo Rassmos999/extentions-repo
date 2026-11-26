@@ -90,7 +90,11 @@ class SmartForYou :
     private val sourceNextAllowedMs = ConcurrentHashMap<String, Long>()
     private val sourceCooldownUntilMs = ConcurrentHashMap<String, Long>()
     private val recentDetailEntities = ConcurrentHashMap<String, Long>()
+    private val sexTbHashedGenres = ConcurrentHashMap<String, String>()
     private val sourcePaceLock = Any()
+
+    @Volatile
+    private var sexTbGenresFetchedAtMs: Long = 0L
 
     @Volatile
     private var lastSearchRecordedMs: Long = 0L
@@ -282,9 +286,26 @@ class SmartForYou :
         }
 
         val merged = interleaveUnique(batches)
+        // Final non-JAV duration guard: never let 4-6 min clips sneak onto For You / Latest
+        // when the user's non-JAV target duration is >= 20m (unless total feed would starve).
+        val cleanPool = if (nonJavMinMin >= 20 && mode != FeedMode.TRENDING) {
+            val noShortNonJav = merged.animes.filter { anime ->
+                val srcId = detectSourceId(anime.url)
+                val isJavOrShort = srcId != null && (tasteEngine.isJavSource(srcId) || tasteEngine.isShortFormSource(srcId))
+                if (isJavOrShort) {
+                    true
+                } else {
+                    val d = tasteEngine.extractDurationMinutes(anime.title)
+                    d == null || d >= 15
+                }
+            }
+            if (noShortNonJav.size >= 6) noShortNonJav else merged.animes
+        } else {
+            merged.animes
+        }
         if (page <= 1) seenFeedKeys.clear()
         val ranked = tasteEngine.rankCandidates(
-            items = merged.animes,
+            items = cleanPool,
             excludeWatched = true,
             blendWithOriginalRank = mode == FeedMode.TRENDING,
         ).filter { anime ->
@@ -316,8 +337,11 @@ class SmartForYou :
         nonJavMinMin: Int,
         newest: Boolean,
     ): AnimesPage {
-        val wantDurFilter = !src.isJav && !src.isShortForm && src.supportsDurationQuery && nonJavMinMin >= 20
+        val applyNonJavDurGuard = !src.isJav && !src.isShortForm && nonJavMinMin >= 20
+        val hardMinDur = if (applyNonJavDurGuard) (nonJavMinMin - 5).coerceAtLeast(18) else 0
+        val wantDurFilter = applyNonJavDurGuard && (src.supportsDurationQuery || src.isArabic)
         val collected = mutableListOf<SAnime>()
+        val softMediumPool = mutableListOf<SAnime>()
         val seen = HashSet<String>()
         var anyNext = false
 
@@ -326,10 +350,18 @@ class SmartForYou :
             if (p.hasNextPage) anyNext = true
             var added = 0
             for (item in p.animes) {
-                if (!tasteEngine.isWatched(item.url, item.title) && seen.add(item.url.lowercase(Locale.ROOT))) {
-                    collected += item
-                    added++
+                val urlKey = item.url.lowercase(Locale.ROOT)
+                if (tasteEngine.isWatched(item.url, item.title) || !seen.add(urlKey)) continue
+                if (hardMinDur > 0) {
+                    val dur = tasteEngine.extractDurationMinutes(item.title)
+                    if (dur != null && dur < hardMinDur) {
+                        // Never accept 1–14 min clips (e.g. 4m / 6m) when non-JAV target is 25m+!
+                        if (dur >= 15) softMediumPool += item
+                        continue
+                    }
                 }
+                collected += item
+                added++
             }
             return added
         }
@@ -358,7 +390,7 @@ class SmartForYou :
             absorb(comboPage)
         }
 
-        // Pass 3: Single concept search (with duration filter on non-JAV tubes)
+        // Pass 3: Single concept search (with duration filter on non-JAV tubes & longest sort on Arabic KVS)
         if (collected.size < MIN_HEALTHY_YIELD) {
             val qRaw = primaryConcept ?: tasteQueries[idx % tasteQueries.size]
             val q = conceptQueryForSource(src, qRaw)
@@ -368,8 +400,8 @@ class SmartForYou :
             absorb(singlePage)
         }
 
-        // Pass 4 (Adaptive relaxation!): If duration filter made results too sparse, relax URL duration filter
-        // (SmartTasteEngine still ranks >=25m videos at the top!).
+        // Pass 4 (Adaptive relaxation!): If URL duration filter was too strict, relax URL param
+        // while STILL keeping our client-side >=20m / >=15m duration filter (so 4-6m clips never sneak in!).
         if (collected.size < MIN_HEALTHY_YIELD && wantDurFilter) {
             val qRaw = primaryConcept ?: tasteQueries[idx % tasteQueries.size]
             val q = conceptQueryForSource(src, qRaw)
@@ -379,10 +411,15 @@ class SmartForYou :
             absorb(relaxedPage)
         }
 
-        // Pass 5: Final fallback to source browse so this source never goes blank.
+        // Pass 5: Final fallback to source browse (still filtered by hardMinDur!).
         if (collected.size < 4) {
             val fallbackPage = runCatching { browseSource(src.id, page, latest = newest) }.getOrNull()
             absorb(fallbackPage)
+        }
+
+        // Only if < 4 long videos exist for this source, backfill from 15–19m medium pool (never 4-6m!).
+        if (collected.size < 4 && softMediumPool.isNotEmpty()) {
+            collected += softMediumPool.take(6 - collected.size)
         }
 
         return AnimesPage(collected, anyNext)
@@ -408,7 +445,8 @@ class SmartForYou :
     ): AnimesPage? = when (srcId) {
         "sextb" -> {
             val slug = SEXTB_CONCEPT_GENRES[concept] ?: return null
-            val path = if (page > 1) "/genre/$slug/pg-$page" else "/genre/$slug"
+            val genrePath = resolveSexTbGenrePath(slug)
+            val path = if (page > 1) "$genrePath/pg-$page" else genrePath
             val sort = if (newest) "desc" else "viewed"
             val html = fetchHtml(cfClientFor("https://sextb.net"), "https://sextb.net$path?sort=$sort", "https://sextb.net/")
             parseSexTbList(Jsoup.parse(html, "https://sextb.net"))
@@ -691,12 +729,13 @@ class SmartForYou :
         }
 
         "sextb" -> {
+            val baseGenre = resolveSexTbGenrePath("ltx-encode")
             val path = if (latest && page == 1) {
                 "/new-releases"
             } else if (page > 1) {
-                "/genre/ltx-encode/pg-$page"
+                "$baseGenre/pg-$page"
             } else {
-                "/genre/ltx-encode"
+                baseGenre
             }
             val url = "https://sextb.net$path" + if (!latest) "?sort=viewed" else ""
             val html = fetchHtml(cfClientFor("https://sextb.net"), url, "https://sextb.net/")
@@ -890,20 +929,26 @@ class SmartForYou :
             }
 
             "aflamk1" -> {
-                val url = "https://www.aflamk1.net/search/?q=$enc" + if (page > 1) "&from_videos=$page" else ""
+                val sort = if (minDurationMin >= 20) "&sort_by=duration" else ""
+                val url = "https://www.aflamk1.net/search/?q=$enc$sort" + if (page > 1) "&from_videos=$page" else ""
                 val html = fetchHtml(cfClientFor("https://www.aflamk1.net"), url, "https://www.aflamk1.net/")
                 parseKvsList(Jsoup.parse(html, "https://www.aflamk1.net"), "https://www.aflamk1.net", "Aflamk1")
             }
 
             "sexalarab" -> {
-                val url = "https://sexalarab.tv/search/?q=$enc&from_videos=$page"
+                val sort = if (minDurationMin >= 20) "&sort_by=duration" else ""
+                val url = "https://sexalarab.tv/search/?q=$enc$sort&from_videos=$page"
                 val html = fetchHtml(cfClientFor("https://sexalarab.tv"), url, "https://sexalarab.tv/")
                 parseKvsList(Jsoup.parse(html, "https://sexalarab.tv"), "https://sexalarab.tv", "SexAlArab")
             }
 
             "arabx" -> {
                 val slug = URLEncoder.encode(clean.replace(Regex("""\s+"""), "-"), "UTF-8")
-                val url = "https://www.arabx.cam/search/$slug/" + if (page > 1) "?from_videos=$page" else ""
+                val params = buildList {
+                    if (minDurationMin >= 20) add("sort_by=duration")
+                    if (page > 1) add("from_videos=$page")
+                }.joinToString("&")
+                val url = "https://www.arabx.cam/search/$slug/" + if (params.isNotBlank()) "?$params" else ""
                 val html = fetchHtml(cfClientFor("https://www.arabx.cam"), url, "https://www.arabx.cam/")
                 parseKvsList(Jsoup.parse(html, "https://www.arabx.cam"), "https://www.arabx.cam", "ArabX")
             }
@@ -1278,15 +1323,38 @@ class SmartForYou :
         return normalizeOriginUrl(picked, origin)
     }
 
+    private fun resolveSexTbGenrePath(slug: String): String {
+        val now = System.currentTimeMillis()
+        if (sexTbHashedGenres.isEmpty() || now - sexTbGenresFetchedAtMs > 30 * 60 * 1000L) {
+            runCatching {
+                val html = fetchHtml(cfClientFor("https://sextb.net"), "https://sextb.net/genres", "https://sextb.net/")
+                val doc = Jsoup.parse(html, "https://sextb.net")
+                for (a in doc.select("a[href*=/genre/]")) {
+                    val path = a.attr("href").substringBefore('?').trimEnd('/')
+                    if (!path.startsWith("/genre/")) continue
+                    val fullSlug = path.removePrefix("/genre/")
+                    val baseSlug = fullSlug.replace(Regex("""-[a-z0-9]{6,10}$"""), "")
+                    sexTbHashedGenres[baseSlug] = path
+                    sexTbHashedGenres[fullSlug] = path
+                }
+                sexTbGenresFetchedAtMs = now
+            }
+        }
+        return sexTbHashedGenres[slug] ?: "/genre/$slug"
+    }
+
     private fun normalizeOriginUrl(raw: String?, origin: String): String? {
         val clean = raw?.trim()?.trim('"', '\'') ?: return null
         if (clean.isBlank()) return null
-        return when {
+        val absolute = when {
             clean.startsWith("http://") || clean.startsWith("https://") -> clean
             clean.startsWith("//") -> "https:$clean"
             clean.startsWith("/") -> "${origin.trimEnd('/')}$clean"
             else -> "${origin.trimEnd('/')}/${clean.removePrefix("/")}"
         }
+        // Tadami Aurora's Coil cover fetcher blacklists `cdna.sextb.net`; `cdn001.imggle.net`
+        // serves the exact same image path without being blocked!
+        return absolute.replace(SEXTB_DEAD_CDN_REGEX, "https://cdn001.imggle.net/")
     }
 
     // ---- Details Parser ----
@@ -2168,6 +2236,8 @@ class SmartForYou :
 
         private const val DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+        private val SEXTB_DEAD_CDN_REGEX = Regex("""https?://cdn[a-z0-9]*\.sextb\.net/""", RegexOption.IGNORE_CASE)
 
         private val ALL_SOURCES = listOf(
             SourceDef("sextb", "SexTB", isJav = true),
