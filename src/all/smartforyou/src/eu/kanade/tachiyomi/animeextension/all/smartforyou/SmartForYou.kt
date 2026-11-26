@@ -252,9 +252,21 @@ class SmartForYou :
         mode: FeedMode,
     ): AnimesPage {
         val snap = tasteEngine.snapshot()
-        val coreConcepts = (snap.topConcepts + snap.softAnchors).distinct()
+        // Always prioritize MMF + Group themes (mmf, gangbang, dp, foursome, orgy) across
+        // ALL active sources so sources #2-#5 never drift into solo/family/FFM feeds!
+        val primaryGroupThemes = buildList {
+            for (g in GROUP_DISCOVERY_ORDER) {
+                if (g in snap.topConcepts || g in snap.softAnchors || g == "mmf" || g == "gangbang" || g == "dp") {
+                    add(g)
+                }
+            }
+            for (c in snap.topConcepts) {
+                if (c !in this) add(c)
+            }
+        }.distinct()
+        val coreConcepts = primaryGroupThemes
         val tasteQueries = buildList {
-            addAll(coreConcepts.take(5))
+            addAll(primaryGroupThemes.take(5))
             addAll(tasteEngine.buildTitleSearchQueries(maxQueries = 5))
             snap.topPerformers.firstOrNull()?.let(::add)
         }.distinct()
@@ -414,8 +426,9 @@ class SmartForYou :
             return added
         }
 
-        // Choose rotated primary & secondary concepts for this source
-        val primaryConcept = coreConcepts.getOrNull(idx % coreConcepts.size.coerceAtLeast(1))
+        // Choose rotated primary concept strictly from TOP GROUP/MMF themes (mmf, gangbang, dp, foursome, orgy)
+        val groupPool = coreConcepts.filter { it in GROUP_DISCOVERY_ORDER }.ifEmpty { GROUP_DISCOVERY_ORDER }
+        val primaryConcept = groupPool[idx % groupPool.size]
         val anchorPartner = softAnchors.firstOrNull { it != primaryConcept && it in COMBO_FRIENDLY_CONCEPTS }
 
         // Pass 1: Native category/genre browse for supported concept (fast, high precision!)
@@ -558,10 +571,17 @@ class SmartForYou :
         }
 
         "xmoviesforyou" -> {
-            val slug = XMOVIES_CONCEPT_CATS[concept] ?: return null
-            val pg = if (page > 1) "?page=$page" else ""
-            val html = fetchHtml(cfClientFor("https://xmoviesforyou.com"), "https://xmoviesforyou.com/category/$slug$pg", "https://xmoviesforyou.com/")
-            parseXMoviesList(Jsoup.parse(html, "https://xmoviesforyou.com"), page)
+            // XMoviesForYou's /category/dp returns 404 and /category/threesome returns empty;
+            // `/new-search?q=` returns clean full-length MMF, DP, Gangbang & Foursome scenes!
+            val q = when (concept) {
+                "mmf", "threesome" -> "mmf"
+                "dp" -> "dp"
+                "gangbang" -> "gangbang"
+                "foursome" -> "foursome"
+                "orgy" -> "orgy"
+                else -> concept
+            }
+            searchSource("xmoviesforyou", page, q, minDurationMin = 0, newest = newest)
         }
 
         else -> null
@@ -569,34 +589,22 @@ class SmartForYou :
 
     private fun isSyntheticFallbackQuery(q: String): Boolean {
         if (q.length > 55) return true
+        // Drop bracketed titles / duration-prefixed titles emitted by Tadami's fallback engine
+        // (e.g. "[33m] ...", "[Private] ...", "[SexTB • 85m] ...").
+        if (q.startsWith("[")) return true
         val lower = q.lowercase(Locale.ROOT)
         if (lower.startsWith("source:") ||
             lower.startsWith("label:") ||
             lower.startsWith("studio:") ||
             lower.startsWith("uploader:") ||
             lower.startsWith("duration:") ||
-            lower.startsWith("[sextb") ||
-            lower.startsWith("[pornhub") ||
-            lower.startsWith("[xvideos") ||
-            lower.startsWith("[xnxx") ||
-            lower.startsWith("[rule34") ||
-            lower.startsWith("[sexalarab") ||
-            lower.startsWith("[supjav") ||
-            lower.startsWith("[jable") ||
-            lower.startsWith("[missav") ||
-            lower.startsWith("[javgg") ||
-            lower.startsWith("[javguru") ||
-            lower.startsWith("[xmovies") ||
-            lower.startsWith("[aflamk1") ||
-            lower.startsWith("[arabx") ||
             lower == "featured actress" ||
             lower == "single work" ||
-            lower == "solo work"
+            lower == "solo work" ||
+            ALL_SOURCES.any { lower == it.id || lower == it.label.lowercase(Locale.ROOT) }
         ) {
             return true
         }
-        // Drop Tadami AnimeSearchFallbackEngine burst queries matching entities we JUST returned
-        // from getAnimeDetails within the last 14 seconds (prevents xvideos HTTP 429 storms!).
         val detailTs = recentDetailEntities[lower]
         if (detailTs != null && System.currentTimeMillis() - detailTs < 14_000L) {
             return true
@@ -922,7 +930,7 @@ class SmartForYou :
                 val pageParam = if (page > 1) "&page=$page" else ""
                 val url = "https://www.pornhub.com/video/search?search=$enc$durParam$sortParam$pageParam"
                 val html = fetchHtml(pornhubClient, url, "https://www.pornhub.com/")
-                parsePornHubList(Jsoup.parse(html, "https://www.pornhub.com"))
+                parsePornHubList(Jsoup.parse(html, "https://www.pornhub.com"), isSearch = true)
             }
 
             "sextb" -> searchSexTbAjax(clean, page)
@@ -1028,13 +1036,25 @@ class SmartForYou :
 
     // ---- List Parsers ----
 
-    private fun parsePornHubList(doc: Document): AnimesPage {
-        val items = doc.select("li.pcVideoListItem:not(.mockNsfwThumb), ul#videoSearchResult li.pcVideoListItem")
+    private fun parsePornHubList(doc: Document, isSearch: Boolean = false): AnimesPage {
+        // Strictly select inside `ul#videoSearchResult` (for search) or `ul#videoCategory`
+        // (for category browse) so PornHub's unrelated short sidebar/promoted widgets never leak in!
+        val primaryCards = if (isSearch) {
+            doc.select("ul#videoSearchResult li.pcVideoListItem:not(.mockNsfwThumb)")
+        } else {
+            doc.select("ul#videoCategory li.pcVideoListItem:not(.mockNsfwThumb)")
+        }
+        val candidates = primaryCards.ifEmpty {
+            doc.select("li.pcVideoListItem:not(.mockNsfwThumb)")
+        }
+        val items = candidates
             .asSequence()
             .filter { el ->
                 el.parents().none { p ->
-                    p.id() in setOf("hottestMenuSection", "recommMenuSection", "bottomVideos") ||
-                        p.hasClass("premiumStyle")
+                    p.id() in setOf("hottestMenuSection", "recommMenuSection", "bottomVideos", "recommendedVideos", "mostRecentVideosSection") ||
+                        p.hasClass("premiumStyle") ||
+                        p.hasClass("dropdownHottestVideos") ||
+                        p.hasClass("dropdownReccomendedVideos")
                 }
             }
             .mapNotNull { el ->
@@ -2316,6 +2336,8 @@ class SmartForYou :
             "supjav2" to "supjav",
             "sexmahali" to "sexalarab",
         )
+
+        private val GROUP_DISCOVERY_ORDER = listOf("mmf", "gangbang", "dp", "foursome", "orgy")
 
         private val COMBO_FRIENDLY_CONCEPTS = setOf(
             "mmf", "threesome", "foursome", "dp", "gangbang", "slut", "orgy", "anal", "creampie", "milf", "interracial",

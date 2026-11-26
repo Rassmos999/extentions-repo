@@ -715,10 +715,13 @@ class SmartTasteEngine(
         val candidateConcepts = extractConcepts(title, extraTags)
         val anchors = getSoftAnchors().toSet()
 
-        val isMmf = "mmf" in candidateConcepts || MMF_PRIORITY_REGEX.containsMatchIn(combinedText)
-        val isHardGroup = "gangbang" in candidateConcepts || "dp" in candidateConcepts ||
-            "foursome" in candidateConcepts || "orgy" in candidateConcepts
-        val isFfmOnly = !isMmf && !isHardGroup && FFM_PENALTY_REGEX.containsMatchIn(combinedText)
+        val isReverseGangbang = REVERSE_GANGBANG_REGEX.containsMatchIn(combinedText)
+        val isMmf = !isReverseGangbang && ("mmf" in candidateConcepts || MMF_PRIORITY_REGEX.containsMatchIn(combinedText))
+        val isHardGroup = !isReverseGangbang && (
+            "gangbang" in candidateConcepts || "dp" in candidateConcepts ||
+                "foursome" in candidateConcepts || "orgy" in candidateConcepts
+            )
+        val isFfmOnly = isReverseGangbang || (!isMmf && !isHardGroup && FFM_PENALTY_REGEX.containsMatchIn(combinedText))
 
         var score = 0.0
 
@@ -1424,12 +1427,14 @@ class SmartTasteEngine(
         private val MULTI_SPACE_REGEX = Regex("""\s+""")
 
         // Canonical adult concept patterns — rich English & Arabic title/tag vocabulary.
+        private val REVERSE_GANGBANG_REGEX = Regex("""\b(?:reverse\s*gang\s*bang\w*|harem|1\s*(?:guy|man|cock|dick)\s+(?:and\s+)?[2-9]\s*(?:girls|women|teens|babes|milfs|sluts))\b""")
+
         private val MMF_PRIORITY_REGEX = Regex(
-            """\b(?:mmf|mfm|fmm|mmmf|mmfm|mfmm|fmmm|2\s*on\s*1|2v1|3\s*on\s*1|4\s*on\s*1|5\s*on\s*1|two\s+on\s+one|two\s+(?:guys|men|dudes|boys|cocks|dicks|black\s+guys|studs|bulls|brothers|friends|husbands)|both\s+(?:guys|cocks|dicks|holes)|double\s*(?:team\w*|penetration|penetrat\w*|anal|vaginal|stuffed)|tag\s*team\w*|spit\s*roast\w*|spitroast\w*|sandwiched|airtight|dp|dap|dvp|sharing\s+(?:his|my|a|her|the)\s+(?:wife|girlfriend|gf|slut|bitch|mom|stepmom|sister)|shared\s+by\s+two|fucked\s+by\s+(?:two|2|3|three|multiple)|1\s*girl\s+[2-9]\s*(?:guys|men))\b|ولدين\s*وبنت|رجلين\s*وامر|شابين|اتنين\s*عليها|اثنين\s*على\s*واحد|يتقاسم\w*|تتناك\s*من\s*(?:اثنين|اتنين|شابين|رجلين|اصدقائه|أصدقائه|الجميع)""",
+            """\b(?:mmf|mfm|fmm|mmmf|mmfm|mfmm|fmmm|2\s*on\s*1|2v1|3\s*on\s*1|4\s*on\s*1|5\s*on\s*1|two\s+on\s+one|(?:two|three|four|2|3|4|5|\d+)\s+(?:guys|men|dudes|boys|males|cocks|dicks|bbc|black\s+guys|studs|bulls|brothers|friends|husbands|hot\s+males)|both\s+(?:guys|cocks|dicks|holes)|double\s*(?:team\w*|penetration|penetrat\w*|anal|vaginal|stuffed|pound\w*)|dpdiva|dp\s*fanatics|dogfart|tag\s*team\w*|spit\s*roast\w*|spitroast\w*|sandwiched|airtight|dp|dap|dvp|sharing\s+(?:his|my|a|her|the)\s+(?:wife|girlfriend|gf|slut|bitch|mom|stepmom|sister)|shared\s+by\s+(?:two|2|3|three|multiple)|fucked\s+by\s+(?:two|2|3|three|multiple|\d+)|1\s*girl\s+[2-9]\s*(?:guys|men)|boyfriend\s+and\s+(?:his|my)\s+(?:friend|brother|buddy))\b|ولدين\s*وبنت|رجلين\s*وامر|شابين|اتنين\s*عليها|اثنين\s*على\s*واحد|يتقاسم\w*|تتناك\s*من\s*(?:اثنين|اتنين|شابين|رجلين|اصدقائه|أصدقائه|الجميع)""",
         )
 
         private val FFM_PENALTY_REGEX = Regex(
-            """\b(?:ffm|mff|fmf|fffm|mfff|ffmf|fmff|girl\s*girl\s*guy|girl/girl/guy|2\s*girls\s*1\s*(?:guy|cock|dick|man)|two\s+(?:girls|women|sluts|sisters|wives|moms|milfs|teens|babes|bitches|lesbians|beauties|hotties)|lesbian\s*threesome|harem|reverse\s*gangbang)\b|ولد\s*وبنتين|بنتين\s*وولد|شاب\s*وبنتين|اختين\s*مع|أختين\s*مع|سحاق\s*ثلاثي""",
+            """\b(?:ffm|mff|fmf|fffm|mfff|ffmf|fmff|bgg|firstbgg|boy[\s/-]*girl[\s/-]*girl|girl[\s/-]*girl[\s/-]*guy|2\s*girls\s*1\s*(?:guy|cock|dick|man)|(?:two|three|2|3)\s+(?:girls|women|chicks|sluts|sisters|wives|moms|milfs|teens|babes|bitches|lesbians|beauties|hotties)|lesbian\s*threesome|girl\s+on\s+girl|harem|reverse\s*gang\s*bang\w*)\b|ولد\s*وبنتين|بنتين\s*وولد|شاب\s*وبنتين|اختين\s*مع|أختين\s*مع|سحاق\s*ثلاثي""",
         )
 
         private val CONCEPT_PATTERNS: List<Pair<String, Regex>> = listOf(
