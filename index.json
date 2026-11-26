@@ -348,10 +348,10 @@
   {
     "name": "Aniyomi: PornHub",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.pornhub",
-    "apk": "aniyomi-all.pornhub-v14.3.apk",
+    "apk": "aniyomi-all.pornhub-v14.4.apk",
     "lang": "all",
-    "code": 3,
-    "version": "14.3",
+    "code": 4,
+    "version": "14.4",
     "nsfw": 1,
     "sources": [
       {
@@ -399,10 +399,10 @@
   {
     "name": "Aniyomi: SexTB",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.sextb",
-    "apk": "aniyomi-all.sextb-v14.26.apk",
+    "apk": "aniyomi-all.sextb-v14.27.apk",
     "lang": "all",
-    "code": 26,
-    "version": "14.26",
+    "code": 27,
+    "version": "14.27",
     "nsfw": 1,
     "sources": [
       {
@@ -427,6 +427,23 @@
         "lang": "all",
         "id": "7409266434239021230",
         "baseUrl": "https://cinemana.shabakaty.com"
+      }
+    ]
+  },
+  {
+    "name": "Aniyomi: Smart For You",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.smartforyou",
+    "apk": "aniyomi-all.smartforyou-v14.1.apk",
+    "lang": "all",
+    "code": 1,
+    "version": "14.1",
+    "nsfw": 1,
+    "sources": [
+      {
+        "name": "Smart For You",
+        "lang": "all",
+        "id": "8513878458889700194",
+        "baseUrl": "https://www.pornhub.com"
       }
     ]
   },

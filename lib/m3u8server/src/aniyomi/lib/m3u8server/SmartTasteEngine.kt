@@ -48,6 +48,7 @@ class SmartTasteEngine(
     private val localCategoryStorageKey: String = "smart_taste_cats_$sourceKey"
 
     data class ProfileSnapshot(
+        val topSources: List<String>,
         val topPerformers: List<String>,
         val topTags: List<String>,
         val topKeywords: List<String>,
@@ -60,6 +61,7 @@ class SmartTasteEngine(
 
     private val lock = Any()
 
+    private val sourceUsage = LinkedHashMap<String, Double>()
     private val keywords = LinkedHashMap<String, Double>()
     private val bigrams = LinkedHashMap<String, Double>()
     private val tags = LinkedHashMap<String, Double>()
@@ -219,6 +221,7 @@ class SmartTasteEngine(
     fun snapshot(): ProfileSnapshot = synchronized(lock) {
         ensureLoadedLocked()
         ProfileSnapshot(
+            topSources = topKeys(sourceUsage, 10),
             topPerformers = topKeys(performers, 8),
             topTags = topKeys(tags, 10),
             topKeywords = topKeys(keywords, 12),
@@ -230,13 +233,25 @@ class SmartTasteEngine(
         )
     }
 
+    fun recordSourceUsage(sourceId: String, weight: Double = WEIGHT_BROWSE) {
+        val clean = sourceId.trim().lowercase(Locale.ROOT)
+        if (clean.isBlank() || clean == "default" || clean == "smartforyou") return
+        synchronized(lock) {
+            ensureLoadedLocked()
+            applyDecayIfNeededLocked()
+            bump(sourceUsage, clean, weight, MAX_SOURCES)
+            persistLocked()
+        }
+    }
+
     fun summaryText(): String {
         val snap = snapshot()
         if (snap.totalInteractions == 0 && snap.topKeywords.isEmpty() && snap.topTags.isEmpty()) {
             return "No taste learned yet. Open/play videos, run Library Update, or paste favorite titles/keywords below."
         }
         val parts = buildList {
-            if (snap.topPerformers.isNotEmpty()) add("Top stars: ${snap.topPerformers.take(3).joinToString(", ")}")
+            if (snap.topSources.isNotEmpty()) add("Top sources: ${snap.topSources.take(3).joinToString(", ")}")
+            if (snap.topPerformers.isNotEmpty()) add("Stars: ${snap.topPerformers.take(3).joinToString(", ")}")
             if (snap.topTags.isNotEmpty()) add("Tags: ${snap.topTags.take(4).joinToString(", ")}")
             if (snap.topBigrams.isNotEmpty()) {
                 add("Topics: ${snap.topBigrams.take(3).joinToString(", ")}")
@@ -382,6 +397,7 @@ class SmartTasteEngine(
 
     fun reset() {
         synchronized(lock) {
+            sourceUsage.clear()
             keywords.clear()
             bigrams.clear()
             tags.clear()
@@ -527,6 +543,10 @@ class SmartTasteEngine(
         categoriesList: Collection<String>,
         weight: Double,
     ) {
+        val srcId = sourceKey.trim().lowercase(Locale.ROOT)
+        if (srcId.isNotBlank() && srcId != "default" && srcId != "smartforyou") {
+            bump(sourceUsage, srcId, weight, MAX_SOURCES)
+        }
         if (!title.isNullOrBlank()) {
             val tokens = tokenizeTitle(title)
             val seenTok = HashSet<String>()
@@ -580,6 +600,7 @@ class SmartTasteEngine(
         val elapsed = (today - lastDecayDay).coerceAtLeast(0L)
         if (elapsed <= 0L) return
         val factor = DAILY_DECAY_FACTOR.pow(elapsed.coerceAtMost(60L).toDouble())
+        decayMap(sourceUsage, factor)
         decayMap(keywords, factor)
         decayMap(bigrams, factor)
         decayMap(tags, factor)
@@ -618,6 +639,7 @@ class SmartTasteEngine(
             lastDecayDay = root.optLong("day", currentEpochDay())
             totalInteractions = root.optInt("n", 0)
             lastAppliedSeed = root.optString("seed", "")
+            readWeightMap(root.optJSONObject("src"), sourceUsage)
             readWeightMap(root.optJSONObject("kw"), keywords)
             readWeightMap(root.optJSONObject("bg"), bigrams)
             readWeightMap(root.optJSONObject("tg"), tags)
@@ -643,6 +665,7 @@ class SmartTasteEngine(
                 put("day", lastDecayDay)
                 put("n", totalInteractions)
                 put("seed", lastAppliedSeed)
+                put("src", writeWeightMap(sourceUsage, MAX_SOURCES))
                 put("kw", writeWeightMap(keywords, MAX_KEYWORDS))
                 put("bg", writeWeightMap(bigrams, MAX_BIGRAMS))
                 put("tg", writeWeightMap(tags, MAX_TAGS))
@@ -737,6 +760,7 @@ class SmartTasteEngine(
         private const val WEIGHT_PLAY = 3.5
         private const val WEIGHT_SEED = 5.0
 
+        private const val MAX_SOURCES = 25
         private const val MAX_KEYWORDS = 80
         private const val MAX_BIGRAMS = 60
         private const val MAX_TAGS = 60
