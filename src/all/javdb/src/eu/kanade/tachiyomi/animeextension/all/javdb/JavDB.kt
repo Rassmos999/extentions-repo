@@ -245,7 +245,9 @@ class JavDB :
         setUrlWithoutDomain(element.attr("href"))
         val code = element.selectFirst("div.video-title strong")?.text().orEmpty()
         val name = element.attr("title").ifBlank { element.selectFirst("div.video-title")?.ownText().orEmpty() }
-        title = listOf(code, name).filter(String::isNotBlank).joinToString(" ")
+        val duration = element.selectFirst("span.duration, span.time, div.duration, time")?.text()?.trim()
+        val baseTitle = listOf(code, name).filter(String::isNotBlank).joinToString(" ")
+        title = if (!duration.isNullOrBlank() && !baseTitle.contains(duration)) "[$duration] $baseTitle" else baseTitle
         thumbnail_url = element.selectFirst("div.cover img")?.absUrl("src")
     }
 

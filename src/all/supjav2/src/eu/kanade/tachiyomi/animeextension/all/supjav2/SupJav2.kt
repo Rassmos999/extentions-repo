@@ -147,8 +147,8 @@ class SupJav2(override val lang: String = "en") :
                 ?: element.parent()?.selectFirst("span.duration, span.time, div.duration, time")
             )?.text()?.trim()
 
-        if (!duration.isNullOrBlank()) {
-            title = "$title [$duration]"
+        if (!duration.isNullOrBlank() && !title.contains(duration)) {
+            title = "[$duration] $title"
         }
     }
 

@@ -1,7 +1,7 @@
 ext {
     extName = 'Jable'
     extClass = '.JableFactory'
-    extVersionCode = 19
+    extVersionCode = 20
     isNsfw = true
 }
 

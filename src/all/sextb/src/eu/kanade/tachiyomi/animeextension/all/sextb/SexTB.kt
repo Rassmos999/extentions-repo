@@ -216,17 +216,17 @@ class SexTB :
         val ribbon = element.selectFirst("span.tray-item-ribbon")?.text()?.trim().orEmpty()
 
         val cleanedTitle = rawTitle.ifBlank { element.text().trim() }
+        val cleanDur = duration.replace(Regex("""(?i)\s*mins?\b"""), "m").trim()
         title = buildString {
-            if (code.isNotBlank() && !cleanedTitle.contains(code, ignoreCase = true)) {
-                append("[").append(code).append("] ")
+            when {
+                code.isNotBlank() && cleanDur.isNotBlank() -> append("[").append(code).append(" • ").append(cleanDur).append("] ")
+                cleanDur.isNotBlank() -> append("[").append(cleanDur).append("] ")
+                code.isNotBlank() && !cleanedTitle.contains(code, ignoreCase = true) -> append("[").append(code).append("] ")
             }
             if (ribbon.isNotBlank() && !cleanedTitle.contains(ribbon, ignoreCase = true)) {
                 append("[").append(ribbon).append("] ")
             }
             append(cleanedTitle)
-            if (duration.isNotBlank() && !cleanedTitle.contains(duration, ignoreCase = true)) {
-                append(" [").append(duration).append("]")
-            }
         }.trim()
     }
 
@@ -454,8 +454,10 @@ class SexTB :
                         setUrlWithoutDomain("/$code")
                         title = buildString {
                             val upper = code.uppercase(Locale.ROOT)
-                            if (!rawName.contains(upper, ignoreCase = true)) {
-                                append("[").append(upper).append("] ")
+                            val durBadge = if (runtime.isNotBlank() && runtime != "0") "${runtime}m" else ""
+                            when {
+                                durBadge.isNotBlank() -> append("[").append(upper).append(" • ").append(durBadge).append("] ")
+                                !rawName.contains(upper, ignoreCase = true) -> append("[").append(upper).append("] ")
                             }
                             if (version.isNotBlank() && !rawName.contains(version, ignoreCase = true)) {
                                 append("[").append(version).append("] ")
@@ -463,9 +465,6 @@ class SexTB :
                                 append("[LTX] ")
                             }
                             append(rawName.ifBlank { upper })
-                            if (runtime.isNotBlank() && runtime != "0") {
-                                append(" [").append(runtime).append(" min]")
-                            }
                         }.trim()
                         thumbnail_url = normalizeUrl(poster)
                     },

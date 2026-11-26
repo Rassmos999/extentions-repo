@@ -162,6 +162,13 @@ class SupJav(override val lang: String = "en") :
                     ?: ""
             }
         }
+        val duration = (
+            element.selectFirst("span.duration, span.time, div.duration, time")
+                ?: element.parent()?.selectFirst("span.duration, span.time, div.duration, time")
+            )?.text()?.trim()
+        if (!duration.isNullOrBlank() && !title.contains(duration)) {
+            title = "[$duration] $title"
+        }
     }
 
     override fun popularAnimeNextPageSelector() = "a.next[href], a[rel=next][href], div.pagination a.next[href], div.pagination a[rel=next], " +

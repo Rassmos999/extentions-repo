@@ -2,13 +2,18 @@ package eu.kanade.tachiyomi.animeextension.all.smartforyou
 
 import android.util.Base64
 import android.util.Log
+import android.webkit.CookieManager
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.doodextractor.DoodExtractor
 import aniyomi.lib.m3u8server.CfWebBridgeInterceptor
 import aniyomi.lib.m3u8server.M3u8ServerManager
 import aniyomi.lib.m3u8server.SmartTasteEngine
+import aniyomi.lib.mixdropextractor.MixDropExtractor
 import aniyomi.lib.playlistutils.PlaylistUtils
+import aniyomi.lib.streamtapeextractor.StreamTapeExtractor
+import aniyomi.lib.voeextractor.VoeExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -28,8 +33,8 @@ import okhttp3.CookieJar
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.HttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -37,6 +42,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.io.IOException
 import java.net.URLEncoder
 import java.util.Locale
@@ -45,13 +51,17 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * Smart For You (+18) — Self-adapting multi-source personalized hub.
+ * Smart For You (+18) — Self-adapting 15-source personalized hub.
  *
- * Reads the shared `+18` SmartTasteEngine profile (`agy_global_taste_v1`) built across
- * all 27 installed adult extensions + Library Updates, automatically selects your
- * most-used sources (`Auto — Most Used`), queries them using your learned title topics,
- * stars, and tags, filters out already-watched videos, ranks everything globally by taste
- * score, and plays streams directly with local seek/skip caching.
+ * - Reads the shared `+18` SmartTasteEngine profile (`agy_global_taste_v1`) across all
+ *   installed adult extensions + Library Updates.
+ * - Supports 15 live sources (JAV, Western tubes, full scenes, Arabic/translated, 3D/Hentai)
+ *   and automatically adapts to your most-used sources.
+ * - Applies adaptive soft-mandatory theme constraints (`threesome`, `foursome`, `dp`,
+ *   `gangbang`, `slut`) & non-JAV duration preferences (`25m+`) per source taxonomy,
+ *   relaxing automatically whenever strict filters would shrink results.
+ * - Routes per-host Referer & WebView clearance cookies for Coil thumbnails so SexTB and
+ *   all 15 sources load cover artwork reliably.
  */
 class SmartForYou :
     AnimeHttpSource(),
@@ -79,6 +89,7 @@ class SmartForYou :
     private val seenFeedKeys = java.util.Collections.synchronizedSet(HashSet<String>())
     private val sourceNextAllowedMs = ConcurrentHashMap<String, Long>()
     private val sourceCooldownUntilMs = ConcurrentHashMap<String, Long>()
+    private val recentDetailEntities = ConcurrentHashMap<String, Long>()
     private val sourcePaceLock = Any()
 
     @Volatile
@@ -93,6 +104,15 @@ class SmartForYou :
             .build()
     }
 
+    // Client exposed to host Coil image loader: dynamically injects matching per-host Referer
+    // and WebView Cloudflare cookies (fixes broken/stale SexTB & CDN covers!) and retries
+    // without Referer if a CDN rejects hotlink referers.
+    private val imageClient: OkHttpClient by lazy {
+        baseHttpClient.newBuilder()
+            .addInterceptor(SmartImageRefererInterceptor())
+            .build()
+    }
+
     private val phCookieJar = PhAgeCookieJar()
 
     private val pornhubClient: OkHttpClient by lazy {
@@ -101,53 +121,60 @@ class SmartForYou :
             .build()
     }
 
-    // Use network.client + CfWebBridgeInterceptor (not cloudflareClient) so background
-    // executor threads never trigger CloudflareInterceptor's Looper/Toast NPE crash.
-    private val sextbClient: OkHttpClient by lazy {
+    private val cfClients = ConcurrentHashMap<String, OkHttpClient>()
+
+    private fun cfClientFor(origin: String): OkHttpClient = cfClients.computeIfAbsent(origin) {
+        // Use network.client + CfWebBridgeInterceptor (NOT cloudflareClient) so worker threads
+        // never trigger CloudflareInterceptor's Looper/Toast NPE crash.
         baseHttpClient.newBuilder()
-            .addInterceptor(CfWebBridgeInterceptor("https://sextb.net"))
+            .addInterceptor(CfWebBridgeInterceptor(origin))
             .build()
     }
 
-    private val sexAlArabClient: OkHttpClient by lazy {
+    private val noRedirectClient: OkHttpClient by lazy {
         baseHttpClient.newBuilder()
-            .addInterceptor(CfWebBridgeInterceptor("https://sexalarab.tv"))
+            .followRedirects(false)
+            .followSslRedirects(false)
             .build()
     }
 
     private val m3u8Server by lazy { M3u8ServerManager(network.client) }
     private val playlistUtils by lazy { PlaylistUtils(baseHttpClient, headers) }
+    private val doodExtractor by lazy { DoodExtractor(baseHttpClient) }
+    private val streamTapeExtractor by lazy { StreamTapeExtractor(baseHttpClient) }
+    private val mixDropExtractor by lazy { MixDropExtractor(baseHttpClient) }
+    private val voeExtractor by lazy { VoeExtractor(baseHttpClient, desktopHeaders("https://supjav.com/")) }
 
     override val client: OkHttpClient
-        get() = baseHttpClient
+        get() = imageClient
 
     private fun isSeekCacheEnabled(): Boolean = preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)
     private fun preferredQuality(): String = preferences.getString(PREF_QUALITY_KEY, "720p") ?: "720p"
     private fun isAutoSourceMode(): Boolean = preferences.getBoolean(PREF_AUTO_SOURCES_KEY, true)
+    private fun autoSourceCount(): Int = (preferences.getString(PREF_AUTO_COUNT_KEY, "4")?.toIntOrNull() ?: 4).coerceIn(2, 6)
 
     private fun isSourceAllowed(id: String): Boolean = preferences.getBoolean("src_enabled_$id", true)
 
-    /**
-     * Automatically selects the user's top 3 most-used supported sources from the shared
-     * `SmartTasteEngine` profile (updating itself continuously as usage shifts).
-     */
     private fun resolveActiveSources(explicitOverride: List<String> = emptyList()): List<SourceDef> {
         if (explicitOverride.isNotEmpty()) {
-            return explicitOverride.mapNotNull { id -> ALL_SOURCES.firstOrNull { it.id == id } }.take(4)
+            return explicitOverride.mapNotNull { id -> ALL_SOURCES.firstOrNull { it.id == id } }.take(6)
         }
         val allowed = ALL_SOURCES.filter { isSourceAllowed(it.id) }.ifEmpty { ALL_SOURCES }
+        val limit = autoSourceCount()
         if (!isAutoSourceMode()) {
-            return allowed.take(4)
+            return allowed.take(limit)
         }
         val rankedIds = tasteEngine.snapshot().topSources
+            .map { SOURCE_ALIASES[it] ?: it }
+            .distinct()
             .filter { id -> allowed.any { it.id == id } }
         val picked = mutableListOf<SourceDef>()
         for (id in rankedIds) {
-            if (picked.size >= AUTO_SOURCE_COUNT) break
+            if (picked.size >= limit) break
             allowed.firstOrNull { it.id == id }?.let(picked::add)
         }
         for (fallback in allowed) {
-            if (picked.size >= AUTO_SOURCE_COUNT) break
+            if (picked.size >= limit) break
             if (picked.none { it.id == fallback.id }) picked += fallback
         }
         return picked
@@ -181,8 +208,6 @@ class SmartForYou :
         filters: AnimeFilterList,
     ): AnimesPage = withContext(Dispatchers.IO) {
         val cleanQuery = query.trim()
-        // Drop synthetic background queries emitted by Tadami's AnimeSearchFallbackEngine
-        // so opening a video never fans out 45 requests across 3 sources or pollutes taste!
         if (cleanQuery.isNotBlank() && isSyntheticFallbackQuery(cleanQuery)) {
             return@withContext AnimesPage(emptyList(), false)
         }
@@ -197,7 +222,7 @@ class SmartForYou :
 
         if (cleanQuery.isNotBlank()) {
             val now = System.currentTimeMillis()
-            if (page == 1 && tasteEngine.isEnabled() && cleanQuery.length in 2..45 && now - lastSearchRecordedMs > 1_500L) {
+            if (page == 1 && tasteEngine.isEnabled() && cleanQuery.length in 2..45 && now - lastSearchRecordedMs > 2_500L) {
                 lastSearchRecordedMs = now
                 tasteEngine.recordSearchOrFilter(query = cleanQuery)
             }
@@ -223,42 +248,36 @@ class SmartForYou :
         mode: FeedMode,
     ): AnimesPage {
         val snap = tasteEngine.snapshot()
-        val coreConcepts = snap.topConcepts
+        val coreConcepts = (snap.topConcepts + snap.softAnchors).distinct()
         val tasteQueries = buildList {
-            addAll(coreConcepts.take(3))
-            addAll(tasteEngine.buildTitleSearchQueries(maxQueries = 3))
+            addAll(coreConcepts.take(5))
+            addAll(tasteEngine.buildTitleSearchQueries(maxQueries = 5))
             snap.topPerformers.firstOrNull()?.let(::add)
         }.distinct()
+        val nonJavMinMin = snap.preferredNonJavMinMinutes
 
-        Log.i(TAG, "ForYou mode=$mode sources=${sources.map { it.id }} core=$coreConcepts queries=$tasteQueries")
+        Log.i(
+            TAG,
+            "ForYou mode=$mode sources=${sources.map { it.id }} core=${coreConcepts.take(6)} anchors=${snap.softAnchors} nonJavMin=${nonJavMinMin}m",
+        )
 
         val useTasteDiscovery = (mode == FeedMode.FOR_YOU || mode == FeedMode.LATEST) && tasteQueries.isNotEmpty()
         val preferNewest = mode == FeedMode.LATEST
+
         val batches = fetchInParallel(sources) { idx, src ->
-            when {
-                useTasteDiscovery -> {
-                    val conceptForSource = coreConcepts.getOrNull(idx % coreConcepts.size.coerceAtLeast(1))
-                    val nativeCategoryPage = if (conceptForSource != null) {
-                        runCatching { browseSourceByConcept(src.id, page, conceptForSource, newest = preferNewest) }.getOrNull()
-                    } else {
-                        null
-                    }
-                    if (nativeCategoryPage != null && nativeCategoryPage.animes.isNotEmpty()) {
-                        nativeCategoryPage
-                    } else {
-                        val q = tasteQueries[idx % tasteQueries.size]
-                        val searchHits = runCatching { searchSource(src.id, page, q) }.getOrNull()
-                        if (searchHits != null && searchHits.animes.isNotEmpty()) {
-                            searchHits
-                        } else {
-                            browseSource(src.id, page, latest = preferNewest)
-                        }
-                    }
-                }
-
-                preferNewest -> browseSource(src.id, page, latest = true)
-
-                else -> browseSource(src.id, page, latest = false)
+            if (!useTasteDiscovery) {
+                browseSource(src.id, page, latest = preferNewest)
+            } else {
+                fetchSourceAdaptive(
+                    src = src,
+                    idx = idx,
+                    page = page,
+                    coreConcepts = coreConcepts,
+                    softAnchors = snap.softAnchors,
+                    tasteQueries = tasteQueries,
+                    nonJavMinMin = nonJavMinMin,
+                    newest = preferNewest,
+                )
             }
         }
 
@@ -277,25 +296,179 @@ class SmartForYou :
         return AnimesPage(ranked, merged.hasNextPage)
     }
 
+    /**
+     * Adaptive soft-mandatory fetcher per source:
+     * 1. Picks themes actually supported by [src] (mapping concepts to native category slugs
+     *    or Arabic/site-native queries).
+     * 2. On non-JAV tube sources supporting URL duration filters (PornHub/XVideos/XNXX),
+     *    starts with `20+ min` / `25m+` duration filter AND combo/anchor theme.
+     * 3. Checks unseen yield — if too narrow (< [MIN_HEALTHY_YIELD]), smoothly relaxes:
+     *    combo -> single concept -> drop strict URL duration filter -> popular/latest browse,
+     *    while keeping all results scored by SmartTasteEngine (anchors + duration).
+     */
+    private fun fetchSourceAdaptive(
+        src: SourceDef,
+        idx: Int,
+        page: Int,
+        coreConcepts: List<String>,
+        softAnchors: List<String>,
+        tasteQueries: List<String>,
+        nonJavMinMin: Int,
+        newest: Boolean,
+    ): AnimesPage {
+        val wantDurFilter = !src.isJav && !src.isShortForm && src.supportsDurationQuery && nonJavMinMin >= 20
+        val collected = mutableListOf<SAnime>()
+        val seen = HashSet<String>()
+        var anyNext = false
+
+        fun absorb(p: AnimesPage?): Int {
+            if (p == null) return 0
+            if (p.hasNextPage) anyNext = true
+            var added = 0
+            for (item in p.animes) {
+                if (!tasteEngine.isWatched(item.url, item.title) && seen.add(item.url.lowercase(Locale.ROOT))) {
+                    collected += item
+                    added++
+                }
+            }
+            return added
+        }
+
+        // Choose rotated primary & secondary concepts for this source
+        val primaryConcept = coreConcepts.getOrNull(idx % coreConcepts.size.coerceAtLeast(1))
+        val anchorPartner = softAnchors.firstOrNull { it != primaryConcept && it in COMBO_FRIENDLY_CONCEPTS }
+
+        // Pass 1: Native category/genre browse for supported concept (fast, high precision!)
+        if (primaryConcept != null) {
+            val nativePage = runCatching {
+                browseSourceByConcept(src.id, page, primaryConcept, newest = newest, minDurationMin = if (wantDurFilter) nonJavMinMin else 0)
+            }.getOrNull()
+            absorb(nativePage)
+        }
+
+        // Pass 2: On search-friendly non-JAV tubes, try an anchor combo (e.g. "threesome dp" / "gangbang slut")
+        // with duration filter if Pass 1 didn't run or yielded too few items.
+        if (collected.size < MIN_HEALTHY_YIELD && primaryConcept != null && anchorPartner != null &&
+            src.id in setOf("pornhub", "xvideos", "xnxx", "xmoviesforyou", "rule34video")
+        ) {
+            val comboQuery = "${conceptQueryForSource(src, primaryConcept)} ${conceptQueryForSource(src, anchorPartner)}".trim()
+            val comboPage = runCatching {
+                searchSource(src.id, page, comboQuery, minDurationMin = if (wantDurFilter) nonJavMinMin else 0, newest = newest)
+            }.getOrNull()
+            absorb(comboPage)
+        }
+
+        // Pass 3: Single concept search (with duration filter on non-JAV tubes)
+        if (collected.size < MIN_HEALTHY_YIELD) {
+            val qRaw = primaryConcept ?: tasteQueries[idx % tasteQueries.size]
+            val q = conceptQueryForSource(src, qRaw)
+            val singlePage = runCatching {
+                searchSource(src.id, page, q, minDurationMin = if (wantDurFilter) nonJavMinMin else 0, newest = newest)
+            }.getOrNull()
+            absorb(singlePage)
+        }
+
+        // Pass 4 (Adaptive relaxation!): If duration filter made results too sparse, relax URL duration filter
+        // (SmartTasteEngine still ranks >=25m videos at the top!).
+        if (collected.size < MIN_HEALTHY_YIELD && wantDurFilter) {
+            val qRaw = primaryConcept ?: tasteQueries[idx % tasteQueries.size]
+            val q = conceptQueryForSource(src, qRaw)
+            val relaxedPage = runCatching {
+                searchSource(src.id, page, q, minDurationMin = 0, newest = newest)
+            }.getOrNull()
+            absorb(relaxedPage)
+        }
+
+        // Pass 5: Final fallback to source browse so this source never goes blank.
+        if (collected.size < 4) {
+            val fallbackPage = runCatching { browseSource(src.id, page, latest = newest) }.getOrNull()
+            absorb(fallbackPage)
+        }
+
+        return AnimesPage(collected, anyNext)
+    }
+
+    private fun conceptQueryForSource(src: SourceDef, concept: String): String {
+        val lower = concept.lowercase(Locale.ROOT)
+        if (src.isArabic) {
+            return ARABIC_CONCEPT_QUERIES[lower] ?: concept
+        }
+        return when (lower) {
+            "dp" -> if (src.isJav) "anal" else "double penetration"
+            else -> concept
+        }
+    }
+
     private fun browseSourceByConcept(
         srcId: String,
         page: Int,
         concept: String,
         newest: Boolean = false,
+        minDurationMin: Int = 0,
     ): AnimesPage? = when (srcId) {
         "sextb" -> {
             val slug = SEXTB_CONCEPT_GENRES[concept] ?: return null
             val path = if (page > 1) "/genre/$slug/pg-$page" else "/genre/$slug"
             val sort = if (newest) "desc" else "viewed"
-            val html = fetchHtml(sextbClient, "https://sextb.net$path?sort=$sort", "https://sextb.net/")
+            val html = fetchHtml(cfClientFor("https://sextb.net"), "https://sextb.net$path?sort=$sort", "https://sextb.net/")
             parseSexTbList(Jsoup.parse(html, "https://sextb.net"))
         }
 
         "pornhub" -> {
             val catId = PORNHUB_CONCEPT_CATEGORIES[concept] ?: return null
             val sort = if (newest) "cm" else "ht"
-            val html = fetchHtml(pornhubClient, "https://www.pornhub.com/video?c=$catId&o=$sort&page=$page", "https://www.pornhub.com/")
+            val durParam = if (minDurationMin >= 30) {
+                "&min_duration=30"
+            } else if (minDurationMin >= 20) {
+                "&min_duration=20"
+            } else {
+                ""
+            }
+            val html = fetchHtml(pornhubClient, "https://www.pornhub.com/video?c=$catId&o=$sort$durParam&page=$page", "https://www.pornhub.com/")
             parsePornHubList(Jsoup.parse(html, "https://www.pornhub.com"))
+        }
+
+        "supjav" -> {
+            val slug = SUPJAV_CONCEPT_TAGS[concept] ?: return null
+            val pg = if (page > 1) "/page/$page" else ""
+            val html = fetchHtml(cfClientFor("https://supjav.com"), "https://supjav.com/tag/$slug$pg", "https://supjav.com/")
+            parseSupJavList(Jsoup.parse(html, "https://supjav.com"))
+        }
+
+        "jable" -> {
+            val slug = JABLE_CONCEPT_TAGS[concept] ?: return null
+            val sortBy = if (newest) "post_date" else "video_viewed"
+            val url = "https://jable.tv/tags/$slug/?lang=en&sort_by=$sortBy&from=${"%02d".format(page)}"
+            val html = fetchHtml(cfClientFor("https://jable.tv"), url, "https://jable.tv/")
+            parseJableList(Jsoup.parse(html, "https://jable.tv"))
+        }
+
+        "missav" -> {
+            val slug = MISSAV_CONCEPT_GENRES[concept] ?: return null
+            val sort = if (newest) "released_at" else "monthly_views"
+            val html = fetchHtml(cfClientFor("https://missav.ws"), "https://missav.ws/en/genres/$slug?sort=$sort&page=$page", "https://missav.ws/")
+            parseMissAvList(Jsoup.parse(html, "https://missav.ws"))
+        }
+
+        "javgg" -> {
+            val slug = JAVGG_CONCEPT_GENRES[concept] ?: return null
+            val pg = if (page > 1) "page/$page/" else ""
+            val html = fetchHtml(cfClientFor("https://javgg.net"), "https://javgg.net/genre/$slug/$pg", "https://javgg.net/")
+            parseJavGgList(Jsoup.parse(html, "https://javgg.net"))
+        }
+
+        "javguru" -> {
+            val slug = JAVGURU_CONCEPT_TAGS[concept] ?: return null
+            val pg = if (page > 1) "page/$page/" else ""
+            val html = fetchHtml(cfClientFor("https://jav.guru"), "https://jav.guru/tag/$slug/$pg", "https://jav.guru/")
+            parseJavGuruList(Jsoup.parse(html, "https://jav.guru"))
+        }
+
+        "xmoviesforyou" -> {
+            val slug = XMOVIES_CONCEPT_CATS[concept] ?: return null
+            val pg = if (page > 1) "?page=$page" else ""
+            val html = fetchHtml(cfClientFor("https://xmoviesforyou.com"), "https://xmoviesforyou.com/category/$slug$pg", "https://xmoviesforyou.com/")
+            parseXMoviesList(Jsoup.parse(html, "https://xmoviesforyou.com"), page)
         }
 
         else -> null
@@ -308,19 +481,33 @@ class SmartForYou :
             lower.startsWith("label:") ||
             lower.startsWith("studio:") ||
             lower.startsWith("uploader:") ||
-            lower.startsWith("[sextb]") ||
-            lower.startsWith("[pornhub]") ||
-            lower.startsWith("[xvideos]") ||
-            lower.startsWith("[xnxx]") ||
-            lower.startsWith("[rule34]") ||
-            lower.startsWith("[sexalarab]") ||
+            lower.startsWith("duration:") ||
+            lower.startsWith("[sextb") ||
+            lower.startsWith("[pornhub") ||
+            lower.startsWith("[xvideos") ||
+            lower.startsWith("[xnxx") ||
+            lower.startsWith("[rule34") ||
+            lower.startsWith("[sexalarab") ||
+            lower.startsWith("[supjav") ||
+            lower.startsWith("[jable") ||
+            lower.startsWith("[missav") ||
+            lower.startsWith("[javgg") ||
+            lower.startsWith("[javguru") ||
+            lower.startsWith("[xmovies") ||
+            lower.startsWith("[aflamk1") ||
+            lower.startsWith("[arabx") ||
             lower == "featured actress" ||
             lower == "single work" ||
             lower == "solo work"
         ) {
             return true
         }
-        // Detect Japanese+English raw metadata dumps emitted by host fallback engine
+        // Drop Tadami AnimeSearchFallbackEngine burst queries matching entities we JUST returned
+        // from getAnimeDetails within the last 14 seconds (prevents xvideos HTTP 429 storms!).
+        val detailTs = recentDetailEntities[lower]
+        if (detailTs != null && System.currentTimeMillis() - detailTs < 14_000L) {
+            return true
+        }
         return q.any { it in '\u3040'..'\u30FF' || it in '\u4E00'..'\u9FFF' } && q.length > 24
     }
 
@@ -330,7 +517,7 @@ class SmartForYou :
         sources: List<SourceDef>,
     ): AnimesPage {
         val batches = fetchInParallel(sources) { _, src ->
-            searchSource(src.id, page, query)
+            searchSource(src.id, page, query, minDurationMin = 0, newest = false)
         }
         val merged = interleaveUnique(batches)
         if (page <= 1) seenFeedKeys.clear()
@@ -357,7 +544,7 @@ class SmartForYou :
         if (sources.size == 1) {
             return listOfNotNull(runCatching { block(0, sources.first()) }.getOrNull())
         }
-        val pool = Executors.newFixedThreadPool(sources.size.coerceAtMost(4))
+        val pool = Executors.newFixedThreadPool(sources.size.coerceAtMost(5))
         return try {
             val futures = sources.mapIndexed { idx, src ->
                 pool.submit<AnimesPage?> {
@@ -393,11 +580,27 @@ class SmartForYou :
         val fullUrl = toAbsoluteUrl(anime.url)
         val srcId = detectSourceId(fullUrl)
         val details = parseDetailsForSource(srcId, fullUrl, anime)
+        rememberDetailEntitiesForFallbackGuard(details)
         if (tasteEngine.isEnabled()) {
             tasteEngine.recordDetails(anime, details)
             if (srcId != null) tasteEngine.recordSourceUsage(srcId, 1.5)
         }
         details
+    }
+
+    private fun rememberDetailEntitiesForFallbackGuard(details: SAnime) {
+        val now = System.currentTimeMillis()
+        if (recentDetailEntities.size > 150) {
+            recentDetailEntities.entries.removeIf { now - it.value > 20_000L }
+        }
+        details.genre?.split(',')?.forEach { g ->
+            val k = g.trim().lowercase(Locale.ROOT)
+            if (k.length >= 2) recentDetailEntities[k] = now
+        }
+        details.artist?.split(',')?.forEach { a ->
+            val k = a.trim().lowercase(Locale.ROOT)
+            if (k.length >= 2) recentDetailEntities[k] = now
+        }
     }
 
     override fun animeDetailsRequest(anime: SAnime): Request = GET(toAbsoluteUrl(anime.url), desktopHeaders(toAbsoluteUrl(anime.url)))
@@ -456,7 +659,7 @@ class SmartForYou :
     override fun videoListRequest(episode: SEpisode): Request = GET(toAbsoluteUrl(episode.url), desktopHeaders(toAbsoluteUrl(episode.url)))
     override fun videoListParse(response: Response): List<Video> = throw UnsupportedOperationException()
 
-    // ======================== Source Connectors ===========================
+    // ======================== 15 Source Connectors ========================
 
     private fun detectSourceId(url: String): String? {
         val host = url.toHttpUrlOrNull()?.host?.lowercase(Locale.ROOT).orEmpty()
@@ -465,8 +668,17 @@ class SmartForYou :
             "sextb.net" in host -> "sextb"
             "xvideos.com" in host -> "xvideos"
             "xnxx.com" in host -> "xnxx"
-            "rule34video.com" in host -> "rule34video"
+            "xmoviesforyou.com" in host -> "xmoviesforyou"
+            "supjav.com" in host -> "supjav"
+            "jable.tv" in host -> "jable"
+            "missav." in host -> "missav"
+            "javgg.net" in host -> "javgg"
+            "jav.guru" in host -> "javguru"
+            "aflamk1." in host -> "aflamk1"
             "sexalarab." in host -> "sexalarab"
+            "arabx." in host -> "arabx"
+            "arabxn." in host -> "arabxn"
+            "rule34video.com" in host -> "rule34video"
             else -> null
         }
     }
@@ -487,7 +699,7 @@ class SmartForYou :
                 "/genre/ltx-encode"
             }
             val url = "https://sextb.net$path" + if (!latest) "?sort=viewed" else ""
-            val html = fetchHtml(sextbClient, url, "https://sextb.net/")
+            val html = fetchHtml(cfClientFor("https://sextb.net"), url, "https://sextb.net/")
             parseSexTbList(Jsoup.parse(html, "https://sextb.net"))
         }
 
@@ -503,6 +715,87 @@ class SmartForYou :
             parseWgczList(Jsoup.parse(html, "https://www.xnxx.com"), "https://www.xnxx.com", "XNXX")
         }
 
+        "xmoviesforyou" -> {
+            val url = if (latest) {
+                if (page <= 1) "https://xmoviesforyou.com/" else "https://xmoviesforyou.com/page/$page"
+            } else {
+                "https://xmoviesforyou.com/most-viewed"
+            }
+            val html = fetchHtml(cfClientFor("https://xmoviesforyou.com"), url, "https://xmoviesforyou.com/")
+            parseXMoviesList(Jsoup.parse(html, "https://xmoviesforyou.com"), page)
+        }
+
+        "supjav" -> {
+            val url = if (latest) {
+                "https://supjav.com/${if (page > 1) "page/$page" else ""}"
+            } else {
+                "https://supjav.com/popular${if (page > 1) "/page/$page" else ""}"
+            }
+            val html = fetchHtml(cfClientFor("https://supjav.com"), url, "https://supjav.com/")
+            parseSupJavList(Jsoup.parse(html, "https://supjav.com"))
+        }
+
+        "jable" -> {
+            val seg = if (latest) "latest-updates" else "hot"
+            val sortBy = if (latest) "post_date" else "video_viewed_week"
+            val url = "https://jable.tv/$seg/?lang=en&sort_by=$sortBy&from=${"%02d".format(page)}"
+            val html = fetchHtml(cfClientFor("https://jable.tv"), url, "https://jable.tv/")
+            parseJableList(Jsoup.parse(html, "https://jable.tv"))
+        }
+
+        "missav" -> {
+            val seg = if (latest) "en/new" else "en/today-hot"
+            val html = fetchHtml(cfClientFor("https://missav.ws"), "https://missav.ws/$seg?page=$page", "https://missav.ws/")
+            parseMissAvList(Jsoup.parse(html, "https://missav.ws"))
+        }
+
+        "javgg" -> {
+            val url = if (latest) "https://javgg.net/new-post/page/$page/" else "https://javgg.net/trending/page/$page/"
+            val html = fetchHtml(cfClientFor("https://javgg.net"), url, "https://javgg.net/")
+            parseJavGgList(Jsoup.parse(html, "https://javgg.net"))
+        }
+
+        "javguru" -> {
+            val url = if (latest) {
+                if (page <= 1) "https://jav.guru/" else "https://jav.guru/page/$page/"
+            } else {
+                "https://jav.guru/most-watched-rank/"
+            }
+            val html = fetchHtml(cfClientFor("https://jav.guru"), url, "https://jav.guru/")
+            parseJavGuruList(Jsoup.parse(html, "https://jav.guru"))
+        }
+
+        "aflamk1" -> {
+            val seg = if (latest) "latest-updates" else "most-popular"
+            val url = "https://www.aflamk1.net/$seg/${if (page > 1) "$page/" else ""}"
+            val html = fetchHtml(cfClientFor("https://www.aflamk1.net"), url, "https://www.aflamk1.net/")
+            parseKvsList(Jsoup.parse(html, "https://www.aflamk1.net"), "https://www.aflamk1.net", "Aflamk1")
+        }
+
+        "sexalarab" -> {
+            val seg = if (latest) "latest-updates" else "most-popular"
+            val url = "https://sexalarab.tv/$seg/${if (page > 1) "$page/" else ""}"
+            val html = fetchHtml(cfClientFor("https://sexalarab.tv"), url, "https://sexalarab.tv/")
+            parseKvsList(Jsoup.parse(html, "https://sexalarab.tv"), "https://sexalarab.tv", "SexAlArab")
+        }
+
+        "arabx" -> {
+            val seg = if (latest) "latest-updates" else "most-popular"
+            val url = "https://www.arabx.cam/$seg/${if (page > 1) "$page/" else ""}"
+            val html = fetchHtml(cfClientFor("https://www.arabx.cam"), url, "https://www.arabx.cam/")
+            parseKvsList(Jsoup.parse(html, "https://www.arabx.cam"), "https://www.arabx.cam", "ArabX")
+        }
+
+        "arabxn" -> {
+            val url = if (latest) {
+                if (page <= 1) "https://www.arabxn.com/" else "https://www.arabxn.com/page/$page"
+            } else {
+                if (page <= 1) "https://www.arabxn.com/video/" else "https://www.arabxn.com/video/page/$page"
+            }
+            val html = fetchHtml(cfClientFor("https://www.arabxn.com"), url, "https://www.arabxn.com/")
+            parseArabXnList(Jsoup.parse(html, "https://www.arabxn.com"))
+        }
+
         "rule34video" -> {
             val seg = if (latest) "latest-updates" else "most-popular"
             val url = "https://rule34video.com/$seg/${if (page > 1) "$page/" else ""}"
@@ -510,50 +803,123 @@ class SmartForYou :
             parseKvsList(Jsoup.parse(html, "https://rule34video.com"), "https://rule34video.com", "Rule34")
         }
 
-        "sexalarab" -> {
-            val seg = if (latest) "latest-updates" else "most-popular"
-            val url = "https://sexalarab.tv/$seg/${if (page > 1) "$page/" else ""}"
-            val html = fetchHtml(sexAlArabClient, url, "https://sexalarab.tv/")
-            parseKvsList(Jsoup.parse(html, "https://sexalarab.tv"), "https://sexalarab.tv", "SexAlArab")
-        }
-
         else -> AnimesPage(emptyList(), false)
     }
 
-    private fun searchSource(srcId: String, page: Int, query: String): AnimesPage {
-        val enc = URLEncoder.encode(query.trim(), "UTF-8")
+    private fun searchSource(
+        srcId: String,
+        page: Int,
+        query: String,
+        minDurationMin: Int = 0,
+        newest: Boolean = false,
+    ): AnimesPage {
+        val clean = query.trim()
+        val enc = URLEncoder.encode(clean, "UTF-8")
         return when (srcId) {
             "pornhub" -> {
-                val url = "https://www.pornhub.com/video/search?search=$enc" + if (page > 1) "&page=$page" else ""
+                val durParam = if (minDurationMin >= 30) {
+                    "&min_duration=30"
+                } else if (minDurationMin >= 20) {
+                    "&min_duration=20"
+                } else {
+                    ""
+                }
+                val sortParam = if (newest) "&o=mr" else ""
+                val pageParam = if (page > 1) "&page=$page" else ""
+                val url = "https://www.pornhub.com/video/search?search=$enc$durParam$sortParam$pageParam"
                 val html = fetchHtml(pornhubClient, url, "https://www.pornhub.com/")
                 parsePornHubList(Jsoup.parse(html, "https://www.pornhub.com"))
             }
 
-            "sextb" -> searchSexTbAjax(query, page)
+            "sextb" -> searchSexTbAjax(clean, page)
 
             "xvideos" -> {
-                val url = "https://www.xvideos.com/?k=$enc&p=${(page - 1).coerceAtLeast(0)}"
+                val durParam = if (minDurationMin >= 20) "&durf=20min_more" else ""
+                val sortParam = if (newest) "&sort=uploaddate" else ""
+                val url = "https://www.xvideos.com/?k=$enc&p=${(page - 1).coerceAtLeast(0)}$durParam$sortParam"
                 val html = fetchHtml(baseHttpClient, url, "https://www.xvideos.com/")
                 parseWgczList(Jsoup.parse(html, "https://www.xvideos.com"), "https://www.xvideos.com", "XVideos")
             }
 
             "xnxx" -> {
-                val url = "https://www.xnxx.com/search/$enc/${(page - 1).coerceAtLeast(0)}"
+                val durSeg = if (minDurationMin >= 20) "20min+/" else ""
+                val url = "https://www.xnxx.com/search/$durSeg$enc/${(page - 1).coerceAtLeast(0)}"
                 val html = fetchHtml(baseHttpClient, url, "https://www.xnxx.com/")
                 parseWgczList(Jsoup.parse(html, "https://www.xnxx.com"), "https://www.xnxx.com", "XNXX")
             }
 
-            "rule34video" -> {
-                val slug = query.trim().lowercase(Locale.ROOT).replace(Regex("""\s+"""), "-")
-                val url = "https://rule34video.com/search/${URLEncoder.encode(slug, "UTF-8")}/${if (page > 1) "$page/" else ""}"
-                val html = fetchHtml(baseHttpClient, url, "https://rule34video.com/")
-                parseKvsList(Jsoup.parse(html, "https://rule34video.com"), "https://rule34video.com", "Rule34")
+            "xmoviesforyou" -> {
+                val sort = if (newest) "latest" else "relevance"
+                val pg = if (page > 1) "&page=$page" else ""
+                val url = "https://xmoviesforyou.com/new-search?q=$enc&sort=$sort$pg"
+                val html = fetchHtml(cfClientFor("https://xmoviesforyou.com"), url, "https://xmoviesforyou.com/")
+                parseXMoviesList(Jsoup.parse(html, "https://xmoviesforyou.com"), page)
+            }
+
+            "supjav" -> {
+                val pg = if (page > 1) "page/$page/" else ""
+                val url = "https://supjav.com/$pg?s=$enc"
+                val html = fetchHtml(cfClientFor("https://supjav.com"), url, "https://supjav.com/")
+                parseSupJavList(Jsoup.parse(html, "https://supjav.com"))
+            }
+
+            "jable" -> {
+                val url = "https://jable.tv/search/$enc/?lang=en&q=$enc&from=${"%02d".format(page)}"
+                val html = fetchHtml(cfClientFor("https://jable.tv"), url, "https://jable.tv/")
+                parseJableList(Jsoup.parse(html, "https://jable.tv"))
+            }
+
+            "missav" -> {
+                val url = "https://missav.ws/en/search/$enc?page=$page"
+                val html = fetchHtml(cfClientFor("https://missav.ws"), url, "https://missav.ws/")
+                parseMissAvList(Jsoup.parse(html, "https://missav.ws"))
+            }
+
+            "javgg" -> {
+                val pg = if (page > 1) "page/$page/" else ""
+                val url = "https://javgg.net/$pg?s=$enc"
+                val html = fetchHtml(cfClientFor("https://javgg.net"), url, "https://javgg.net/")
+                parseJavGgList(Jsoup.parse(html, "https://javgg.net"))
+            }
+
+            "javguru" -> {
+                val pg = if (page > 1) "page/$page/" else ""
+                val url = "https://jav.guru/$pg?s=$enc"
+                val html = fetchHtml(cfClientFor("https://jav.guru"), url, "https://jav.guru/")
+                parseJavGuruList(Jsoup.parse(html, "https://jav.guru"))
+            }
+
+            "aflamk1" -> {
+                val url = "https://www.aflamk1.net/search/?q=$enc" + if (page > 1) "&from_videos=$page" else ""
+                val html = fetchHtml(cfClientFor("https://www.aflamk1.net"), url, "https://www.aflamk1.net/")
+                parseKvsList(Jsoup.parse(html, "https://www.aflamk1.net"), "https://www.aflamk1.net", "Aflamk1")
             }
 
             "sexalarab" -> {
                 val url = "https://sexalarab.tv/search/?q=$enc&from_videos=$page"
-                val html = fetchHtml(sexAlArabClient, url, "https://sexalarab.tv/")
+                val html = fetchHtml(cfClientFor("https://sexalarab.tv"), url, "https://sexalarab.tv/")
                 parseKvsList(Jsoup.parse(html, "https://sexalarab.tv"), "https://sexalarab.tv", "SexAlArab")
+            }
+
+            "arabx" -> {
+                val slug = URLEncoder.encode(clean.replace(Regex("""\s+"""), "-"), "UTF-8")
+                val url = "https://www.arabx.cam/search/$slug/" + if (page > 1) "?from_videos=$page" else ""
+                val html = fetchHtml(cfClientFor("https://www.arabx.cam"), url, "https://www.arabx.cam/")
+                parseKvsList(Jsoup.parse(html, "https://www.arabx.cam"), "https://www.arabx.cam", "ArabX")
+            }
+
+            "arabxn" -> {
+                val pg = if (page > 1) "/page/$page" else ""
+                val url = "https://www.arabxn.com/search/$enc$pg"
+                val html = fetchHtml(cfClientFor("https://www.arabxn.com"), url, "https://www.arabxn.com/")
+                parseArabXnList(Jsoup.parse(html, "https://www.arabxn.com"))
+            }
+
+            "rule34video" -> {
+                val slug = clean.lowercase(Locale.ROOT).replace(Regex("""\s+"""), "-")
+                val url = "https://rule34video.com/search/${URLEncoder.encode(slug, "UTF-8")}/${if (page > 1) "$page/" else ""}"
+                val html = fetchHtml(baseHttpClient, url, "https://rule34video.com/")
+                parseKvsList(Jsoup.parse(html, "https://rule34video.com"), "https://rule34video.com", "Rule34")
             }
 
             else -> AnimesPage(emptyList(), false)
@@ -606,24 +972,14 @@ class SmartForYou :
             .flatMap { it.select("div.tray-item:not(.ad-card):has(a[href]):not(:has(a[href*=\"/advertise\"]))") }
             .mapNotNull { el ->
                 val a = el.selectFirst("a[href]") ?: return@mapNotNull null
-                val href = a.attr("abs:href").ifBlank { "https://sextb.net${a.attr("href")}" }
+                val href = normalizeOriginUrl(a.attr("abs:href").ifBlank { a.attr("href") }, "https://sextb.net") ?: return@mapNotNull null
                 val code = el.selectFirst("div.tray-item-code")?.text()?.trim().orEmpty()
                 val rawTitle = el.selectFirst("div.tray-item-title")?.text()?.trim()
                     ?.ifBlank { a.attr("title").trim() }
                     ?: return@mapNotNull null
                 val dur = el.selectFirst("div.tray-item-runtime")?.text()?.trim().orEmpty()
                 val img = el.selectFirst("img")
-                val thumb = listOf(img?.attr("data-src"), img?.attr("data-original"), img?.attr("src"))
-                    .firstOrNull { !it.isNullOrBlank() && "default-cover" !in it }
-                    ?.let {
-                        if (it.startsWith("//")) {
-                            "https:$it"
-                        } else if (it.startsWith("/")) {
-                            "https://sextb.net$it"
-                        } else {
-                            it
-                        }
-                    }
+                val thumb = extractBestThumb(img, "https://sextb.net")
                 val fullTitle = if (code.isNotBlank() && !rawTitle.contains(code, true)) "[$code] $rawTitle" else rawTitle
                 SAnime.create().apply {
                     url = href
@@ -648,7 +1004,8 @@ class SmartForYou :
             .set("X-Requested-With", "XMLHttpRequest")
             .set("Accept", "application/json, text/javascript, */*; q=0.01")
             .build()
-        sextbClient.newCall(POST("https://sextb.net/ajax/search", reqHeaders, form)).execute().use { resp ->
+        acquireSourceSlot("sextb.net")
+        cfClientFor("https://sextb.net").newCall(POST("https://sextb.net/ajax/search", reqHeaders, form)).execute().use { resp ->
             if (!resp.isSuccessful) return AnimesPage(emptyList(), false)
             val json = JSONObject(resp.body.string())
             val hits = json.optJSONArray("hits") ?: return AnimesPage(emptyList(), false)
@@ -658,14 +1015,14 @@ class SmartForYou :
                     val code = obj.optString("code").trim().lowercase(Locale.ROOT)
                     if (code.isBlank()) continue
                     val rawTitle = Jsoup.parse(obj.optString("name")).text().trim()
-                    val runtime = obj.optString("runtimes").trim().let { if (it.isNotBlank() && it != "0") "$it min" else "" }
-                    val poster = obj.optString("poster").trim()
+                    val runtime = obj.optString("runtimes").trim().let { if (it.isNotBlank() && it != "0") "${it}m" else "" }
+                    val poster = normalizeOriginUrl(obj.optString("poster"), "https://sextb.net")
                     val fullTitle = "[${code.uppercase(Locale.ROOT)}] $rawTitle"
                     add(
                         SAnime.create().apply {
                             url = "https://sextb.net/$code"
                             title = buildCardTitle("SexTB", fullTitle, runtime)
-                            thumbnail_url = poster.takeIf { it.startsWith("http") }
+                            thumbnail_url = poster
                         },
                     )
                 }
@@ -685,10 +1042,10 @@ class SmartForYou :
                 val rawTitle = el.selectFirst("p.title a")?.let { it.attr("title").ifBlank { it.text() } }
                     ?.trim()?.ifBlank { a.attr("title").trim() }
                     ?: return@mapNotNull null
-                val dur = el.selectFirst("span.duration")?.text()?.trim().orEmpty()
-                val img = el.selectFirst("img")
-                val thumb = listOf(img?.attr("data-src"), img?.attr("src"))
-                    .firstOrNull { !it.isNullOrBlank() && !it.startsWith("data:") && "lightbox-blank" !in it }
+                val dur = el.selectFirst("span.duration, span.metadata, p.metadata")?.text()?.let { text ->
+                    Regex("""\b(\d+:\d+|\d+\s*min)\b""", RegexOption.IGNORE_CASE).find(text)?.value
+                }?.trim().orEmpty()
+                val thumb = extractBestThumb(el.selectFirst("img"), origin)
                 SAnime.create().apply {
                     url = href
                     title = buildCardTitle(badge, rawTitle, dur)
@@ -702,30 +1059,17 @@ class SmartForYou :
     }
 
     private fun parseKvsList(doc: Document, origin: String, badge: String): AnimesPage {
-        val items = doc.select("div.list-videos div.item > a, div.item > a[href]")
-            .mapNotNull { a ->
-                val href = a.attr("abs:href").ifBlank {
-                    val h = a.attr("href").trim()
-                    if (h.startsWith("http")) h else "$origin/${h.removePrefix("/")}"
-                }
-                if (href.isBlank() || href == "$origin/") return@mapNotNull null
+        val items = doc.select("div.list-videos div.item, div.item:has(a[href])")
+            .mapNotNull { el ->
+                val a = el.selectFirst("a[href]") ?: return@mapNotNull null
+                val href = normalizeOriginUrl(a.attr("abs:href").ifBlank { a.attr("href") }, origin) ?: return@mapNotNull null
+                if (href == "$origin/" || href == origin) return@mapNotNull null
                 val rawTitle = a.attr("title").trim().ifBlank {
-                    a.selectFirst("strong.title, div.title")?.text()?.trim().orEmpty()
+                    el.selectFirst("strong.title, div.title, a.th div.thumb_title")?.text()?.trim().orEmpty()
                 }
                 if (rawTitle.isBlank()) return@mapNotNull null
-                val dur = a.selectFirst("div.duration, span.duration, div.time")?.text()?.trim().orEmpty()
-                val img = a.selectFirst("img")
-                val thumb = listOf(img?.attr("data-original"), img?.attr("data-webp"), img?.attr("data-src"), img?.attr("src"))
-                    .firstOrNull { !it.isNullOrBlank() && !it.startsWith("data:") }
-                    ?.let {
-                        if (it.startsWith("//")) {
-                            "https:$it"
-                        } else if (it.startsWith("/")) {
-                            "$origin$it"
-                        } else {
-                            it
-                        }
-                    }
+                val dur = el.selectFirst("div.duration, span.duration, div.time, span.time, div.time_length, span.label")?.text()?.trim().orEmpty()
+                val thumb = extractBestThumb(el.selectFirst("img"), origin)
                 SAnime.create().apply {
                     url = href
                     title = buildCardTitle(badge, rawTitle, dur)
@@ -738,11 +1082,210 @@ class SmartForYou :
         return AnimesPage(items, hasNext)
     }
 
-    private fun buildCardTitle(badge: String, rawTitle: String, duration: String): String = buildString {
-        append("[").append(badge).append("] ")
-        append(rawTitle.trim())
-        if (duration.isNotBlank() && !rawTitle.contains(duration)) {
-            append(" [").append(duration).append("]")
+    private fun parseSupJavList(doc: Document): AnimesPage {
+        val items = doc.select("div.posts > div.post")
+            .mapNotNull { el ->
+                val a = el.selectFirst("a[href]") ?: return@mapNotNull null
+                val href = normalizeOriginUrl(a.attr("abs:href").ifBlank { a.attr("href") }, "https://supjav.com") ?: return@mapNotNull null
+                val img = el.selectFirst("img")
+                val rawTitle = img?.attr("alt")?.trim()?.ifBlank { null }
+                    ?: a.attr("title").trim().ifBlank { null }
+                    ?: el.selectFirst("h3, h2")?.text()?.trim()
+                    ?: return@mapNotNull null
+                val dur = el.selectFirst("span.duration, span.time, div.duration, time")?.text()?.trim().orEmpty()
+                SAnime.create().apply {
+                    url = href
+                    title = buildCardTitle("SupJav", rawTitle, dur)
+                    thumbnail_url = extractBestThumb(img, "https://supjav.com")
+                }
+            }
+            .distinctBy { it.url }
+            .take(18)
+        val hasNext = doc.selectFirst("a.next[href], a[rel=next][href], div.pagination li.active + li a[href]") != null
+        return AnimesPage(items, hasNext)
+    }
+
+    private fun parseJableList(doc: Document): AnimesPage {
+        val items = doc.select(".container .video-img-box")
+            .mapNotNull { el ->
+                val a = el.selectFirst(".img-box a[href]") ?: return@mapNotNull null
+                val href = normalizeOriginUrl(a.attr("abs:href").ifBlank { a.attr("href") }, "https://jable.tv") ?: return@mapNotNull null
+                val rawTitle = el.selectFirst(".detail .title")?.text()?.trim().orEmpty()
+                if (rawTitle.isBlank()) return@mapNotNull null
+                val dur = el.selectFirst("span.label, span.duration, span.time, .img-box span")?.text()?.trim()
+                    ?.takeIf { ":" in it }.orEmpty()
+                SAnime.create().apply {
+                    url = href
+                    title = buildCardTitle("Jable", rawTitle, dur)
+                    thumbnail_url = extractBestThumb(el.selectFirst(".img-box img"), "https://jable.tv")
+                }
+            }
+            .distinctBy { it.url }
+            .take(18)
+        val hasNext = doc.selectFirst(".pagination li.active + li a, .pagination a.next, a[rel=next]") != null
+        return AnimesPage(items, hasNext)
+    }
+
+    private fun parseMissAvList(doc: Document): AnimesPage {
+        val items = doc.select("div[class*=thumbnail]")
+            .mapNotNull { el ->
+                val a = el.selectFirst("a[class*=text-secondary][href], a[href][alt]") ?: return@mapNotNull null
+                val href = normalizeOriginUrl(a.attr("abs:href").ifBlank { a.attr("href") }, "https://missav.ws") ?: return@mapNotNull null
+                if (href.endsWith("#") || "javascript:" in href) return@mapNotNull null
+                val rawTitle = a.text().ifBlank { a.attr("alt") }.trim()
+                if (rawTitle.isBlank()) return@mapNotNull null
+                val dur = el.selectFirst("span[class*=duration], span[class*=time], span.font-mono, time")?.text()?.trim()
+                    ?.takeIf { ":" in it }.orEmpty()
+                SAnime.create().apply {
+                    url = href
+                    title = buildCardTitle("MissAV", rawTitle, dur)
+                    thumbnail_url = extractBestThumb(el.selectFirst("img"), "https://missav.ws")
+                }
+            }
+            .distinctBy { it.url }
+            .take(18)
+        val hasNext = doc.selectFirst("a[rel=next], nav a:contains(›)") != null
+        return AnimesPage(items, hasNext)
+    }
+
+    private fun parseJavGgList(doc: Document): AnimesPage {
+        val items = doc.select("article.item, div.items article")
+            .mapNotNull { el ->
+                val a = el.selectFirst("a[href]") ?: return@mapNotNull null
+                val href = normalizeOriginUrl(a.attr("abs:href").ifBlank { a.attr("href") }, "https://javgg.net") ?: return@mapNotNull null
+                val rawTitle = el.selectFirst("h3 a, h3, .data h3")?.text()?.trim()?.ifBlank { a.attr("title").trim() }.orEmpty()
+                if (rawTitle.isBlank()) return@mapNotNull null
+                val dur = el.selectFirst("span.duration, span.time, div.duration, span.quality")?.text()?.trim()
+                    ?.takeIf { ":" in it || "min" in it.lowercase(Locale.ROOT) }.orEmpty()
+                SAnime.create().apply {
+                    url = href
+                    title = buildCardTitle("JavGG", rawTitle, dur)
+                    thumbnail_url = extractBestThumb(el.selectFirst("img"), "https://javgg.net")
+                }
+            }
+            .distinctBy { it.url }
+            .take(18)
+        val hasNext = doc.selectFirst("a.arrow_pag[href], a[rel=next], div.pagination a.next") != null
+        return AnimesPage(items, hasNext)
+    }
+
+    private fun parseJavGuruList(doc: Document): AnimesPage {
+        val items = doc.select("div.inside-article, div.row > div.imgg")
+            .mapNotNull { el ->
+                val a = el.selectFirst("a[href]") ?: return@mapNotNull null
+                val href = normalizeOriginUrl(a.attr("abs:href").ifBlank { a.attr("href") }, "https://jav.guru") ?: return@mapNotNull null
+                val rawTitle = el.selectFirst("h2 a, h2, .grid1 a")?.text()?.trim()?.ifBlank { a.attr("title").trim() }.orEmpty()
+                if (rawTitle.isBlank()) return@mapNotNull null
+                val dur = el.selectFirst("span.duration, span.time, div.duration, time")?.text()?.trim()
+                    ?.takeIf { ":" in it || "min" in it.lowercase(Locale.ROOT) }.orEmpty()
+                SAnime.create().apply {
+                    url = href
+                    title = buildCardTitle("JavGuru", rawTitle, dur)
+                    thumbnail_url = extractBestThumb(el.selectFirst("img"), "https://jav.guru")
+                }
+            }
+            .distinctBy { it.url }
+            .take(18)
+        val hasNext = doc.selectFirst("a.next.page-numbers, a[rel=next]") != null
+        return AnimesPage(items, hasNext)
+    }
+
+    private fun parseXMoviesList(doc: Document, page: Int): AnimesPage {
+        val elements = doc.select("a.card").ifEmpty {
+            doc.select("section a.group.flex.flex-col").ifEmpty {
+                doc.select("main a.group.flex.flex-col, a[data-video-card]")
+            }
+        }
+        val items = elements.mapNotNull { el ->
+            val href = normalizeOriginUrl(el.absUrl("href").ifBlank { el.attr("href") }, "https://xmoviesforyou.com") ?: return@mapNotNull null
+            if ("/category/" in href || "/studio/" in href || "/pornstar/" in href || "/page/" in href) return@mapNotNull null
+            val img = el.selectFirst("img")
+            val rawTitle = el.selectFirst("h3.title, h3, h2")?.text()?.trim()?.ifBlank { null }
+                ?: img?.attr("alt")?.trim()?.ifBlank { null }
+                ?: el.attr("title").trim()
+            if (rawTitle.isBlank()) return@mapNotNull null
+            val dur = el.selectFirst("span.duration, div.duration, span.time, time, span[class*=bottom-]")?.text()?.trim()
+                ?.takeIf { ":" in it || "min" in it.lowercase(Locale.ROOT) }.orEmpty()
+            SAnime.create().apply {
+                url = href
+                title = buildCardTitle("XMovies", rawTitle, dur)
+                thumbnail_url = extractBestThumb(img, "https://xmoviesforyou.com")
+            }
+        }.distinctBy { it.url }.take(18)
+        val hasNext = items.isNotEmpty() && doc.select("a[href]").any {
+            it.text().trim().equals("Next", true) || "page=${page + 1}" in it.attr("href") || it.attr("href").endsWith("/page/${page + 1}")
+        }
+        return AnimesPage(items, hasNext)
+    }
+
+    private fun parseArabXnList(doc: Document): AnimesPage {
+        val items = doc.select("article.video-card, article.rowvideo, article")
+            .mapNotNull { el ->
+                val a = el.selectFirst("a[href*=/watch-], a[href]") ?: return@mapNotNull null
+                val href = normalizeOriginUrl(a.attr("abs:href").ifBlank { a.attr("href") }, "https://www.arabxn.com") ?: return@mapNotNull null
+                if ("/watch-" !in href) return@mapNotNull null
+                val rawTitle = a.attr("title").trim().ifBlank {
+                    el.selectFirst("h2, h3, strong.title, .title")?.text()?.trim().orEmpty()
+                }
+                if (rawTitle.isBlank()) return@mapNotNull null
+                val dur = el.selectFirst("div.timevideo1, div.timevideo, div.duration, span.duration, span.time, time")?.text()?.trim().orEmpty()
+                SAnime.create().apply {
+                    url = href
+                    title = buildCardTitle("ArabXN", rawTitle, dur)
+                    thumbnail_url = extractBestThumb(el.selectFirst("img"), "https://www.arabxn.com")
+                }
+            }
+            .distinctBy { it.url }
+            .take(18)
+        val hasNext = doc.selectFirst("a[rel=next], nav.catalog-pagination span.is-current ~ a[href]") != null
+        return AnimesPage(items, hasNext)
+    }
+
+    /**
+     * Places BOTH the source badge AND video duration at the START of the card title
+     * (e.g. `[PornHub • 32:15] Title...` or `[SexTB • 120m] [SONE-248] ...`) so duration is
+     * ALWAYS visible on 2-line grid cards and never truncated at the end!
+     */
+    private fun buildCardTitle(badge: String, rawTitle: String, duration: String): String {
+        val cleanDur = duration.trim()
+            .replace(Regex("""(?i)\s*mins?\b"""), "m")
+            .replace(Regex("""^[^\d]+"""), "")
+            .trim()
+        val prefix = if (cleanDur.isNotBlank()) "[$badge • $cleanDur]" else "[$badge]"
+        return "$prefix ${rawTitle.trim()}"
+    }
+
+    private fun extractBestThumb(img: Element?, origin: String): String? {
+        if (img == null) return null
+        val candidates = listOf(
+            img.attr("data-src"),
+            img.attr("data-original"),
+            img.attr("data-webp"),
+            img.attr("data-lazy-src"),
+            img.attr("data-image"),
+            img.attr("poster"),
+            img.attr("src"),
+        )
+        val picked = candidates.firstOrNull { raw ->
+            val t = raw.trim()
+            t.isNotBlank() &&
+                !t.startsWith("data:", ignoreCase = true) &&
+                "blank.gif" !in t &&
+                "lightbox-blank" !in t &&
+                "default-cover" !in t &&
+                "no-poster" !in t
+        } ?: return null
+        return normalizeOriginUrl(picked, origin)
+    }
+
+    private fun normalizeOriginUrl(raw: String?, origin: String): String? {
+        val clean = raw?.trim()?.trim('"', '\'') ?: return null
+        if (clean.isBlank()) return null
+        return when {
+            clean.startsWith("http://") || clean.startsWith("https://") -> clean
+            clean.startsWith("//") -> "https:$clean"
+            clean.startsWith("/") -> "${origin.trimEnd('/')}$clean"
+            else -> "${origin.trimEnd('/')}/${clean.removePrefix("/")}"
         }
     }
 
@@ -750,7 +1293,8 @@ class SmartForYou :
 
     private fun parseDetailsForSource(srcId: String?, fullUrl: String, fallback: SAnime): SAnime {
         val httpClient = clientForSource(srcId)
-        val html = runCatching { fetchHtml(httpClient, fullUrl, "${originOf(fullUrl)}/") }.getOrNull()
+        val origin = originOf(fullUrl)
+        val html = runCatching { fetchHtml(httpClient, fullUrl, "$origin/") }.getOrNull()
             ?: return SAnime.create().apply {
                 url = fullUrl
                 title = fallback.title
@@ -758,37 +1302,59 @@ class SmartForYou :
                 status = SAnime.COMPLETED
             }
         val doc = Jsoup.parse(html, fullUrl)
-        val parsedTitle = doc.selectFirst("h1.title span.inlineFree, h1.film-info-title, h1.page-title, h1")?.text()?.trim()
+        val parsedTitle = doc.selectFirst("h1.title span.inlineFree, h1.film-info-title, h1.page-title, div.post-meta h2, .header-left h4, main h1, h1")?.text()?.trim()
             ?.ifBlank { doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim() }
             ?.ifBlank { fallback.title }
             ?: fallback.title
+
         val thumb = doc.selectFirst("meta[property=og:image], meta[name=twitter:image]")?.attr("content")?.trim()
-            ?.takeIf { it.startsWith("http") }
+            ?.let { normalizeOriginUrl(it, origin) }
+            ?: extractBestThumb(doc.selectFirst("div.film-poster img, img.poster, div.post-meta img, #player img"), origin)
             ?: fallback.thumbnail_url
+
         val tags = when (srcId) {
             "pornhub" -> doc.select("div.categoriesWrapper a, div.tagsWrapper a").eachText()
             "sextb" -> doc.select("div.description:contains(Genre) a").eachText()
+            "supjav" -> doc.select("div.tags > a").eachText()
+            "jable" -> doc.select(".tags a").eachText()
+            "missav" -> doc.select("a[href*=/genres/], a[href*=/tags/]").eachText()
+            "javgg", "javguru" -> doc.select("a[href*=/genre/], a[href*=/tag/]").eachText()
+            "xmoviesforyou" -> doc.select("a[href^='/category/'], a[href^='/tag/']").eachText()
             "xvideos", "xnxx" -> doc.select("div.video-metadata a.is-keyword, div.video-tags-list a").eachText()
-            else -> doc.select("div.info a[href*=/tag], div.info a[href*=/categor], a[href*=/tags/]").eachText()
+            else -> doc.select("div.info a[href*=/tag], div.info a[href*=/categor], a[href*=/tags/], a.taga[href*=/tag/]").eachText()
         }.map(String::trim).filter(String::isNotBlank).distinct().take(15)
 
         val stars = when (srcId) {
             "pornhub" -> doc.select("div.pornstarsWrapper a, div.userInfo a.bolded").eachText()
             "sextb" -> doc.select("div.description:contains(Cast) a").eachText()
+            "supjav" -> doc.select("p:contains(Cast :) > a").eachText()
+            "jable" -> doc.select(".header-left .model span[title]").eachAttr("title")
+            "xmoviesforyou" -> doc.select("a[href^='/pornstar/']").eachText()
             "xvideos", "xnxx" -> doc.select("div.video-metadata a.model, li.model a").eachText()
-            else -> doc.select("div.info a[href*=/models/], div.info a[href*=/pornstar]").eachText()
+            else -> doc.select("div.info a[href*=/models/], div.info a[href*=/pornstar], a.taga[href*=/pornstar/]").eachText()
         }.map(String::trim).filter(String::isNotBlank).distinct().take(8)
+
+        val detailDur = tasteEngine.extractDurationMinutes(
+            fallback.title,
+            doc.selectFirst("meta[property=video:duration], meta[itemprop=duration]")?.attr("content"),
+            doc.selectFirst("div.description:contains(Runtime), span.duration, div.duration, .header-right")?.text(),
+        )
 
         val desc = doc.selectFirst("meta[name=description], meta[property=og:description]")?.attr("content")?.trim()
         return SAnime.create().apply {
             url = fullUrl
-            title = parsedTitle
+            title = if (detailDur != null && detailDur > 0 && !parsedTitle.contains("${detailDur}m") && !parsedTitle.contains(":")) {
+                "[${detailDur}m] $parsedTitle"
+            } else {
+                parsedTitle
+            }
             thumbnail_url = thumb
             genre = tags.joinToString().ifBlank { null }
             artist = stars.joinToString().ifBlank { null }
             author = srcId?.uppercase(Locale.ROOT)
             description = buildList {
                 if (srcId != null) add("Source: ${ALL_SOURCES.firstOrNull { it.id == srcId }?.label ?: srcId}")
+                if (detailDur != null && detailDur > 0) add("Duration: $detailDur min")
                 if (!desc.isNullOrBlank()) add(desc)
             }.joinToString("\n").ifBlank { null }
             status = SAnime.COMPLETED
@@ -796,15 +1362,24 @@ class SmartForYou :
         }
     }
 
-    // ---- Video Extractors ----
+    // ---- Video Extractors (All 15 Sources) ----
 
     private fun extractVideosForSource(srcId: String, fullUrl: String): List<Video> = when (srcId) {
         "pornhub" -> extractPornHubVideos(fullUrl)
         "sextb" -> extractSexTbVideos(fullUrl)
         "xvideos" -> extractWgczVideos(fullUrl, "https://www.xvideos.com", "XVideos")
         "xnxx" -> extractWgczVideos(fullUrl, "https://www.xnxx.com", "XNXX")
+        "xmoviesforyou" -> extractXMoviesVideos(fullUrl)
+        "supjav" -> extractSupJavVideos(fullUrl)
+        "jable" -> extractJableVideos(fullUrl)
+        "missav" -> extractMissAvVideos(fullUrl)
+        "javgg" -> extractJavGgVideos(fullUrl)
+        "javguru" -> extractJavGuruVideos(fullUrl)
+        "aflamk1" -> extractKvsVideos(cfClientFor("https://www.aflamk1.net"), fullUrl, "Aflamk1")
+        "sexalarab" -> extractKvsVideos(cfClientFor("https://sexalarab.tv"), fullUrl, "SexAlArab")
+        "arabx" -> extractArabXVideos(fullUrl)
+        "arabxn" -> extractArabXnVideos(fullUrl)
         "rule34video" -> extractKvsVideos(baseHttpClient, fullUrl, "Rule34")
-        "sexalarab" -> extractKvsVideos(sexAlArabClient, fullUrl, "SexAlArab")
         else -> emptyList()
     }
 
@@ -847,7 +1422,6 @@ class SmartForYou :
             }
         }
 
-        // Fetch progressive MP4s via /video/get_media using exact session cookies
         val cookieHeader = phCookieJar.buildHeader(setCookies)
         for (gmUrl in getMediaUrls.distinct()) {
             runCatching {
@@ -883,6 +1457,7 @@ class SmartForYou :
     }
 
     private fun extractSexTbVideos(pageUrl: String): List<Video> {
+        val sextbClient = cfClientFor("https://sextb.net")
         val html = fetchHtml(sextbClient, pageUrl, "https://sextb.net/")
         val doc = Jsoup.parse(html, pageUrl)
         val buttons = doc.select("button.btn-player.episode[data-id], button.btn-player[data-id]:not(.vip)")
@@ -936,7 +1511,7 @@ class SmartForYou :
                 ?: Regex("""https?://[^\s"'<>]+""").find(dec.replace("\\/", "/"))?.value
                 ?: continue
 
-            val extracted = extractSexTbEmbed(iframeUrl, pageUrl)
+            val extracted = extractGenericEmbed(iframeUrl, pageUrl, "SexTB")
             if (extracted.isNotEmpty()) {
                 videos += extracted
                 break
@@ -945,9 +1520,191 @@ class SmartForYou :
         return videos.distinctBy { it.videoUrl ?: it.url }
     }
 
-    private fun extractSexTbEmbed(rawEmbedUrl: String, referer: String): List<Video> {
+    private fun extractJableVideos(pageUrl: String): List<Video> {
+        val html = fetchHtml(cfClientFor("https://jable.tv"), pageUrl, "https://jable.tv/")
+        val m3u8 = Regex("""\bhlsUrl\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1) ?: return emptyList()
+        val playHeaders = desktopHeaders("https://jable.tv/").newBuilder().set("Origin", "https://jable.tv").build()
+        return runCatching {
+            playlistUtils.extractFromHls(m3u8, referer = "https://jable.tv/", masterHeaders = playHeaders, videoHeaders = playHeaders, videoNameGen = { "Jable - $it" })
+        }.getOrDefault(emptyList()).ifEmpty {
+            listOf(Video(m3u8, "Jable - HLS", m3u8, headers = playHeaders))
+        }
+    }
+
+    private fun extractMissAvVideos(pageUrl: String): List<Video> {
+        val origin = originOf(pageUrl)
+        val html = fetchHtml(cfClientFor(origin), pageUrl, "$origin/")
+        val doc = Jsoup.parse(html, pageUrl)
+        val scripts = doc.select("script").joinToString("\n") { s ->
+            val d = s.data()
+            if ("function(p,a,c,k,e,d)" in d) autoUnpacker(d) ?: d else d
+        }
+        val m3u8 = Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").find(scripts)?.value ?: return emptyList()
+        val refOrigin = if ("missav.fans" in origin) "https://missav.ws" else origin
+        val playHeaders = desktopHeaders("$refOrigin/").newBuilder().set("Origin", refOrigin).build()
+        return runCatching {
+            playlistUtils.extractFromHls(m3u8, referer = "$refOrigin/", masterHeaders = playHeaders, videoHeaders = playHeaders, videoNameGen = { "MissAV - $it" })
+        }.getOrDefault(emptyList()).ifEmpty {
+            listOf(Video(m3u8, "MissAV - HLS", m3u8, headers = playHeaders))
+        }
+    }
+
+    private fun extractXMoviesVideos(pageUrl: String): List<Video> {
+        val html = fetchHtml(cfClientFor("https://xmoviesforyou.com"), pageUrl, "https://xmoviesforyou.com/")
+        val videos = mutableListOf<Video>()
+        val videoId = Regex("""["']videoId["']\s*:\s*["']?([a-zA-Z0-9_-]+)["']?""").find(html)?.groupValues?.get(1)
+            ?: Regex("""/api/stream/([a-zA-Z0-9_-]+)""").find(html)?.groupValues?.get(1)
+        val target = Regex("""["']target["']\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1).orEmpty()
+        if (!videoId.isNullOrBlank()) {
+            runCatching {
+                val apiUrl = "https://xmoviesforyou.com/api/stream/$videoId" + if (target.isNotBlank()) "?target=${URLEncoder.encode(target, "UTF-8")}" else ""
+                val apiHeaders = desktopHeaders(pageUrl).newBuilder().set("Accept", "application/json, */*").build()
+                cfClientFor("https://xmoviesforyou.com").newCall(GET(apiUrl, apiHeaders)).execute().use { r ->
+                    if (!r.isSuccessful) return@use
+                    val hls = JSONObject(r.body.string()).optString("url").replace("\\/", "/").trim()
+                    if (hls.startsWith("http")) {
+                        if (!m3u8Server.isRunning()) m3u8Server.startServer()
+                        val local = m3u8Server.processM3u8Url(hls, referer = "https://xmoviesforyou.com/", userAgent = DESKTOP_UA, origin = "https://xmoviesforyou.com")
+                        if (local != null) videos += Video(local, "XMovies - HLS", local)
+                    }
+                }
+            }
+        }
+        if (videos.isEmpty()) {
+            val doc = Jsoup.parse(html, pageUrl)
+            val mirrors = doc.select("a[href]")
+                .map { it.attr("href").trim() }
+                .filter { it.startsWith("http") && listOf("dood", "streamtape", "mixdrop", "ds2play", "myvidplay").any { h -> h in it.lowercase(Locale.ROOT) } }
+                .distinct().take(3)
+            for (m in mirrors) {
+                videos += extractGenericEmbed(m, pageUrl, "XMovies")
+                if (videos.isNotEmpty()) break
+            }
+        }
+        return videos.distinctBy { it.videoUrl ?: it.url }
+    }
+
+    private fun extractSupJavVideos(pageUrl: String): List<Video> {
+        val html = fetchHtml(cfClientFor("https://supjav.com"), pageUrl, "https://supjav.com/")
+        val doc = Jsoup.parse(html, pageUrl)
+        val links = doc.select("div.btnst a[data-link], div.btnst a[href], div.btns a[data-link], a[href*=supjav.php]")
+            .mapNotNull { it.attr("data-link").ifBlank { it.attr("href") }.trim().takeIf { s -> s.isNotBlank() && s != "#" } }
+            .distinct()
+            .take(4)
+        for (rawId in links) {
+            val resolved = resolveSupJavRedirect(rawId) ?: continue
+            val hits = extractGenericEmbed(resolved, pageUrl, "SupJav")
+            if (hits.isNotEmpty()) return hits
+        }
+        return emptyList()
+    }
+
+    private fun resolveSupJavRedirect(id: String): String? {
+        if (id.startsWith("//")) return "https:$id"
+        if (id.startsWith("http") && "supjav" !in id.lowercase(Locale.ROOT)) return id
+        val candidates = if (id.startsWith("http")) {
+            listOf(id)
+        } else {
+            listOf("https://lkc21.com/supjav.php?c=${id.reversed()}", "https://lkc21.com/supjav.php?c=$id")
+        }
+        for (u in candidates) {
+            val loc = runCatching {
+                noRedirectClient.newCall(GET(u, desktopHeaders("https://lkc21.com/"))).execute().use { r ->
+                    r.header("Location")?.trim()?.takeIf(String::isNotBlank)
+                        ?.let { r.request.url.resolve(it)?.toString() }
+                }
+            }.getOrNull()
+            if (!loc.isNullOrBlank()) return loc
+        }
+        return null
+    }
+
+    private fun extractJavGgVideos(pageUrl: String): List<Video> {
+        val html = fetchHtml(cfClientFor("https://javgg.net"), pageUrl, "https://javgg.net/")
+        val doc = Jsoup.parse(html, pageUrl)
+        val iframes = doc.select("[id*=source-player] iframe, iframe[src]")
+            .mapNotNull { it.attr("src").ifBlank { it.attr("data-src") }.trim().takeIf { s -> s.startsWith("http") } }
+            .distinct().take(4)
+        for (iframe in iframes) {
+            val hits = extractGenericEmbed(iframe, pageUrl, "JavGG")
+            if (hits.isNotEmpty()) return hits
+        }
+        return emptyList()
+    }
+
+    private fun extractJavGuruVideos(pageUrl: String): List<Video> {
+        val html = fetchHtml(cfClientFor("https://jav.guru"), pageUrl, "https://jav.guru/")
+        val b64Matches = Regex(""""iframe_url"\s*:\s*"([^"]+)"""").findAll(html).map { it.groupValues[1] }.toList()
+        for (b64 in b64Matches.take(4)) {
+            val iframeUrl = runCatching { String(Base64.decode(b64, Base64.DEFAULT)) }.getOrNull() ?: continue
+            val token = iframeUrl.toHttpUrlOrNull()?.queryParameter("xd")
+            val targetUrl = if (token != null) "${iframeUrl.substringBefore("?")}?xr=${token.reversed()}" else iframeUrl
+            val finalEmbed = runCatching {
+                baseHttpClient.newCall(GET(targetUrl, desktopHeaders(iframeUrl))).execute().use { r ->
+                    val u = r.request.url.toString()
+                    val body = r.body.string()
+                    Regex("""location\.href\s*=\s*["']([^"']+)["']""").find(body)?.groupValues?.get(1) ?: u
+                }
+            }.getOrNull() ?: targetUrl
+            val hits = extractGenericEmbed(finalEmbed, pageUrl, "JavGuru")
+            if (hits.isNotEmpty()) return hits
+        }
+        return emptyList()
+    }
+
+    private fun extractArabXVideos(pageUrl: String): List<Video> {
+        val client = cfClientFor("https://www.arabx.cam")
+        val kvs = runCatching { extractKvsVideos(client, pageUrl, "ArabX") }.getOrDefault(emptyList())
+        if (kvs.isNotEmpty()) return kvs
+        val html = fetchHtml(client, pageUrl, "https://www.arabx.cam/")
+        val doc = Jsoup.parse(html, pageUrl)
+        val iframes = doc.select("div.player iframe[src], iframe[src]")
+            .map { it.attr("abs:src").ifBlank { it.attr("src") } }
+            .filter { it.startsWith("http") && "google" !in it && "exoclick" !in it }
+            .distinct().take(3)
+        for (iframe in iframes) {
+            val hits = extractGenericEmbed(iframe, pageUrl, "ArabX")
+            if (hits.isNotEmpty()) return hits
+        }
+        return emptyList()
+    }
+
+    private fun extractArabXnVideos(pageUrl: String): List<Video> {
+        val html = fetchHtml(cfClientFor("https://www.arabxn.com"), pageUrl, "https://www.arabxn.com/")
+        val doc = Jsoup.parse(html, pageUrl)
+        val safeRef = pageUrl.toHttpUrlOrNull()?.toString() ?: "https://www.arabxn.com/"
+        val playHeaders = desktopHeaders(safeRef)
+        val fromSources = doc.select("video#my-video source[src], video source[src]")
+            .mapNotNull { s ->
+                val u = s.attr("abs:src").ifBlank { s.attr("src") }
+                if (u.startsWith("http") && ".mp4" in u.lowercase(Locale.ROOT)) {
+                    val label = s.attr("title").ifBlank { "MP4" }
+                    Video(u, "ArabXN - $label", u, headers = playHeaders)
+                } else {
+                    null
+                }
+            }
+        if (fromSources.isNotEmpty()) return fromSources.distinctBy { it.url }
+        return Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .map { it.value }
+            .distinct()
+            .map { Video(it, "ArabXN - MP4", it, headers = playHeaders) }
+            .toList()
+    }
+
+    private fun extractGenericEmbed(rawEmbedUrl: String, referer: String, badge: String): List<Video> {
         val embedUrl = rawEmbedUrl.replaceFirst("hglink.to", "niramirus.com").replaceFirst("hgcloud.to", "niramirus.com")
         val lower = embedUrl.lowercase(Locale.ROOT)
+        // Dedicated host extractors
+        runCatching {
+            when {
+                "streamtape" in lower -> return streamTapeExtractor.videosFromUrl(embedUrl)
+                "dood" in lower || "ds2play" in lower || "myvidplay" in lower || "d000d" in lower -> return doodExtractor.videosFromUrl(embedUrl)
+                "mixdrop" in lower -> return mixDropExtractor.videosFromUrl(embedUrl)
+                "voe." in lower -> return voeExtractor.videosFromUrl(embedUrl)
+            }
+        }
         // F4 embed
         if ("f4s" in lower || "f4jav" in lower) {
             val resp = runCatching { baseHttpClient.newCall(GET(embedUrl, desktopHeaders(referer))).execute() }.getOrNull() ?: return emptyList()
@@ -965,10 +1722,10 @@ class SmartForYou :
             val embedOrigin = "${finalUrl.scheme}://${finalUrl.host}"
             if (!m3u8Server.isRunning()) m3u8Server.startServer()
             val localUrl = m3u8Server.processM3u8Url(srcUrl, referer = "$embedOrigin/", userAgent = DESKTOP_UA, origin = embedOrigin) ?: return emptyList()
-            return listOf(Video(localUrl, "SexTB - F4 HLS", localUrl))
+            return listOf(Video(localUrl, "$badge - F4 HLS", localUrl))
         }
 
-        // StreamWish / FileLions / VidHide packed player
+        // Packed HLS / TurboVid / StreamWish / FileLions / VidHide / Direct MP4
         val resp = runCatching { baseHttpClient.newCall(GET(embedUrl, desktopHeaders(referer))).execute() }.getOrNull() ?: return emptyList()
         val (finalUrl, body) = resp.use { it.request.url to it.body.string().replace("\\/", "/") }
         val doc = Jsoup.parse(body, finalUrl.toString())
@@ -979,13 +1736,20 @@ class SmartForYou :
         val m3u8 = Regex(""""hls4"\s*:\s*"([^"]+)"""").find(scripts)?.groupValues?.get(1)
             ?: Regex(""""hls3"\s*:\s*"([^"]+)"""").find(scripts)?.groupValues?.get(1)
             ?: Regex(""""hls2"\s*:\s*"([^"]+)"""").find(scripts)?.groupValues?.get(1)
+            ?: Regex("""urlPlay\s*=\s*['"]([^'"]+)['"]""").find(body)?.groupValues?.get(1)
             ?: Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").find(scripts)?.value
+            ?: Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").find(body)?.value
+        if (!m3u8.isNullOrBlank()) {
+            val resolved = finalUrl.resolve(m3u8)?.toString() ?: m3u8
+            val embedOrigin = "${finalUrl.scheme}://${finalUrl.host}"
+            if (!m3u8Server.isRunning()) m3u8Server.startServer()
+            val localUrl = m3u8Server.processM3u8Url(resolved, referer = finalUrl.toString(), userAgent = DESKTOP_UA, origin = embedOrigin) ?: return emptyList()
+            return listOf(Video(localUrl, "$badge - HLS", localUrl))
+        }
+        val mp4 = Regex("""https?://[^\s"'<>\\]+\.mp4[^\s"'<>\\]*""").find(scripts)?.value
+            ?: Regex("""https?://[^\s"'<>\\]+\.mp4[^\s"'<>\\]*""").find(body)?.value
             ?: return emptyList()
-        val resolved = finalUrl.resolve(m3u8)?.toString() ?: m3u8
-        val embedOrigin = "${finalUrl.scheme}://${finalUrl.host}"
-        if (!m3u8Server.isRunning()) m3u8Server.startServer()
-        val localUrl = m3u8Server.processM3u8Url(resolved, referer = finalUrl.toString(), userAgent = DESKTOP_UA, origin = embedOrigin) ?: return emptyList()
-        return listOf(Video(localUrl, "SexTB - HLS", localUrl))
+        return listOf(Video(mp4, "$badge - MP4", mp4, headers = desktopHeaders(finalUrl.toString())))
     }
 
     private fun extractWgczVideos(pageUrl: String, origin: String, badge: String): List<Video> {
@@ -1086,8 +1850,17 @@ class SmartForYou :
 
     private fun clientForSource(srcId: String?): OkHttpClient = when (srcId) {
         "pornhub" -> pornhubClient
-        "sextb" -> sextbClient
-        "sexalarab" -> sexAlArabClient
+        "sextb" -> cfClientFor("https://sextb.net")
+        "xmoviesforyou" -> cfClientFor("https://xmoviesforyou.com")
+        "supjav" -> cfClientFor("https://supjav.com")
+        "jable" -> cfClientFor("https://jable.tv")
+        "missav" -> cfClientFor("https://missav.ws")
+        "javgg" -> cfClientFor("https://javgg.net")
+        "javguru" -> cfClientFor("https://jav.guru")
+        "aflamk1" -> cfClientFor("https://www.aflamk1.net")
+        "sexalarab" -> cfClientFor("https://sexalarab.tv")
+        "arabx" -> cfClientFor("https://www.arabx.cam")
+        "arabxn" -> cfClientFor("https://www.arabxn.com")
         else -> baseHttpClient
     }
 
@@ -1123,7 +1896,7 @@ class SmartForYou :
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
             val body = resp.body.string()
             if (body.length > 2000) {
-                if (pageCache.size > 80) pageCache.clear()
+                if (pageCache.size > 100) pageCache.clear()
                 pageCache[url] = System.currentTimeMillis() to body
             }
             return body
@@ -1196,7 +1969,7 @@ class SmartForYou :
     // ============================== Filters ===============================
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("Auto-picks your most-used sources unless overridden below."),
+        AnimeFilter.Header("Auto-picks your most-used sources from 15 supported sites unless overridden below."),
         FeedModeFilter(),
         SourceGroup(ALL_SOURCES.map { SourceCheckBox(it.label, it.id) }),
     )
@@ -1214,7 +1987,7 @@ class SmartForYou :
     }
 
     private class SourceCheckBox(name: String, val sourceId: String) : AnimeFilter.CheckBox(name)
-    private class SourceGroup(items: List<SourceCheckBox>) : AnimeFilter.Group<SourceCheckBox>("Sources (optional override)", items)
+    private class SourceGroup(items: List<SourceCheckBox>) : AnimeFilter.Group<SourceCheckBox>("Sources (15 available — optional override)", items)
 
     // ============================== Settings ==============================
 
@@ -1224,15 +1997,24 @@ class SmartForYou :
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_AUTO_SOURCES_KEY
             title = "Auto-select most-used sources"
-            summary = "Automatically adapts to your top 3 most-used sources (Current: $activeSummary)."
+            summary = "Adapts automatically across 15 sources (Active now: $activeSummary)."
             setDefaultValue(true)
+        }.also(screen::addPreference)
+
+        ListPreference(screen.context).apply {
+            key = PREF_AUTO_COUNT_KEY
+            title = "Active sources per feed page"
+            entries = arrayOf("2 sources (fastest)", "3 sources", "4 sources (recommended)", "5 sources", "6 sources (broadest)")
+            entryValues = arrayOf("2", "3", "4", "5", "6")
+            setDefaultValue("4")
+            summary = "%s"
         }.also(screen::addPreference)
 
         for (src in ALL_SOURCES) {
             SwitchPreferenceCompat(screen.context).apply {
                 key = "src_enabled_${src.id}"
                 title = "Allow source: ${src.label}"
-                summary = "Include ${src.label} in Auto mix & manual searches."
+                summary = "Include ${src.label} in Auto mix & searches."
                 setDefaultValue(true)
             }.also(screen::addPreference)
         }
@@ -1258,7 +2040,74 @@ class SmartForYou :
 
     // ========================== Helper Classes ============================
 
-    private data class SourceDef(val id: String, val label: String)
+    private data class SourceDef(
+        val id: String,
+        val label: String,
+        val isJav: Boolean = false,
+        val isShortForm: Boolean = false,
+        val supportsDurationQuery: Boolean = false,
+        val isArabic: Boolean = false,
+    )
+
+    /**
+     * Fixes broken cover thumbnails (especially SexTB & JAV/Arabic CDNs) inside Coil:
+     * rewrites the default `Referer: https://www.pornhub.com/` header to the exact host
+     * origin for each source, attaches WebView clearance cookies when available, and retries
+     * once without Referer if an image CDN rejects hotlink referers (HTTP 403).
+     */
+    private class SmartImageRefererInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val orig = chain.request()
+            val urlStr = orig.url.toString()
+            val host = orig.url.host.lowercase(Locale.ROOT)
+            val referer = resolveImageReferer(host)
+
+            val builder = orig.newBuilder()
+                .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+            if (referer != null) {
+                builder.header("Referer", referer)
+            } else {
+                builder.removeHeader("Referer")
+            }
+            if ("sextb" in host || "supjav" in host || "jable" in host || "missav" in host) {
+                val webCookie = runCatching {
+                    CookieManager.getInstance()?.getCookie(referer ?: urlStr)
+                }.getOrNull()
+                if (!webCookie.isNullOrBlank() && orig.header("Cookie").isNullOrBlank()) {
+                    builder.header("Cookie", webCookie)
+                }
+            }
+            val resp = chain.proceed(builder.build())
+            if (resp.code == 403 || resp.code == 401) {
+                resp.close()
+                val retryReq = orig.newBuilder()
+                    .removeHeader("Referer")
+                    .header("User-Agent", DESKTOP_UA)
+                    .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+                    .build()
+                return chain.proceed(retryReq)
+            }
+            return resp
+        }
+
+        private fun resolveImageReferer(host: String): String? = when {
+            "sextb" in host || "dmm.co.jp" in host || "sextbcdn" in host -> "https://sextb.net/"
+            "phncdn" in host || "pornhub" in host -> "https://www.pornhub.com/"
+            "xvideos" in host || "xhcdn" in host || "xnxx" in host -> "https://www.xvideos.com/"
+            "xmoviesforyou" in host -> "https://xmoviesforyou.com/"
+            "supjav" in host || "imgjav" in host -> "https://supjav.com/"
+            "jable" in host -> "https://jable.tv/"
+            "missav" in host || "fourhoi" in host -> "https://missav.ws/"
+            "javgg" in host -> "https://javgg.net/"
+            "jav.guru" in host || "javguru" in host -> "https://jav.guru/"
+            "aflamk1" in host -> "https://www.aflamk1.net/"
+            "sexalarab" in host -> "https://sexalarab.tv/"
+            "arabx." in host -> "https://www.arabx.cam/"
+            "arabxn" in host -> "https://www.arabxn.com/"
+            "rule34video" in host -> "https://rule34video.com/"
+            else -> null
+        }
+    }
 
     private class PhAgeCookieJar : CookieJar {
         private val session = ConcurrentHashMap<String, String>()
@@ -1308,11 +2157,12 @@ class SmartForYou :
 
     companion object {
         private const val TAG = "SmartForYou"
-        private const val AUTO_SOURCE_COUNT = 3
-        private const val SOURCE_TIMEOUT_MS = 12_000L
+        private const val MIN_HEALTHY_YIELD = 6
+        private const val SOURCE_TIMEOUT_MS = 13_000L
         private const val CACHE_TTL_MS = 3 * 60 * 1000L
 
         private const val PREF_AUTO_SOURCES_KEY = "pref_auto_sources"
+        private const val PREF_AUTO_COUNT_KEY = "pref_auto_source_count"
         private const val PREF_QUALITY_KEY = "pref_quality"
         private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
 
@@ -1320,18 +2170,55 @@ class SmartForYou :
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
         private val ALL_SOURCES = listOf(
-            SourceDef("sextb", "SexTB"),
-            SourceDef("pornhub", "PornHub"),
-            SourceDef("xvideos", "XVideos"),
-            SourceDef("xnxx", "XNXX"),
-            SourceDef("rule34video", "Rule34Video"),
-            SourceDef("sexalarab", "SexAlArab"),
+            SourceDef("sextb", "SexTB", isJav = true),
+            SourceDef("pornhub", "PornHub", supportsDurationQuery = true),
+            SourceDef("xvideos", "XVideos", supportsDurationQuery = true),
+            SourceDef("xnxx", "XNXX", supportsDurationQuery = true),
+            SourceDef("xmoviesforyou", "XMoviesForYou"),
+            SourceDef("supjav", "SupJav", isJav = true),
+            SourceDef("jable", "Jable", isJav = true),
+            SourceDef("missav", "MissAV", isJav = true),
+            SourceDef("javgg", "JavGG", isJav = true),
+            SourceDef("javguru", "JavGuru", isJav = true),
+            SourceDef("aflamk1", "Aflamk1", isArabic = true),
+            SourceDef("sexalarab", "SexAlArab", isArabic = true),
+            SourceDef("arabx", "ArabX", isArabic = true),
+            SourceDef("arabxn", "ArabXN", isArabic = true),
+            SourceDef("rule34video", "Rule34Video", isShortForm = true),
+        )
+
+        private val SOURCE_ALIASES = mapOf(
+            "supjav2" to "supjav",
+            "sexmahali" to "sexalarab",
+        )
+
+        private val COMBO_FRIENDLY_CONCEPTS = setOf(
+            "threesome", "foursome", "dp", "gangbang", "slut", "orgy", "anal", "creampie", "milf", "interracial",
+        )
+
+        private val ARABIC_CONCEPT_QUERIES = mapOf(
+            "threesome" to "ثلاثي",
+            "foursome" to "جماعي",
+            "gangbang" to "جماعي",
+            "orgy" to "جماعي",
+            "dp" to "خلفي",
+            "slut" to "شرموطة",
+            "anal" to "خلفي",
+            "milf" to "امهات",
+            "cuckold" to "ديوث",
+            "stepfamily" to "محارم",
+            "lesbian" to "سحاق",
+            "massage" to "مساج",
+            "creampie" to "قذف",
         )
 
         private val SEXTB_CONCEPT_GENRES = mapOf(
             "threesome" to "threesome--foursome",
             "foursome" to "threesome--foursome",
+            "gangbang" to "orgy",
             "orgy" to "orgy",
+            "slut" to "slut",
+            "dp" to "anal",
             "creampie" to "creampie",
             "milf" to "married-woman",
             "big tits" to "big-tits",
@@ -1342,7 +2229,6 @@ class SmartForYou :
             "lesbian" to "lesbian",
             "cuckold" to "cuckold",
             "stepfamily" to "incest",
-            "uncensored" to "ltx-encode",
             "amateur" to "amateur",
             "pov" to "pov",
             "massage" to "massage",
@@ -1363,12 +2249,13 @@ class SmartForYou :
             "69" to "69",
             "masturbation" to "masturbation",
             "public" to "outdoor",
-            "english subtitle" to "english-subtitle",
         )
 
         private val PORNHUB_CONCEPT_CATEGORIES = mapOf(
             "threesome" to "65",
             "foursome" to "65",
+            "dp" to "72",
+            "gangbang" to "80",
             "orgy" to "2",
             "creampie" to "15",
             "milf" to "29",
@@ -1401,6 +2288,90 @@ class SmartForYou :
             "facial" to "16",
             "masturbation" to "22",
             "public" to "24",
+        )
+
+        private val SUPJAV_CONCEPT_TAGS = mapOf(
+            "threesome" to "3p-4p",
+            "foursome" to "3p-4p",
+            "gangbang" to "gangbang",
+            "orgy" to "orgy",
+            "slut" to "slut",
+            "dp" to "anal",
+            "anal" to "anal",
+            "creampie" to "creampie",
+            "cuckold" to "cuckold",
+            "milf" to "mature-woman",
+            "interracial" to "black-actor",
+            "lesbian" to "lesbian",
+            "bdsm" to "bdsm",
+            "massage" to "massage",
+            "squirt" to "squirting",
+        )
+
+        private val JABLE_CONCEPT_TAGS = mapOf(
+            "threesome" to "3p",
+            "foursome" to "groupsex",
+            "gangbang" to "groupsex",
+            "orgy" to "groupsex",
+            "dp" to "anal-sex",
+            "anal" to "anal-sex",
+            "creampie" to "creampie",
+            "cuckold" to "ntr",
+            "milf" to "mature-woman",
+            "massage" to "massage",
+            "squirt" to "squirting",
+            "bdsm" to "bondage",
+        )
+
+        private val MISSAV_CONCEPT_GENRES = mapOf(
+            "threesome" to "3p-4p",
+            "foursome" to "3p-4p",
+            "gangbang" to "gangbang",
+            "orgy" to "orgy",
+            "slut" to "slut",
+            "anal" to "anal",
+            "creampie" to "creampie",
+            "cuckold" to "ntr",
+            "milf" to "mature-woman",
+            "massage" to "massage",
+            "squirt" to "squirting",
+        )
+
+        private val JAVGG_CONCEPT_GENRES = mapOf(
+            "threesome" to "3p-4p",
+            "foursome" to "3p-4p",
+            "gangbang" to "gangbang",
+            "orgy" to "orgy",
+            "slut" to "slut",
+            "anal" to "anal",
+            "creampie" to "creampie",
+            "cuckold" to "cuckold",
+            "milf" to "mature-woman",
+        )
+
+        private val JAVGURU_CONCEPT_TAGS = mapOf(
+            "threesome" to "3p-4p",
+            "foursome" to "3p-4p",
+            "gangbang" to "orgy",
+            "orgy" to "orgy",
+            "slut" to "slut",
+            "anal" to "anal",
+            "creampie" to "creampie",
+            "cuckold" to "cuckold",
+        )
+
+        private val XMOVIES_CONCEPT_CATS = mapOf(
+            "threesome" to "threesome",
+            "foursome" to "threesome",
+            "gangbang" to "gangbang",
+            "dp" to "dp",
+            "orgy" to "orgy",
+            "anal" to "anal",
+            "creampie" to "creampie",
+            "milf" to "milf",
+            "interracial" to "interracial",
+            "lesbian" to "lesbian",
+            "bdsm" to "bdsm",
         )
     }
 }

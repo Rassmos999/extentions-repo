@@ -221,10 +221,14 @@ class XMoviesForYou :
             val href = el.absUrl("href").ifBlank { el.attr("href") }.trim()
             if (href.isBlank() || !isVideoPageUrl(href)) return@mapNotNull null
             val img = el.selectFirst("img")
-            val title = el.selectFirst("h3.title, h3, h2")?.text()?.trim()?.ifBlank { null }
+            val rawTitle = el.selectFirst("h3.title, h3, h2")?.text()?.trim()?.ifBlank { null }
                 ?: img?.attr("alt")?.trim()?.ifBlank { null }
                 ?: el.attr("title").trim()
-            if (title.isBlank()) return@mapNotNull null
+            if (rawTitle.isBlank()) return@mapNotNull null
+            val duration = el.selectFirst("span.duration, div.duration, span.time, time, span[class*=bottom-]")
+                ?.text()?.trim()
+                ?.takeIf { ":" in it || "min" in it.lowercase(Locale.ROOT) }
+            val title = if (!duration.isNullOrBlank() && !rawTitle.contains(duration)) "[$duration] $rawTitle" else rawTitle
             SAnime.create().apply {
                 setUrlWithoutDomain(href)
                 this.title = title
