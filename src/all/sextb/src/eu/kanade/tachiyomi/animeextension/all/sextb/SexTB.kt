@@ -140,11 +140,25 @@ class SexTB :
         val error = AtomicReference<Throwable?>(null)
     }
 
-    private val inFlightGets = ConcurrentHashMap<String, InFlightGet>()
+    private class InFlightSearch {
+        val latch = CountDownLatch(1)
+        val result = AtomicReference<AnimesPage?>(null)
+        val error = AtomicReference<Throwable?>(null)
+    }
 
-    // Dynamic in-memory caches so rotated SexTB hashes auto-heal without stale constants.
-    private val resolvedCatalogPaths = ConcurrentHashMap<String, String>()
-    private val resolvedActressPaths = ConcurrentHashMap<String, String>()
+    private val inFlightGets = ConcurrentHashMap<String, InFlightGet>()
+    private val inFlightSearches = ConcurrentHashMap<String, InFlightSearch>()
+
+    // Tracks URLs already returned per active search query across pages to prevent duplicate cards.
+    private val seenSearchUrls = ConcurrentHashMap<String, MutableSet<String>>()
+
+    // Persistent + in-memory caches so rotated SexTB hashes and actress paths survive app restarts.
+    private val resolvedCatalogPaths: ConcurrentHashMap<String, String> by lazy {
+        loadPersistedPathMap(PREF_CATALOG_PATH_CACHE_KEY)
+    }
+    private val resolvedActressPaths: ConcurrentHashMap<String, String> by lazy {
+        loadPersistedPathMap(PREF_ACTRESS_PATH_CACHE_KEY)
+    }
     private val pageCache = ConcurrentHashMap<String, Pair<Long, AnimesPage>>()
     private val videoPageCache = ConcurrentHashMap<String, Pair<Long, String>>()
     private val topChartPathCache = ConcurrentHashMap<String, Pair<Long, String>>()
@@ -282,36 +296,91 @@ class SexTB :
         return GET(url, headers)
     }
 
+    private fun normalizeSearchCacheKey(query: String): String = query
+        .lowercase(Locale.ROOT)
+        .replace(SEARCH_KEY_NOISE_REGEX, " ")
+        .trim()
+        .ifBlank { query.trim().lowercase(Locale.ROOT) }
+
+    private fun deduplicateSearchPage(normQuery: String, page: Int, rawPage: AnimesPage): AnimesPage {
+        if (page <= 1) {
+            if (seenSearchUrls.size > 40) seenSearchUrls.clear()
+            val freshSet = java.util.Collections.synchronizedSet(HashSet<String>())
+            val unique = rawPage.animes.filter { freshSet.add(it.url.lowercase(Locale.ROOT)) }
+            seenSearchUrls[normQuery] = freshSet
+            return AnimesPage(unique, rawPage.hasNextPage && unique.isNotEmpty())
+        }
+        val seen = seenSearchUrls.computeIfAbsent(normQuery) {
+            java.util.Collections.synchronizedSet(HashSet())
+        }
+        val unique = rawPage.animes.filter { seen.add(it.url.lowercase(Locale.ROOT)) }
+        return AnimesPage(unique, rawPage.hasNextPage && unique.isNotEmpty())
+    }
+
     private fun searchByMovieQuery(page: Int, query: String): AnimesPage {
-        val normalizedKey = "ajax-search:${query.lowercase(Locale.ROOT)}:$page"
+        val normQuery = normalizeSearchCacheKey(query)
+        val cacheKey = "ajax-search:$normQuery:$page"
         val now = System.currentTimeMillis()
-        pageCache[normalizedKey]?.takeIf { (ts, cachedPage) ->
+        pageCache[cacheKey]?.takeIf { (ts, cachedPage) ->
             val ttl = if (cachedPage.animes.isEmpty()) EMPTY_PAGE_CACHE_TTL_MS else PAGE_CACHE_TTL_MS
             now - ts < ttl
-        }?.let { return it.second }
+        }?.let { return deduplicateSearchPage(normQuery, page, it.second) }
 
-        // Prefer SexTB's lightweight JSON /ajax/search endpoint (~30KB, much higher rate limit
-        // than HTML /search/<slug> which is capped at ~4 req/min with a 60s window).
-        val ajaxResult = try {
-            searchViaAjaxMovies(query, page)
-        } catch (e: CloudflareBlockedException) {
-            throw e
-        } catch (e: Throwable) {
-            Log.w(TAG, "/ajax/search failed for '$query': ${e.message}")
-            null
-        }
-        if (ajaxResult != null) {
-            if (pageCache.size > 80) pageCache.clear()
-            pageCache[normalizedKey] = System.currentTimeMillis() to ajaxResult
-            return ajaxResult
+        // Single-flight coalescing on normalized query+page so identical/near-identical
+        // concurrent searches never fire duplicate network calls.
+        val newHolder = InFlightSearch()
+        val existing = inFlightSearches.putIfAbsent(cacheKey, newHolder)
+        if (existing != null) {
+            try {
+                if (!existing.latch.await(SINGLE_FLIGHT_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                    throw IOException("SexTB timed out waiting for coalesced search '$query'")
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IOException("SexTB search interrupted for '$query'", e)
+            }
+            existing.result.get()?.let { return deduplicateSearchPage(normQuery, page, it) }
+            val err = existing.error.get()
+            if (err is IOException) throw err
+            throw IOException(err?.message ?: "SexTB coalesced search failed for '$query'", err)
         }
 
-        // Fallback to HTML /search/<slug> only if /ajax/search itself failed.
-        val primaryReq = buildMovieSearchRequest(page, query)
-        return try {
-            executeCachedListing(primaryReq, highPriority = false, bucket = RateBucket.SEARCH)
-        } catch (e: HttpStatusException) {
-            if (e.code == 404) AnimesPage(emptyList(), false) else throw e
+        try {
+            // Prefer SexTB's lightweight JSON /ajax/search endpoint (~30KB, much higher rate limit
+            // than HTML /search/<slug> which is capped at ~4 req/min with a 60s window).
+            val ajaxResult = try {
+                searchViaAjaxMovies(query, page)
+            } catch (e: CloudflareBlockedException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.w(TAG, "/ajax/search failed for '$query': ${e.message}")
+                null
+            }
+
+            val rawPage = if (ajaxResult != null) {
+                ajaxResult
+            } else if (query.length <= 70) {
+                // Fallback to HTML /search/<slug> only for concise queries when /ajax/search failed.
+                val primaryReq = buildMovieSearchRequest(page, query)
+                try {
+                    executeCachedListing(primaryReq, highPriority = false, bucket = RateBucket.SEARCH)
+                } catch (e: HttpStatusException) {
+                    if (e.code == 404) AnimesPage(emptyList(), false) else throw e
+                }
+            } else {
+                AnimesPage(emptyList(), false)
+            }
+
+            if (pageCache.size > 100) pageCache.clear()
+            pageCache[cacheKey] = System.currentTimeMillis() to rawPage
+            newHolder.result.set(rawPage)
+            return deduplicateSearchPage(normQuery, page, rawPage)
+        } catch (t: Throwable) {
+            newHolder.error.set(t)
+            throw t
+        } finally {
+            newHolder.latch.countDown()
+            inFlightSearches.remove(cacheKey, newHolder)
         }
     }
 
@@ -334,7 +403,7 @@ class SexTB :
         val animes = buildList {
             for (i in 0 until hits.length()) {
                 val obj = hits.optJSONObject(i) ?: continue
-                val code = obj.optString("code").trim()
+                val code = obj.optString("code").trim().lowercase(Locale.ROOT)
                 if (code.isBlank()) continue
                 val rawName = Jsoup.parse(obj.optString("name")).text().trim()
                 val runtime = obj.optString("runtimes").trim()
@@ -363,7 +432,7 @@ class SexTB :
                     },
                 )
             }
-        }
+        }.distinctBy { it.url.lowercase(Locale.ROOT) }
         val totalPages = json.optInt("totalPages", 1)
         val hasNext = animes.isNotEmpty() && curPage < totalPages
         Log.i(TAG, "AjaxSearch q='$query' p=$curPage/$totalPages count=${animes.size} viaWeb=${resp.viaWebView}")
@@ -425,8 +494,11 @@ class SexTB :
             if (slug.isBlank()) null else "/actress/$slug"
         }
         if (resolved != null) {
-            if (resolvedActressPaths.size > 100) resolvedActressPaths.clear()
-            resolvedActressPaths[key] = resolved
+            if (resolvedActressPaths.size >= MAX_PERSISTED_ACTRESS_PATHS) resolvedActressPaths.clear()
+            val prev = resolvedActressPaths.put(key, resolved)
+            if (prev != resolved) {
+                persistPathMap(PREF_ACTRESS_PATH_CACHE_KEY, resolvedActressPaths)
+            }
         }
         return resolved
     }
@@ -768,13 +840,23 @@ class SexTB :
         }
         if (cached != null) return cached.second
 
-        val siteResp = executeSiteGet(request, highPriority = highPriority, bucket = bucket)
+        val siteResp = try {
+            executeSiteGet(request, highPriority = highPriority, bucket = bucket)
+        } catch (e: HttpStatusException) {
+            // Self-heal if a persisted hashed catalog path rotated and returned HTTP 404.
+            val healedReq = if (e.code == 404) evictStaleHashedPath(request) else null
+            if (healedReq != null) {
+                executeSiteGet(healedReq, highPriority = highPriority, bucket = bucket)
+            } else {
+                throw e
+            }
+        }
         rememberCatalogPathFromUrl(siteResp.finalUrl)
         val doc = Jsoup.parse(siteResp.body, siteResp.finalUrl)
         harvestHashedCatalogLinks(doc)
         val result = parseListingDocument(doc, cardMode)
         Log.i(TAG, "Listing parsed url=${siteResp.finalUrl} mode=$cardMode count=${result.animes.size} hasNext=${result.hasNextPage} viaWeb=${siteResp.viaWebView}")
-        if (pageCache.size > 80) pageCache.clear()
+        if (pageCache.size > 100) pageCache.clear()
         pageCache[key] = System.currentTimeMillis() to result
         return result
     }
@@ -1147,10 +1229,20 @@ class SexTB :
             return batch.distinctBy { it.url }.sortedBy { serverPriority(it.label) }
         }
 
-        // Resolve top 2 prioritized servers first (cuts /ajax/player calls in half & speeds up Play);
-        // only fall back to remaining servers if the first wave yields no playable stream.
-        val firstWaveButtons = playerButtons.take(INITIAL_SERVERS_TO_RESOLVE)
-        val fallbackButtons = playerButtons.drop(INITIAL_SERVERS_TO_RESOLVE)
+        // If the user pinned a specific preferred server and it's available first, resolve
+        // ONLY that 1 server in wave 1 (1 /ajax/player POST instead of 2-4); fall back to
+        // remaining servers automatically if it fails.
+        val prefServer = preferredServer()
+        val firstWaveCount = if (
+            prefServer != PREF_SERVER_DEFAULT &&
+            playerButtons.firstOrNull()?.let { normalizeServerLabel(it.text()).contains(prefServer, ignoreCase = true) } == true
+        ) {
+            1
+        } else {
+            INITIAL_SERVERS_TO_RESOLVE
+        }
+        val firstWaveButtons = playerButtons.take(firstWaveCount)
+        val fallbackButtons = playerButtons.drop(firstWaveCount)
 
         var prioritizedPlayers = resolveBatch(firstWaveButtons)
         var rawVideos = if (prioritizedPlayers.isNotEmpty()) {
@@ -2020,20 +2112,65 @@ class SexTB :
         rememberCatalogPathFromUrl(request.url.toString())
     }
 
-    private fun harvestHashedCatalogLinks(document: Document) {
-        if (resolvedCatalogPaths.size > 200) return
-        document.select("a[href^=\"/jav-\"], a[href^=\"/genre/\"], a[href^=\"/studio/\"]").forEach { link ->
-            val href = link.attr("href").trim()
-            if (href.startsWith("/")) {
-                rememberCatalogPathFromUrl("$baseUrl$href")
+    private fun loadPersistedPathMap(prefKey: String): ConcurrentHashMap<String, String> {
+        val map = ConcurrentHashMap<String, String>()
+        runCatching {
+            val raw = preferences.getString(prefKey, null)?.takeIf(String::isNotBlank) ?: return@runCatching
+            val json = JSONObject(raw)
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = json.optString(k).trim()
+                if (k.startsWith("/") || prefKey == PREF_ACTRESS_PATH_CACHE_KEY) {
+                    if (v.startsWith("/")) map[k] = v
+                }
             }
+        }
+        return map
+    }
+
+    private fun persistPathMap(prefKey: String, map: ConcurrentHashMap<String, String>) {
+        runCatching {
+            val json = JSONObject()
+            for ((k, v) in map) {
+                json.put(k, v)
+            }
+            preferences.edit().putString(prefKey, json.toString()).apply()
         }
     }
 
-    private fun rememberCatalogPathFromUrl(url: String) {
+    private fun evictStaleHashedPath(request: Request): Request? {
+        val encodedPath = request.url.encodedPath
+        val basePart = encodedPath.substringBefore("/pg-").trimEnd('/')
+        val pageSuffix = if ("/pg-" in encodedPath) "/pg-${encodedPath.substringAfter("/pg-")}" else ""
+        val matchingEntry = resolvedCatalogPaths.entries.firstOrNull { it.value == basePart } ?: return null
+        resolvedCatalogPaths.remove(matchingEntry.key, matchingEntry.value)
+        persistPathMap(PREF_CATALOG_PATH_CACHE_KEY, resolvedCatalogPaths)
+        val rebuiltUrl = request.url.newBuilder()
+            .encodedPath(matchingEntry.key + pageSuffix)
+            .build()
+        Log.i(TAG, "Evicted stale hashed path ${matchingEntry.value}; retrying with ${matchingEntry.key}")
+        return request.newBuilder().url(rebuiltUrl).build()
+    }
+
+    private fun harvestHashedCatalogLinks(document: Document) {
+        if (resolvedCatalogPaths.size >= MAX_PERSISTED_CATALOG_PATHS) return
+        var dirty = false
+        document.select("a[href^=\"/jav-\"], a[href^=\"/genre/\"], a[href^=\"/studio/\"]").forEach { link ->
+            val href = link.attr("href").trim()
+            if (href.startsWith("/") && rememberCatalogPathFromUrl("$baseUrl$href", persist = false)) {
+                dirty = true
+            }
+        }
+        if (dirty) {
+            persistPathMap(PREF_CATALOG_PATH_CACHE_KEY, resolvedCatalogPaths)
+        }
+    }
+
+    private fun rememberCatalogPathFromUrl(url: String, persist: Boolean = true): Boolean {
         val resolvedPath = url.toHttpUrlOrNull()?.encodedPath?.substringBefore("/pg-")?.trimEnd('/')
-            ?: return
-        if (resolvedPath.isBlank()) return
+            ?: return false
+        if (resolvedPath.isBlank()) return false
         val stablePath = when {
             resolvedPath.startsWith("/jav-censored-") -> "/jav-censored"
 
@@ -2046,18 +2183,26 @@ class SexTB :
             resolvedPath.startsWith("/genre/") -> {
                 val tail = resolvedPath.removePrefix("/genre/")
                 val baseSlug = tail.replace(TRAILING_HASH_REGEX, "")
-                if (baseSlug != tail) "/genre/$baseSlug" else return
+                if (baseSlug != tail) "/genre/$baseSlug" else return false
             }
 
             resolvedPath.startsWith("/studio/") -> {
                 val tail = resolvedPath.removePrefix("/studio/")
                 val baseSlug = tail.replace(TRAILING_HASH_REGEX, "")
-                if (baseSlug != tail) "/studio/$baseSlug" else return
+                if (baseSlug != tail) "/studio/$baseSlug" else return false
             }
 
-            else -> return
+            else -> return false
         }
-        resolvedCatalogPaths[stablePath] = resolvedPath
+        if (resolvedCatalogPaths.size >= MAX_PERSISTED_CATALOG_PATHS && !resolvedCatalogPaths.containsKey(stablePath)) {
+            return false
+        }
+        val prev = resolvedCatalogPaths.put(stablePath, resolvedPath)
+        val changed = prev != resolvedPath
+        if (changed && persist) {
+            persistPathMap(PREF_CATALOG_PATH_CACHE_KEY, resolvedCatalogPaths)
+        }
+        return changed
     }
 
     private fun Response.throwIfCloudflareChallenge() {
@@ -2197,10 +2342,14 @@ class SexTB :
         private const val MAX_EXTRACTION_WAIT_MS = 10_000L
         private const val EXTRA_WAIT_AFTER_FIRST_MS = 1_800L
         private const val PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
-        private const val EMPTY_PAGE_CACHE_TTL_MS = 45 * 1000L
+        private const val EMPTY_PAGE_CACHE_TTL_MS = 3 * 60 * 1000L
         private const val VIDEO_CACHE_TTL_MS = 3 * 60 * 1000L
         private const val TOP_CHART_CACHE_TTL_MS = 10 * 60 * 1000L
         private const val WEB_BRIDGE_TTL_MS = 15 * 60 * 1000L
+        private const val MAX_PERSISTED_CATALOG_PATHS = 250
+        private const val MAX_PERSISTED_ACTRESS_PATHS = 120
+        private const val PREF_CATALOG_PATH_CACHE_KEY = "cache_catalog_paths_v1"
+        private const val PREF_ACTRESS_PATH_CACHE_KEY = "cache_actress_paths_v1"
         private const val LISTING_REQUEST_GAP_MS = 220L
         private const val LISTING_COOLDOWN_GAP_MS = 1_200L
         private const val PLAYER_REQUEST_GAP_MS = 250L
@@ -2279,6 +2428,7 @@ class SexTB :
         private val UPN_HEX_REGEX = Regex("""[0-9a-fA-F]+""")
         private val BRACKET_TAG_REGEX = Regex("""\[[^\]]+\]""")
         private val NON_SLUG_REGEX = Regex("""[^a-z0-9-]+""")
+        private val SEARCH_KEY_NOISE_REGEX = Regex("""[\s\-_:/\[\]().,!?]+""")
         private val WHITESPACE_REGEX = Regex("""\s+""")
         private val MULTI_SPACE_REGEX = Regex("""\s+""")
         private val MULTI_DASH_REGEX = Regex("""-+""")
