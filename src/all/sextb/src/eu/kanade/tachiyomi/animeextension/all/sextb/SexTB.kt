@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.all.sextb
 
 import android.util.Base64
+import android.util.Log
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -99,6 +100,11 @@ class SexTB :
     private val voeExtractor by lazy { VoeExtractor(fastExtractorClient, headers) }
     private val uqloadExtractor by lazy { UqloadExtractor(fastExtractorClient) }
     private val m3u8Server by lazy { M3u8ServerManager(streamProxyClient) }
+    private val webBridge by lazy { SexTbWebBridge(baseUrl) }
+
+    // Switch to same-origin WebView fetch when OkHttp hits Cloudflare JA4 fingerprint mismatch.
+    @Volatile
+    private var webBridgeUntilMs: Long = 0L
 
     // Dynamic in-memory caches so rotated SexTB hashes auto-heal without stale constants.
     private val resolvedCatalogPaths = ConcurrentHashMap<String, String>()
@@ -110,11 +116,12 @@ class SexTB :
     private fun isSeekCacheEnabled(): Boolean = preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)
     private fun preferredServer(): String = preferences.getString(PREF_SERVER_KEY, PREF_SERVER_DEFAULT) ?: PREF_SERVER_DEFAULT
     private fun preferredQuality(): String = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) ?: PREF_QUALITY_DEFAULT
+    private fun defaultCategoryPath(): String = preferences.getString(PREF_DEFAULT_CATEGORY_KEY, DEFAULT_CATEGORY) ?: DEFAULT_CATEGORY
 
     // ============================== Popular ===============================
     override fun popularAnimeRequest(page: Int): Request = catalogRequest(
         page = page,
-        categoryPath = DEFAULT_CATEGORY,
+        categoryPath = defaultCategoryPath(),
         sort = "viewed",
     )
 
@@ -173,7 +180,7 @@ class SexTB :
     // =============================== Latest ===============================
     override fun latestUpdatesRequest(page: Int): Request = catalogRequest(
         page = page,
-        categoryPath = DEFAULT_CATEGORY,
+        categoryPath = defaultCategoryPath(),
         sort = "desc",
     )
 
@@ -208,7 +215,7 @@ class SexTB :
 
         val targets = buildFilterTargets(page, filters)
         if (targets.size <= 1) {
-            val target = targets.firstOrNull() ?: FilterTarget.Catalog(catalogRequest(page, DEFAULT_CATEGORY))
+            val target = targets.firstOrNull() ?: FilterTarget.Catalog(catalogRequest(page, defaultCategoryPath()))
             return@withContext executeFilterTarget(target)
         }
 
@@ -232,7 +239,7 @@ class SexTB :
             return buildMovieSearchRequest(page, cleanQuery)
         }
         val first = buildFilterTargets(page, filters).firstOrNull()
-        return (first as? FilterTarget.Catalog)?.request ?: catalogRequest(page, DEFAULT_CATEGORY)
+        return (first as? FilterTarget.Catalog)?.request ?: catalogRequest(page, defaultCategoryPath())
     }
 
     private fun buildMovieSearchRequest(page: Int, query: String): Request {
@@ -258,54 +265,49 @@ class SexTB :
     }
 
     private fun searchViaAjaxMovies(query: String, page: Int): AnimesPage {
-        val form = FormBody.Builder()
-            .add("q", query)
-            .add("page", page.coerceAtLeast(1).toString())
-            .add("type", "movie")
-            .build()
-        val ajaxHeaders = headers.newBuilder()
-            .set("Referer", "$baseUrl/")
-            .set("Origin", baseUrl)
-            .set("X-Requested-With", "XMLHttpRequest")
-            .set("Accept", "application/json, text/javascript, */*; q=0.01")
-            .build()
-        return client.newCall(POST("$baseUrl/ajax/search", ajaxHeaders, form)).execute().use { resp ->
-            resp.throwIfCloudflareChallenge()
-            if (!resp.isSuccessful) return AnimesPage(emptyList(), false)
-            val json = JSONObject(resp.body.string())
-            val hits = json.optJSONArray("hits") ?: return AnimesPage(emptyList(), false)
-            val animes = buildList {
-                for (i in 0 until hits.length()) {
-                    val obj = hits.optJSONObject(i) ?: continue
-                    val code = obj.optString("code").trim()
-                    if (code.isBlank()) continue
-                    val rawName = Jsoup.parse(obj.optString("name")).text().trim()
-                    val runtime = obj.optString("runtimes").trim()
-                    val isLtx = obj.optBoolean("ltx", false)
-                    val poster = obj.optString("poster").trim()
-                    add(
-                        SAnime.create().apply {
-                            setUrlWithoutDomain("/$code")
-                            title = buildString {
-                                val upper = code.uppercase(Locale.ROOT)
-                                if (!rawName.contains(upper, ignoreCase = true)) {
-                                    append("[").append(upper).append("] ")
-                                }
-                                if (isLtx && !rawName.contains("LTX", ignoreCase = true)) {
-                                    append("[LTX] ")
-                                }
-                                append(rawName.ifBlank { upper })
-                                if (runtime.isNotBlank() && runtime != "0") {
-                                    append(" [").append(runtime).append(" min]")
-                                }
-                            }.trim()
-                            thumbnail_url = normalizeUrl(poster)
-                        },
-                    )
-                }
+        val resp = executeSitePost(
+            url = "$baseUrl/ajax/search",
+            formParams = listOf(
+                "q" to query,
+                "page" to page.coerceAtLeast(1).toString(),
+                "type" to "movie",
+            ),
+            referer = "$baseUrl/",
+        )
+        if (resp.status !in 200..299) return AnimesPage(emptyList(), false)
+        val json = JSONObject(resp.body)
+        val hits = json.optJSONArray("hits") ?: return AnimesPage(emptyList(), false)
+        val animes = buildList {
+            for (i in 0 until hits.length()) {
+                val obj = hits.optJSONObject(i) ?: continue
+                val code = obj.optString("code").trim()
+                if (code.isBlank()) continue
+                val rawName = Jsoup.parse(obj.optString("name")).text().trim()
+                val runtime = obj.optString("runtimes").trim()
+                val isLtx = obj.optBoolean("ltx", false)
+                val poster = obj.optString("poster").trim()
+                add(
+                    SAnime.create().apply {
+                        setUrlWithoutDomain("/$code")
+                        title = buildString {
+                            val upper = code.uppercase(Locale.ROOT)
+                            if (!rawName.contains(upper, ignoreCase = true)) {
+                                append("[").append(upper).append("] ")
+                            }
+                            if (isLtx && !rawName.contains("LTX", ignoreCase = true)) {
+                                append("[LTX] ")
+                            }
+                            append(rawName.ifBlank { upper })
+                            if (runtime.isNotBlank() && runtime != "0") {
+                                append(" [").append(runtime).append(" min]")
+                            }
+                        }.trim()
+                        thumbnail_url = normalizeUrl(poster)
+                    },
+                )
             }
-            AnimesPage(animes, false)
         }
+        return AnimesPage(animes, false)
     }
 
     private fun searchByActressQuery(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
@@ -347,34 +349,30 @@ class SexTB :
 
         // First query SexTB's live actor search endpoint to get exact (possibly hashed) actress URL.
         val ajaxPath = runCatching {
-            val form = FormBody.Builder()
-                .add("q", nameQuery.trim())
-                .add("page", "1")
-                .add("type", "actor")
-                .build()
-            val ajaxHeaders = headers.newBuilder()
-                .set("Referer", "$baseUrl/")
-                .set("Origin", baseUrl)
-                .set("X-Requested-With", "XMLHttpRequest")
-                .set("Accept", "application/json, text/javascript, */*; q=0.01")
-                .build()
-            fastExtractorClient.newCall(POST("$baseUrl/ajax/search", ajaxHeaders, form)).execute().use { resp ->
-                if (!resp.isSuccessful) return@use null
-                val json = JSONObject(resp.body.string())
-                val hits = json.optJSONArray("hits") ?: return@use null
-                var firstUrl: String? = null
-                for (i in 0 until hits.length()) {
-                    val item = hits.optJSONObject(i) ?: continue
-                    val u = item.optString("url").trim()
-                    if (!u.startsWith("/actress/")) continue
-                    if (firstUrl == null) firstUrl = u
-                    val hitName = item.optString("name").trim()
-                    if (hitName.equals(nameQuery.trim(), ignoreCase = true)) {
-                        return@use u
-                    }
+            val resp = executeSitePost(
+                url = "$baseUrl/ajax/search",
+                formParams = listOf(
+                    "q" to nameQuery.trim(),
+                    "page" to "1",
+                    "type" to "actor",
+                ),
+                referer = "$baseUrl/",
+            )
+            if (resp.status !in 200..299) return@runCatching null
+            val json = JSONObject(resp.body)
+            val hits = json.optJSONArray("hits") ?: return@runCatching null
+            var firstUrl: String? = null
+            for (i in 0 until hits.length()) {
+                val item = hits.optJSONObject(i) ?: continue
+                val u = item.optString("url").trim()
+                if (!u.startsWith("/actress/")) continue
+                if (firstUrl == null) firstUrl = u
+                val hitName = item.optString("name").trim()
+                if (hitName.equals(nameQuery.trim(), ignoreCase = true)) {
+                    return@runCatching u
                 }
-                firstUrl
             }
+            firstUrl
         }.getOrNull()
 
         val resolved = ajaxPath ?: run {
@@ -522,7 +520,7 @@ class SexTB :
             FilterTarget.Catalog(
                 catalogRequest(
                     page = page,
-                    categoryPath = DEFAULT_CATEGORY,
+                    categoryPath = defaultCategoryPath(),
                     genre = params.genreParam,
                     studio = params.studioParam,
                     quality = params.quality,
@@ -545,12 +543,8 @@ class SexTB :
         }?.second
 
         val chartPath = cachedChartPath ?: run {
-            val topDoc = client.newCall(GET("$baseUrl/top", headers)).execute().use { resp ->
-                resp.throwIfCloudflareChallenge()
-                val html = resp.body.string()
-                if (html.isCloudflareChallengeHtml()) throw CloudflareBlockedException()
-                Jsoup.parse(html, resp.request.url.toString())
-            }
+            val siteResp = executeSiteGet(GET("$baseUrl/top", headers))
+            val topDoc = Jsoup.parse(siteResp.body, siteResp.finalUrl)
             val prefix = if (kind == "month") "/top/month/" else "/top/week/"
             topDoc.selectFirst("a[href^=\"$prefix\"]")?.attr("href")?.trim()?.also { found ->
                 topChartPathCache[kind] = System.currentTimeMillis() to found
@@ -565,7 +559,10 @@ class SexTB :
         val cached = pageCache[key]?.takeIf { System.currentTimeMillis() - it.first < PAGE_CACHE_TTL_MS }
         if (cached != null) return cached.second
 
-        val result = client.newCall(request).execute().use(::popularAnimeParse)
+        val siteResp = executeSiteGet(request)
+        rememberCatalogPathFromUrl(siteResp.finalUrl)
+        val result = parseListingDocument(Jsoup.parse(siteResp.body, siteResp.finalUrl))
+        Log.i(TAG, "Listing parsed url=${siteResp.finalUrl} count=${result.animes.size} hasNext=${result.hasNextPage} viaWeb=${siteResp.viaWebView}")
         if (result.animes.isNotEmpty()) {
             if (pageCache.size > 40) pageCache.clear()
             pageCache[key] = System.currentTimeMillis() to result
@@ -832,13 +829,9 @@ class SexTB :
     }
 
     private fun fetchAndCacheVideoPage(request: Request, urlKey: String): String {
-        client.newCall(request).execute().use { response ->
-            response.throwIfCloudflareChallenge()
-            val html = response.body.string()
-            if (html.isCloudflareChallengeHtml()) throw CloudflareBlockedException()
-            cacheVideoPage(urlKey, html)
-            return html
-        }
+        val siteResp = executeSiteGet(request)
+        cacheVideoPage(urlKey, siteResp.body)
+        return siteResp.body
     }
 
     private fun cacheVideoPage(urlKey: String, html: String) {
@@ -925,6 +918,7 @@ class SexTB :
         }
 
         val sortedVideos = sortVideos(finalVideos)
+        Log.i(TAG, "VideoList RESOLVED targets=${prioritizedPlayers.size} raw=${rawVideos.size} final=${sortedVideos.size} qualities=${sortedVideos.map { it.quality }}")
         if (sortedVideos.isEmpty()) {
             throw IOException("SexTB servers were found, but none returned a playable stream. Retry or open the video in WebView.")
         }
@@ -1333,45 +1327,183 @@ class SexTB :
         filmId: String,
         token: String,
         referer: String,
-    ): PlayerPayload? {
-        val form = FormBody.Builder()
-            .add("episode", episodeId)
-            .add("filmId", filmId)
-            .add("pt", token)
-            .add("ts", "")
-            .build()
-        val ajaxHeaders = headers.newBuilder()
-            .set("Referer", referer)
-            .set("Origin", baseUrl)
-            .set("X-Requested-With", "XMLHttpRequest")
-            .set("Accept", "application/json, text/javascript, */*; q=0.01")
-            .build()
-
-        return try {
-            fastExtractorClient.newCall(POST("$baseUrl/ajax/player", ajaxHeaders, form)).execute().use { ajaxResponse ->
-                ajaxResponse.throwIfCloudflareChallenge()
-                val json = JSONObject(ajaxResponse.body.string())
-                val code = json.optString("code")
-                if (code.equals("E_HUMAN", ignoreCase = true)) {
-                    return PlayerPayload(
-                        encryptedPlayer = "",
-                        nextToken = json.optString("next_pt"),
-                        nextKey = json.optString("next_pk"),
-                        humanCheckRequired = true,
-                    )
-                }
-                if (json.optBoolean("error", false)) return null
+    ): PlayerPayload? = try {
+        val resp = executeSitePost(
+            url = "$baseUrl/ajax/player",
+            formParams = listOf(
+                "episode" to episodeId,
+                "filmId" to filmId,
+                "pt" to token,
+                "ts" to "",
+            ),
+            referer = referer,
+        )
+        if (resp.status !in 200..299) {
+            null
+        } else {
+            val json = JSONObject(resp.body)
+            val code = json.optString("code")
+            if (code.equals("E_HUMAN", ignoreCase = true)) {
+                PlayerPayload(
+                    encryptedPlayer = "",
+                    nextToken = json.optString("next_pt"),
+                    nextKey = json.optString("next_pk"),
+                    humanCheckRequired = true,
+                )
+            } else if (json.optBoolean("error", false)) {
+                null
+            } else {
                 PlayerPayload(
                     encryptedPlayer = json.optString("player_enc"),
                     nextToken = json.optString("next_pt"),
                     nextKey = json.optString("next_pk"),
                 ).takeIf { it.encryptedPlayer.isNotBlank() }
             }
-        } catch (e: CloudflareBlockedException) {
-            throw e
-        } catch (_: Exception) {
-            null
         }
+    } catch (e: CloudflareBlockedException) {
+        throw e
+    } catch (e: Exception) {
+        Log.e(TAG, "fetchPlayerPayload failed for ep=$episodeId: ${e.message}")
+        null
+    }
+
+    private fun shouldUseWebBridge(): Boolean = System.currentTimeMillis() < webBridgeUntilMs
+
+    private fun isCloudflareThrowable(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            val name = cur.javaClass.name
+            val msg = cur.message.orEmpty()
+            if (cur is CloudflareBlockedException ||
+                name.contains("Cloudflare", ignoreCase = true) ||
+                msg.contains("Cloudflare", ignoreCase = true)
+            ) {
+                return true
+            }
+            cur = cur.cause
+        }
+        return false
+    }
+
+    private fun executeSiteGet(request: Request): SiteResponse {
+        val url = request.url.toString()
+        if (!shouldUseWebBridge()) {
+            try {
+                client.newCall(request).execute().use { resp ->
+                    resp.throwIfCloudflareChallenge()
+                    val finalUrl = resp.request.url.toString()
+                    val body = resp.body.string()
+                    if (body.isCloudflareChallengeHtml()) throw CloudflareBlockedException()
+                    if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
+                    return SiteResponse(resp.code, finalUrl, body, viaWebView = false)
+                }
+            } catch (t: Throwable) {
+                if (!isCloudflareThrowable(t)) throw t
+                if (!webBridge.hasClearanceCookie()) {
+                    Log.w(TAG, "Cloudflare blocked $url and no cf_clearance cookie exists in WebView.")
+                    throw CloudflareBlockedException()
+                }
+                Log.i(TAG, "OkHttp hit Cloudflare fingerprint mismatch on $url; switching to WebView session bridge.")
+                webBridgeUntilMs = System.currentTimeMillis() + WEB_BRIDGE_TTL_MS
+            }
+        }
+
+        var webResp = webBridge.fetch(
+            url = url,
+            method = "GET",
+            extraHeaders = mapOf(
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            ),
+        )
+        if (webResp.status == 429) {
+            runCatching { Thread.sleep(RATE_LIMIT_BACKOFF_MS) }
+            webResp = webBridge.fetch(
+                url = url,
+                method = "GET",
+                extraHeaders = mapOf(
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                ),
+            )
+        }
+        if (webResp.status == 429) {
+            throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
+        }
+        if (webResp.status in CLOUDFLARE_ERROR_CODES || webResp.body.isCloudflareChallengeHtml()) {
+            webBridgeUntilMs = 0L
+            Log.w(TAG, "WebView session bridge received Cloudflare challenge (${webResp.status}) for $url.")
+            throw CloudflareBlockedException()
+        }
+        if (webResp.status !in 200..299) {
+            throw IOException("HTTP ${webResp.status} for $url")
+        }
+        return SiteResponse(webResp.status, webResp.finalUrl, webResp.body, viaWebView = true)
+    }
+
+    private fun executeSitePost(
+        url: String,
+        formParams: List<Pair<String, String>>,
+        referer: String,
+    ): SiteResponse {
+        if (!shouldUseWebBridge()) {
+            val form = FormBody.Builder().apply {
+                formParams.forEach { (k, v) -> add(k, v) }
+            }.build()
+            val ajaxHeaders = headers.newBuilder()
+                .set("Referer", referer)
+                .set("Origin", baseUrl)
+                .set("X-Requested-With", "XMLHttpRequest")
+                .set("Accept", "application/json, text/javascript, */*; q=0.01")
+                .build()
+            try {
+                fastExtractorClient.newCall(POST(url, ajaxHeaders, form)).execute().use { resp ->
+                    resp.throwIfCloudflareChallenge()
+                    val finalUrl = resp.request.url.toString()
+                    val body = resp.body.string()
+                    if (body.isCloudflareChallengeHtml()) throw CloudflareBlockedException()
+                    return SiteResponse(resp.code, finalUrl, body, viaWebView = false)
+                }
+            } catch (t: Throwable) {
+                if (!isCloudflareThrowable(t)) throw t
+                if (!webBridge.hasClearanceCookie()) throw CloudflareBlockedException()
+                Log.i(TAG, "OkHttp POST hit Cloudflare mismatch on $url; switching to WebView session bridge.")
+                webBridgeUntilMs = System.currentTimeMillis() + WEB_BRIDGE_TTL_MS
+            }
+        }
+
+        val encodedForm = formParams.joinToString("&") { (k, v) ->
+            "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
+        }
+        var webResp = webBridge.fetch(
+            url = url,
+            method = "POST",
+            formBody = encodedForm,
+            extraHeaders = mapOf(
+                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With" to "XMLHttpRequest",
+                "Accept" to "application/json, text/javascript, */*; q=0.01",
+            ),
+        )
+        if (webResp.status == 429) {
+            runCatching { Thread.sleep(RATE_LIMIT_BACKOFF_MS) }
+            webResp = webBridge.fetch(
+                url = url,
+                method = "POST",
+                formBody = encodedForm,
+                extraHeaders = mapOf(
+                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Accept" to "application/json, text/javascript, */*; q=0.01",
+                ),
+            )
+        }
+        if (webResp.status == 429) {
+            throw IOException("SexTB rate limit (HTTP 429). Wait a moment and retry.")
+        }
+        if (webResp.status in CLOUDFLARE_ERROR_CODES || webResp.body.isCloudflareChallengeHtml()) {
+            webBridgeUntilMs = 0L
+            throw CloudflareBlockedException()
+        }
+        return SiteResponse(webResp.status, webResp.finalUrl, webResp.body, viaWebView = true)
     }
 
     private fun xorDecrypt(encoded: String, key: String): String {
@@ -1477,7 +1609,12 @@ class SexTB :
         .ifBlank { query.trim() }
 
     private fun Response.rememberCatalogPath() {
-        val resolvedPath = request.url.encodedPath.substringBefore("/pg-").trimEnd('/')
+        rememberCatalogPathFromUrl(request.url.toString())
+    }
+
+    private fun rememberCatalogPathFromUrl(url: String) {
+        val resolvedPath = url.toHttpUrlOrNull()?.encodedPath?.substringBefore("/pg-")?.trimEnd('/')
+            ?: return
         if (resolvedPath.isBlank()) return
         val stablePath = when {
             resolvedPath.startsWith("/jav-censored-") -> "/jav-censored"
@@ -1550,6 +1687,15 @@ class SexTB :
     // ============================ Preferences =============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
+            key = PREF_DEFAULT_CATEGORY_KEY
+            title = "Default category (Popular / Latest)"
+            entries = PREF_DEFAULT_CATEGORY_ENTRIES
+            entryValues = PREF_DEFAULT_CATEGORY_VALUES
+            setDefaultValue(DEFAULT_CATEGORY)
+            summary = "%s"
+        }.also(screen::addPreference)
+
+        ListPreference(screen.context).apply {
             key = PREF_SERVER_KEY
             title = "Preferred server"
             entries = PREF_SERVER_ENTRIES
@@ -1581,6 +1727,13 @@ class SexTB :
 
     override fun videoUrlParse(document: Document): String = throw UnsupportedOperationException()
 
+    private data class SiteResponse(
+        val status: Int,
+        val finalUrl: String,
+        val body: String,
+        val viaWebView: Boolean,
+    )
+
     private data class HlsCandidate(
         val url: String,
         val mustProxy: Boolean,
@@ -1604,7 +1757,8 @@ class SexTB :
     private class HumanVerificationException : IOException("SexTB requested human verification (Turnstile). Open this video in WebView once, confirm, then retry.")
 
     companion object {
-        private const val DEFAULT_CATEGORY = "/jav-censored"
+        private const val TAG = "SexTB"
+        private const val DEFAULT_CATEGORY = "/genre/ltx-encode"
         private const val TOP_WEEK_SENTINEL = "__TOP_WEEK__"
         private const val TOP_MONTH_SENTINEL = "__TOP_MONTH__"
 
@@ -1617,9 +1771,35 @@ class SexTB :
         private const val PAGE_CACHE_TTL_MS = 3 * 60 * 1000L
         private const val VIDEO_CACHE_TTL_MS = 3 * 60 * 1000L
         private const val TOP_CHART_CACHE_TTL_MS = 10 * 60 * 1000L
+        private const val WEB_BRIDGE_TTL_MS = 15 * 60 * 1000L
+        private const val RATE_LIMIT_BACKOFF_MS = 900L
         private const val CHALLENGE_PEEK_BYTES = 512L * 1024L
         private const val UPN_AES_KEY = "kiemtienmua911ca"
         private const val UPN_AES_IV = "1234567890oiuytr"
+
+        private const val PREF_DEFAULT_CATEGORY_KEY = "pref_default_category"
+        private val PREF_DEFAULT_CATEGORY_ENTRIES = arrayOf(
+            "LTX Decensored",
+            "Censored",
+            "Uncensored",
+            "Uncensored Leaked",
+            "Reducing Mosaic",
+            "Amateur",
+            "English Subtitle",
+            "SexTB Encode",
+            "New Releases",
+        )
+        private val PREF_DEFAULT_CATEGORY_VALUES = arrayOf(
+            "/genre/ltx-encode",
+            "/jav-censored",
+            "/jav-uncensored",
+            "/genre/uncensored-leaked",
+            "/genre/reducing-mosaic",
+            "/jav-amateur",
+            "/jav-subtitle",
+            "/genre/sextb-encode",
+            "/new-releases",
+        )
 
         private const val PREF_SERVER_KEY = "pref_server"
         private const val PREF_SERVER_DEFAULT = "AUTO"
@@ -1632,9 +1812,9 @@ class SexTB :
 
         private const val PREF_SEEK_CACHE_KEY = "pref_seek_cache"
 
-        private val CLOUDFLARE_ERROR_CODES = setOf(403, 429, 503)
+        private val CLOUDFLARE_ERROR_CODES = setOf(403, 503)
         private val titleChallengeRegex =
-            Regex("""<title>\s*(?:just a moment|attention required)[^<]*</title>""", RegexOption.IGNORE_CASE)
+            Regex("""<title>\s*(?:just a moment|attention required|checking your browser)[^<]*</title>""", RegexOption.IGNORE_CASE)
         private val PT_REGEX = Regex("""window\.__pt\s*=\s*["']([^"']+)""")
         private val PK_REGEX = Regex("""window\.__pk\s*=\s*["']([^"']+)""")
         private val FILM_ID_REGEX = Regex("""(?:var|let|const)\s+filmId\s*=\s*(\d+)""")
@@ -1663,13 +1843,13 @@ class SexTB :
 
         // All live SexTB categories and newly added sections/charts (canonical auto-resolving paths).
         private val CATEGORIES = arrayOf(
+            "LTX Decensored" to "/genre/ltx-encode",
             "Censored" to "/jav-censored",
             "Uncensored" to "/jav-uncensored",
+            "Uncensored Leaked" to "/genre/uncensored-leaked",
+            "Reducing Mosaic" to "/genre/reducing-mosaic",
             "Amateur" to "/jav-amateur",
             "English Subtitle" to "/jav-subtitle",
-            "Uncensored Leaked" to "/genre/uncensored-leaked",
-            "LTX Decensored" to "/genre/ltx-encode",
-            "Reducing Mosaic" to "/genre/reducing-mosaic",
             "SexTB Encode" to "/genre/sextb-encode",
             "New Releases" to "/new-releases",
             "TOP Chart (Weekly)" to TOP_WEEK_SENTINEL,

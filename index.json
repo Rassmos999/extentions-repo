@@ -399,10 +399,10 @@
   {
     "name": "Aniyomi: SexTB",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.sextb",
-    "apk": "aniyomi-all.sextb-v14.20.apk",
+    "apk": "aniyomi-all.sextb-v14.21.apk",
     "lang": "all",
-    "code": 20,
-    "version": "14.20",
+    "code": 21,
+    "version": "14.21",
     "nsfw": 1,
     "sources": [
       {
