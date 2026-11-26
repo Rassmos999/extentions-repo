@@ -271,25 +271,25 @@ class PornHub :
         val snap = tasteEngine.snapshot()
         val requests = mutableListOf<Pair<Request, PornHubClient.RateBucket>>()
 
-        // 1. Top learned category (local PornHub category ID or matched from global learned tags).
-        val matchedCat = snap.topCategories.firstOrNull()
+        // 1. Top learned core concept or category (e.g. threesome -> c=65, creampie -> c=15).
+        val matchedCat = snap.topConcepts.firstNotNullOfOrNull { PornHubFilters.findCategoryValueByName(it) }
+            ?: snap.topCategories.firstOrNull()
             ?: snap.topTags.firstNotNullOfOrNull { PornHubFilters.findCategoryValueByName(it) }
         if (!matchedCat.isNullOrBlank()) {
             requests += GET(browseUrl(page = page, sort = "ht", category = matchedCat), headers) to PornHubClient.RateBucket.LISTING
         }
 
-        // 2. Top learned title topic / keywords (from saved titles, watched titles, or seed text).
-        val titleQueries = tasteEngine.buildTitleSearchQueries(maxQueries = 2)
-        titleQueries.firstOrNull()?.let { q ->
+        // 2. Top learned core concept / discovery queries (e.g. foursome, threesome, creampie).
+        val titleQueries = tasteEngine.buildTitleSearchQueries(maxQueries = 3)
+        for (q in titleQueries) {
+            if (requests.size >= 3) break
             requests += buildKeywordSearchRequest(page, q) to PornHubClient.RateBucket.SEARCH
         }
 
-        // 3. Top learned performer/star (or second title query / trending fallback).
+        // 3. Top learned performer/star if room remains.
         val topStar = snap.topPerformers.firstOrNull()
         if (!topStar.isNullOrBlank() && requests.size < 3) {
             requests += buildKeywordSearchRequest(page, topStar) to PornHubClient.RateBucket.SEARCH
-        } else if (titleQueries.size > 1 && requests.size < 3) {
-            requests += buildKeywordSearchRequest(page, titleQueries[1]) to PornHubClient.RateBucket.SEARCH
         }
 
         if (requests.isEmpty()) {

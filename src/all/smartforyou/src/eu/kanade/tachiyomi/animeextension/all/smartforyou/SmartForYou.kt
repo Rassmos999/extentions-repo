@@ -76,6 +76,7 @@ class SmartForYou :
     }
 
     private val pageCache = ConcurrentHashMap<String, Pair<Long, String>>()
+    private val seenFeedKeys = java.util.Collections.synchronizedSet(HashSet<String>())
 
     private val baseHttpClient: OkHttpClient by lazy {
         network.client.newBuilder()
@@ -212,22 +213,37 @@ class SmartForYou :
         mode: FeedMode,
     ): AnimesPage {
         val snap = tasteEngine.snapshot()
+        val coreConcepts = snap.topConcepts
         val tasteQueries = buildList {
-            addAll(tasteEngine.buildTitleSearchQueries(maxQueries = 2))
+            addAll(coreConcepts.take(3))
+            addAll(tasteEngine.buildTitleSearchQueries(maxQueries = 3))
             snap.topPerformers.firstOrNull()?.let(::add)
-            snap.topTags.firstOrNull()?.let(::add)
         }.distinct()
+
+        Log.i(TAG, "ForYou mode=$mode sources=${sources.map { it.id }} core=$coreConcepts queries=$tasteQueries")
 
         val hasTaste = mode == FeedMode.FOR_YOU && tasteQueries.isNotEmpty()
         val batches = fetchInParallel(sources) { idx, src ->
             when {
                 hasTaste -> {
-                    val q = tasteQueries[idx % tasteQueries.size]
-                    val searchHits = runCatching { searchSource(src.id, page, q) }.getOrNull()
-                    if (searchHits != null && searchHits.animes.isNotEmpty()) {
-                        searchHits
+                    // 1. Prefer native category/genre page when top core concept maps directly
+                    //    (e.g. threesome/foursome -> SexTB /genre/threesome--foursome, PornHub ?c=65).
+                    val conceptForSource = coreConcepts.getOrNull(idx % coreConcepts.size.coerceAtLeast(1))
+                    val nativeCategoryPage = if (conceptForSource != null) {
+                        runCatching { browseSourceByConcept(src.id, page, conceptForSource) }.getOrNull()
                     } else {
-                        browseSource(src.id, page, latest = false)
+                        null
+                    }
+                    if (nativeCategoryPage != null && nativeCategoryPage.animes.isNotEmpty()) {
+                        nativeCategoryPage
+                    } else {
+                        val q = tasteQueries[idx % tasteQueries.size]
+                        val searchHits = runCatching { searchSource(src.id, page, q) }.getOrNull()
+                        if (searchHits != null && searchHits.animes.isNotEmpty()) {
+                            searchHits
+                        } else {
+                            browseSource(src.id, page, latest = false)
+                        }
                     }
                 }
 
@@ -238,16 +254,35 @@ class SmartForYou :
         }
 
         val merged = interleaveUnique(batches)
-        val ranked = if (tasteEngine.hasLearnedProfile()) {
-            tasteEngine.rankCandidates(
-                items = merged.animes,
-                excludeWatched = mode == FeedMode.FOR_YOU,
-                blendWithOriginalRank = mode != FeedMode.FOR_YOU,
-            )
-        } else {
-            merged.animes
+        if (page <= 1) seenFeedKeys.clear()
+        val ranked = tasteEngine.rankCandidates(
+            items = merged.animes,
+            excludeWatched = true,
+            blendWithOriginalRank = mode != FeedMode.FOR_YOU,
+        ).filter { anime ->
+            val keys = tasteEngine.extractKnownKeys(anime.url, anime.title)
+            val alreadyShown = keys.any { it in seenFeedKeys }
+            if (!alreadyShown) seenFeedKeys.addAll(keys)
+            !alreadyShown
         }
         return AnimesPage(ranked, merged.hasNextPage)
+    }
+
+    private fun browseSourceByConcept(srcId: String, page: Int, concept: String): AnimesPage? = when (srcId) {
+        "sextb" -> {
+            val slug = SEXTB_CONCEPT_GENRES[concept] ?: return null
+            val path = if (page > 1) "/genre/$slug/pg-$page" else "/genre/$slug"
+            val html = fetchHtml(sextbClient, "https://sextb.net$path?sort=viewed", "https://sextb.net/")
+            parseSexTbList(Jsoup.parse(html, "https://sextb.net"))
+        }
+
+        "pornhub" -> {
+            val catId = PORNHUB_CONCEPT_CATEGORIES[concept] ?: return null
+            val html = fetchHtml(pornhubClient, "https://www.pornhub.com/video?c=$catId&o=ht&page=$page", "https://www.pornhub.com/")
+            parsePornHubList(Jsoup.parse(html, "https://www.pornhub.com"))
+        }
+
+        else -> null
     }
 
     private fun searchAcrossSources(
@@ -259,10 +294,18 @@ class SmartForYou :
             searchSource(src.id, page, query)
         }
         val merged = interleaveUnique(batches)
-        val ranked = if (tasteEngine.hasLearnedProfile()) {
-            tasteEngine.rankCandidates(merged.animes, excludeWatched = false, blendWithOriginalRank = true)
-        } else {
-            merged.animes
+        if (page <= 1) seenFeedKeys.clear()
+        val ranked = (
+            if (tasteEngine.hasLearnedProfile()) {
+                tasteEngine.rankCandidates(merged.animes, excludeWatched = false, blendWithOriginalRank = true)
+            } else {
+                merged.animes
+            }
+            ).filter { anime ->
+            val keys = tasteEngine.extractKnownKeys(anime.url, anime.title)
+            val alreadyShown = keys.any { it in seenFeedKeys }
+            if (!alreadyShown) seenFeedKeys.addAll(keys)
+            !alreadyShown
         }
         return AnimesPage(ranked, merged.hasNextPage)
     }
@@ -1219,6 +1262,81 @@ class SmartForYou :
             SourceDef("xnxx", "XNXX"),
             SourceDef("rule34video", "Rule34Video"),
             SourceDef("sexalarab", "SexAlArab"),
+        )
+
+        private val SEXTB_CONCEPT_GENRES = mapOf(
+            "threesome" to "threesome--foursome",
+            "foursome" to "threesome--foursome",
+            "orgy" to "orgy",
+            "creampie" to "creampie",
+            "milf" to "married-woman",
+            "big tits" to "big-tits",
+            "big ass" to "huge-butt",
+            "anal" to "anal",
+            "blowjob" to "blowjob",
+            "squirt" to "squirting",
+            "lesbian" to "lesbian",
+            "cuckold" to "cuckold",
+            "stepfamily" to "incest",
+            "uncensored" to "ltx-encode",
+            "amateur" to "amateur",
+            "pov" to "pov",
+            "massage" to "massage",
+            "cosplay" to "cosplay",
+            "bdsm" to "bdsm",
+            "hardcore" to "hardcore",
+            "interracial" to "black-man",
+            "blonde" to "blonde",
+            "bbw" to "chubby",
+            "slender" to "slender",
+            "small tits" to "small-tits",
+            "shaved" to "shaved-pussy",
+            "feet" to "foot-fetish",
+            "handjob" to "handjob",
+            "facial" to "facial",
+            "cowgirl" to "cowgirl",
+            "doggy style" to "doggy-style",
+            "69" to "69",
+            "masturbation" to "masturbation",
+            "public" to "outdoor",
+            "english subtitle" to "english-subtitle",
+        )
+
+        private val PORNHUB_CONCEPT_CATEGORIES = mapOf(
+            "threesome" to "65",
+            "foursome" to "65",
+            "orgy" to "2",
+            "creampie" to "15",
+            "milf" to "29",
+            "big tits" to "8",
+            "big ass" to "4",
+            "anal" to "35",
+            "blowjob" to "13",
+            "squirt" to "69",
+            "lesbian" to "27",
+            "cuckold" to "242",
+            "stepfamily" to "444",
+            "amateur" to "3",
+            "pov" to "41",
+            "massage" to "78",
+            "cosplay" to "241",
+            "bdsm" to "10",
+            "hardcore" to "21",
+            "interracial" to "25",
+            "latina" to "26",
+            "asian" to "1",
+            "arab" to "98",
+            "ebony" to "17",
+            "blonde" to "9",
+            "brunette" to "11",
+            "redhead" to "42",
+            "bbw" to "6",
+            "small tits" to "59",
+            "feet" to "93",
+            "handjob" to "20",
+            "facial" to "16",
+            "masturbation" to "22",
+            "public" to "24",
         )
     }
 }

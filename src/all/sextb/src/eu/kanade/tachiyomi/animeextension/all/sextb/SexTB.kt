@@ -864,9 +864,13 @@ class SexTB :
     private fun findSexTbGenreSlug(tag: String): String? {
         val needle = tag.trim().lowercase(Locale.ROOT)
         if (needle.isBlank()) return null
+        if (needle == "threesome" || needle == "foursome" || needle == "3some" || needle == "4some") {
+            return "threesome--foursome"
+        }
         return GENRES.firstOrNull { (name, slug) ->
             name.equals(needle, ignoreCase = true) ||
-                slug.equals(needle.replace(' ', '-'), ignoreCase = true)
+                slug.equals(needle.replace(' ', '-'), ignoreCase = true) ||
+                name.lowercase(Locale.ROOT).contains(needle)
         }?.second
     }
 
@@ -886,12 +890,23 @@ class SexTB :
             if (ap.animes.isNotEmpty()) sourcesFetched++
         }
 
-        // 1. Top learned Genre(s) across all SexTB categories (1 single request!).
-        val matchedGenres = snap.topTags.mapNotNull(::findSexTbGenreSlug).distinct().take(2)
+        // 1. Top learned CORE concepts mapped directly to native SexTB genre pages (e.g. threesome--foursome)!
+        val matchedGenres = (snap.topConcepts + snap.topTags)
+            .mapNotNull(::findSexTbGenreSlug)
+            .distinct()
+            .take(2)
         if (matchedGenres.isNotEmpty()) {
-            val extra = matchedGenres.drop(1).joinToString(",").ifBlank { "all" }
-            val req = catalogRequest(page = page, categoryPath = "/genre/${matchedGenres.first()}", genre = extra, sort = "viewed")
-            collect(runCatching { executeCachedListing(req) }.getOrNull())
+            val primaryReq = catalogRequest(page = page, categoryPath = "/genre/${matchedGenres.first()}", sort = "viewed")
+            collect(runCatching { executeCachedListing(primaryReq) }.getOrNull())
+            if (matchedGenres.size > 1) {
+                val combinedReq = catalogRequest(
+                    page = page,
+                    categoryPath = "/genre/${matchedGenres.first()}",
+                    genre = matchedGenres[1],
+                    sort = "viewed",
+                )
+                collect(runCatching { executeCachedListing(combinedReq) }.getOrNull())
+            }
         }
 
         // 2. Top learned Actress (resolved via cached actress path or live actor lookup).
@@ -904,7 +919,7 @@ class SexTB :
             }
         }
 
-        // 3. Top learned Title topic / keywords via fast JSON /ajax/search!
+        // 3. Top learned core concept via fast JSON /ajax/search!
         val titleQuery = tasteEngine.buildTitleSearchQueries(maxQueries = 1).firstOrNull()
         if (!titleQuery.isNullOrBlank() && sourcesFetched < 3) {
             collect(runCatching { searchViaAjaxMovies(titleQuery, page) }.getOrNull())

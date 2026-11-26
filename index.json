@@ -172,10 +172,10 @@
   {
     "name": "Aniyomi: Jable",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.jable",
-    "apk": "aniyomi-all.jable-v14.18.apk",
+    "apk": "aniyomi-all.jable-v14.19.apk",
     "lang": "all",
-    "code": 18,
-    "version": "14.18",
+    "code": 19,
+    "version": "14.19",
     "nsfw": 1,
     "sources": [
       {
@@ -189,10 +189,10 @@
   {
     "name": "Aniyomi: JavDB",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.javdb",
-    "apk": "aniyomi-all.javdb-v14.5.apk",
+    "apk": "aniyomi-all.javdb-v14.6.apk",
     "lang": "all",
-    "code": 5,
-    "version": "14.5",
+    "code": 6,
+    "version": "14.6",
     "nsfw": 1,
     "sources": [
       {
@@ -206,10 +206,10 @@
   {
     "name": "Aniyomi: JavGG",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.javgg",
-    "apk": "aniyomi-all.javgg-v14.3.apk",
+    "apk": "aniyomi-all.javgg-v14.4.apk",
     "lang": "all",
-    "code": 3,
-    "version": "14.3",
+    "code": 4,
+    "version": "14.4",
     "nsfw": 1,
     "sources": [
       {
@@ -223,10 +223,10 @@
   {
     "name": "Aniyomi: Jav Guru",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.javguru",
-    "apk": "aniyomi-all.javguru-v14.3.apk",
+    "apk": "aniyomi-all.javguru-v14.4.apk",
     "lang": "all",
-    "code": 3,
-    "version": "14.3",
+    "code": 4,
+    "version": "14.4",
     "nsfw": 1,
     "sources": [
       {
@@ -280,10 +280,10 @@
   {
     "name": "Aniyomi: MissAV",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.missav",
-    "apk": "aniyomi-all.missav-v14.3.apk",
+    "apk": "aniyomi-all.missav-v14.4.apk",
     "lang": "all",
-    "code": 3,
-    "version": "14.3",
+    "code": 4,
+    "version": "14.4",
     "nsfw": 1,
     "sources": [
       {
@@ -348,10 +348,10 @@
   {
     "name": "Aniyomi: PornHub",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.pornhub",
-    "apk": "aniyomi-all.pornhub-v14.4.apk",
+    "apk": "aniyomi-all.pornhub-v14.5.apk",
     "lang": "all",
-    "code": 4,
-    "version": "14.4",
+    "code": 5,
+    "version": "14.5",
     "nsfw": 1,
     "sources": [
       {
@@ -382,10 +382,10 @@
   {
     "name": "Aniyomi: RouVideo",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.rouvideo",
-    "apk": "aniyomi-all.rouvideo-v14.29.apk",
+    "apk": "aniyomi-all.rouvideo-v14.30.apk",
     "lang": "all",
-    "code": 29,
-    "version": "14.29",
+    "code": 30,
+    "version": "14.30",
     "nsfw": 1,
     "sources": [
       {
@@ -399,10 +399,10 @@
   {
     "name": "Aniyomi: SexTB",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.sextb",
-    "apk": "aniyomi-all.sextb-v14.27.apk",
+    "apk": "aniyomi-all.sextb-v14.28.apk",
     "lang": "all",
-    "code": 27,
-    "version": "14.27",
+    "code": 28,
+    "version": "14.28",
     "nsfw": 1,
     "sources": [
       {
@@ -433,10 +433,10 @@
   {
     "name": "Aniyomi: Smart For You",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.smartforyou",
-    "apk": "aniyomi-all.smartforyou-v14.1.apk",
+    "apk": "aniyomi-all.smartforyou-v14.2.apk",
     "lang": "all",
-    "code": 1,
-    "version": "14.1",
+    "code": 2,
+    "version": "14.2",
     "nsfw": 1,
     "sources": [
       {
@@ -519,10 +519,10 @@
   {
     "name": "Aniyomi: SupJav",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.supjav",
-    "apk": "aniyomi-all.supjav-v14.3.apk",
+    "apk": "aniyomi-all.supjav-v14.4.apk",
     "lang": "all",
-    "code": 3,
-    "version": "14.3",
+    "code": 4,
+    "version": "14.4",
     "nsfw": 1,
     "sources": [
       {
@@ -536,10 +536,10 @@
   {
     "name": "Aniyomi: SupJav 2",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.supjav2",
-    "apk": "aniyomi-all.supjav2-v14.32.apk",
+    "apk": "aniyomi-all.supjav2-v14.33.apk",
     "lang": "all",
-    "code": 32,
-    "version": "14.32",
+    "code": 33,
+    "version": "14.33",
     "nsfw": 1,
     "sources": [
       {
@@ -587,10 +587,10 @@
   {
     "name": "Aniyomi: XMoviesForYou",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.xmoviesforyou",
-    "apk": "aniyomi-all.xmoviesforyou-v14.6.apk",
+    "apk": "aniyomi-all.xmoviesforyou-v14.7.apk",
     "lang": "all",
-    "code": 6,
-    "version": "14.6",
+    "code": 7,
+    "version": "14.7",
     "nsfw": 1,
     "sources": [
       {
@@ -604,10 +604,10 @@
   {
     "name": "Aniyomi: Xnxx",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.xnxx",
-    "apk": "aniyomi-all.xnxx-v14.25.apk",
+    "apk": "aniyomi-all.xnxx-v14.26.apk",
     "lang": "all",
-    "code": 25,
-    "version": "14.25",
+    "code": 26,
+    "version": "14.26",
     "nsfw": 1,
     "sources": [
       {
@@ -621,10 +621,10 @@
   {
     "name": "Aniyomi: Xvideos",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.xvideos",
-    "apk": "aniyomi-all.xvideos-v14.26.apk",
+    "apk": "aniyomi-all.xvideos-v14.27.apk",
     "lang": "all",
-    "code": 26,
-    "version": "14.26",
+    "code": 27,
+    "version": "14.27",
     "nsfw": 1,
     "sources": [
       {
@@ -638,10 +638,10 @@
   {
     "name": "Aniyomi: Aflamk1",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.aflamk1",
-    "apk": "aniyomi-ar.aflamk1-v14.17.apk",
+    "apk": "aniyomi-ar.aflamk1-v14.18.apk",
     "lang": "ar",
-    "code": 17,
-    "version": "14.17",
+    "code": 18,
+    "version": "14.18",
     "nsfw": 1,
     "sources": [
       {
@@ -774,10 +774,10 @@
   {
     "name": "Aniyomi: ArabsHentai",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.arabshentai",
-    "apk": "aniyomi-ar.arabshentai-v14.4.apk",
+    "apk": "aniyomi-ar.arabshentai-v14.5.apk",
     "lang": "ar",
-    "code": 4,
-    "version": "14.4",
+    "code": 5,
+    "version": "14.5",
     "nsfw": 1,
     "sources": [
       {
@@ -791,10 +791,10 @@
   {
     "name": "Aniyomi: ArabX",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.arabx",
-    "apk": "aniyomi-ar.arabx-v14.21.apk",
+    "apk": "aniyomi-ar.arabx-v14.22.apk",
     "lang": "ar",
-    "code": 21,
-    "version": "14.21",
+    "code": 22,
+    "version": "14.22",
     "nsfw": 1,
     "sources": [
       {
@@ -808,10 +808,10 @@
   {
     "name": "Aniyomi: ArabXN",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.arabxn",
-    "apk": "aniyomi-ar.arabxn-v14.21.apk",
+    "apk": "aniyomi-ar.arabxn-v14.22.apk",
     "lang": "ar",
-    "code": 21,
-    "version": "14.21",
+    "code": 22,
+    "version": "14.22",
     "nsfw": 1,
     "sources": [
       {
@@ -910,10 +910,10 @@
   {
     "name": "Aniyomi: HentaiAraby",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.hentaiaraby",
-    "apk": "aniyomi-ar.hentaiaraby-v14.5.apk",
+    "apk": "aniyomi-ar.hentaiaraby-v14.6.apk",
     "lang": "ar",
-    "code": 5,
-    "version": "14.5",
+    "code": 6,
+    "version": "14.6",
     "nsfw": 1,
     "sources": [
       {
@@ -927,10 +927,10 @@
   {
     "name": "Aniyomi: NxxHentai",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.nxxhentai",
-    "apk": "aniyomi-ar.nxxhentai-v14.4.apk",
+    "apk": "aniyomi-ar.nxxhentai-v14.5.apk",
     "lang": "ar",
-    "code": 4,
-    "version": "14.4",
+    "code": 5,
+    "version": "14.5",
     "nsfw": 1,
     "sources": [
       {
@@ -961,10 +961,10 @@
   {
     "name": "Aniyomi: SexAlArab",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.sexalarab",
-    "apk": "aniyomi-ar.sexalarab-v14.25.apk",
+    "apk": "aniyomi-ar.sexalarab-v14.26.apk",
     "lang": "ar",
-    "code": 25,
-    "version": "14.25",
+    "code": 26,
+    "version": "14.26",
     "nsfw": 1,
     "sources": [
       {
@@ -978,10 +978,10 @@
   {
     "name": "Aniyomi: SexMahali",
     "pkg": "eu.kanade.tachiyomi.animeextension.ar.sexmahali",
-    "apk": "aniyomi-ar.sexmahali-v14.22.apk",
+    "apk": "aniyomi-ar.sexmahali-v14.23.apk",
     "lang": "ar",
-    "code": 22,
-    "version": "14.22",
+    "code": 23,
+    "version": "14.23",
     "nsfw": 1,
     "sources": [
       {
@@ -1352,10 +1352,10 @@
   {
     "name": "Aniyomi: haho.moe",
     "pkg": "eu.kanade.tachiyomi.animeextension.en.hahomoe",
-    "apk": "aniyomi-en.hahomoe-v14.25.apk",
+    "apk": "aniyomi-en.hahomoe-v14.26.apk",
     "lang": "en",
-    "code": 25,
-    "version": "14.25",
+    "code": 26,
+    "version": "14.26",
     "nsfw": 1,
     "sources": [
       {
@@ -1369,10 +1369,10 @@
   {
     "name": "Aniyomi: hanime.tv",
     "pkg": "eu.kanade.tachiyomi.animeextension.en.hanime",
-    "apk": "aniyomi-en.hanime-v14.3.apk",
+    "apk": "aniyomi-en.hanime-v14.4.apk",
     "lang": "en",
-    "code": 3,
-    "version": "14.3",
+    "code": 4,
+    "version": "14.4",
     "nsfw": 1,
     "sources": [
       {
@@ -1386,10 +1386,10 @@
   {
     "name": "Aniyomi: HentaiMama",
     "pkg": "eu.kanade.tachiyomi.animeextension.en.hentaimama",
-    "apk": "aniyomi-en.hentaimama-v14.22.apk",
+    "apk": "aniyomi-en.hentaimama-v14.23.apk",
     "lang": "en",
-    "code": 22,
-    "version": "14.22",
+    "code": 23,
+    "version": "14.23",
     "nsfw": 1,
     "sources": [
       {
@@ -1420,10 +1420,10 @@
   {
     "name": "Aniyomi: Hstream",
     "pkg": "eu.kanade.tachiyomi.animeextension.en.hstream",
-    "apk": "aniyomi-en.hstream-v14.25.apk",
+    "apk": "aniyomi-en.hstream-v14.26.apk",
     "lang": "en",
-    "code": 25,
-    "version": "14.25",
+    "code": 26,
+    "version": "14.26",
     "nsfw": 1,
     "sources": [
       {
@@ -1692,10 +1692,10 @@
   {
     "name": "Aniyomi: Oppai Stream",
     "pkg": "eu.kanade.tachiyomi.animeextension.en.oppaistream",
-    "apk": "aniyomi-en.oppaistream-v14.9.apk",
+    "apk": "aniyomi-en.oppaistream-v14.10.apk",
     "lang": "en",
-    "code": 9,
-    "version": "14.9",
+    "code": 10,
+    "version": "14.10",
     "nsfw": 1,
     "sources": [
       {
@@ -1726,10 +1726,10 @@
   {
     "name": "Aniyomi: Rule34Video",
     "pkg": "eu.kanade.tachiyomi.animeextension.en.rule34video",
-    "apk": "aniyomi-en.rule34video-v14.25.apk",
+    "apk": "aniyomi-en.rule34video-v14.26.apk",
     "lang": "en",
-    "code": 25,
-    "version": "14.25",
+    "code": 26,
+    "version": "14.26",
     "nsfw": 1,
     "sources": [
       {
