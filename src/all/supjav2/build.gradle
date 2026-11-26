@@ -1,7 +1,7 @@
 ext {
     extName = 'SupJav 2'
     extClass = '.SupJav2Factory'
-    extVersionCode = 34
+    extVersionCode = 35
     isNsfw = true
 }
 apply plugin: "kei.plugins.extension.legacy"
