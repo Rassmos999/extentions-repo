@@ -297,7 +297,11 @@ class PornHub :
             val titleQueries = tasteEngine.buildTitleSearchQueries(maxQueries = 4)
             for (q in titleQueries) {
                 if (reqs.size >= 3) break
-                val effectiveQ = if (q == "dp") "double penetration" else q
+                val effectiveQ = when (q) {
+                    "dp" -> "double penetration"
+                    "mmf", "threesome" -> "mmf threesome"
+                    else -> q
+                }
                 reqs += buildKeywordSearchRequest(page, effectiveQ, duration = effectiveDur) to PornHubClient.RateBucket.SEARCH
             }
 

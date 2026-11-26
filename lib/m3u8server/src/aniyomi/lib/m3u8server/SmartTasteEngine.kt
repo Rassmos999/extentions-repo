@@ -627,10 +627,11 @@ class SmartTasteEngine(
         if (bootVersion >= CURRENT_BOOT_VERSION) return false
         bootVersion = CURRENT_BOOT_VERSION
         val priors = linkedMapOf(
-            "threesome" to 9.0,
+            "mmf" to 11.0,
+            "gangbang" to 9.5,
             "foursome" to 9.0,
-            "dp" to 7.5,
-            "gangbang" to 7.5,
+            "threesome" to 8.5,
+            "dp" to 8.5,
             "slut" to 6.5,
         )
         for ((concept, minWeight) in priors) {
@@ -703,10 +704,21 @@ class SmartTasteEngine(
         }
 
         val lowerTitle = title.lowercase(Locale.ROOT)
+        val combinedText = buildString {
+            append(lowerTitle).append(' ')
+            for (t in extraTags) {
+                if (t.isNotBlank()) append(t.lowercase(Locale.ROOT)).append(' ')
+            }
+        }
         val tokens = tokenizeTitle(title)
         val titleBigrams = extractBigrams(tokens)
         val candidateConcepts = extractConcepts(title, extraTags)
         val anchors = getSoftAnchors().toSet()
+
+        val isMmf = "mmf" in candidateConcepts || MMF_PRIORITY_REGEX.containsMatchIn(combinedText)
+        val isHardGroup = "gangbang" in candidateConcepts || "dp" in candidateConcepts ||
+            "foursome" in candidateConcepts || "orgy" in candidateConcepts
+        val isFfmOnly = !isMmf && !isHardGroup && FFM_PENALTY_REGEX.containsMatchIn(combinedText)
 
         var score = 0.0
 
@@ -715,6 +727,8 @@ class SmartTasteEngine(
         var matchedAnchorCount = 0
         for (concept in candidateConcepts) {
             if (concept in FORMAT_ONLY_CONCEPTS) continue
+            // Never award positive threesome points to FFM (1 guy + 2 girls) titles.
+            if (isFfmOnly && concept == "threesome") continue
             val weight = concepts[concept] ?: 0.0
             val spec = CONCEPT_SPECIFICITY[concept] ?: 1.0
             if (weight > 0.0) {
@@ -728,11 +742,27 @@ class SmartTasteEngine(
         if (matchedConceptCount >= 2) {
             score += (matchedConceptCount - 1) * 3.8
         }
-        // Soft-mandatory anchor bonus: combos like (threesome + dp) or (gangbang + slut) soar!
+        // Soft-mandatory anchor bonus: combos like (mmf + dp) or (gangbang + slut) soar!
         if (matchedAnchorCount == 1) {
             score += 3.5
         } else if (matchedAnchorCount >= 2) {
             score += 3.5 + (matchedAnchorCount - 1) * 5.2
+        }
+
+        // 1b. Explicit Composition Rules:
+        // - MMF (2+ guys + 1 girl) is ALWAYS highest priority (+14.0).
+        // - Group / Gangbang / Foursome / Orgy / DP ALWAYS gets a strong bonus (+9.0 / +7.0).
+        // - FFM (1 guy + 2 girls) gets a clear -12.0 penalty so MMF & Group stay on top.
+        if (isMmf) {
+            score += 14.0
+        }
+        if (!isFfmOnly) {
+            when {
+                isHardGroup -> score += 9.0
+                "threesome" in candidateConcepts -> score += 6.5
+            }
+        } else {
+            score -= 12.0
         }
 
         // 2. Adaptive Duration Fit (JAV vs Non-JAV vs Short-Form)
@@ -1289,7 +1319,7 @@ class SmartTasteEngine(
         private const val GLOBAL_PREFS_NAME = "agy_global_taste_v1"
         private const val DEFAULT_STORAGE_KEY = "smart_taste_profile_v1"
         private const val VERSION_KEY = "smart_taste_version"
-        private const val CURRENT_BOOT_VERSION = 2
+        private const val CURRENT_BOOT_VERSION = 3
 
         const val PREF_SMART_TASTE_KEY = "pref_smart_taste_enabled"
         const val PREF_TASTE_SEED_KEY = "pref_smart_taste_seed"
@@ -1394,13 +1424,22 @@ class SmartTasteEngine(
         private val MULTI_SPACE_REGEX = Regex("""\s+""")
 
         // Canonical adult concept patterns — rich English & Arabic title/tag vocabulary.
+        private val MMF_PRIORITY_REGEX = Regex(
+            """\b(?:mmf|mfm|fmm|mmmf|mmfm|mfmm|fmmm|2\s*on\s*1|2v1|3\s*on\s*1|4\s*on\s*1|5\s*on\s*1|two\s+on\s+one|two\s+(?:guys|men|dudes|boys|cocks|dicks|black\s+guys|studs|bulls|brothers|friends|husbands)|both\s+(?:guys|cocks|dicks|holes)|double\s*(?:team\w*|penetration|penetrat\w*|anal|vaginal|stuffed)|tag\s*team\w*|spit\s*roast\w*|spitroast\w*|sandwiched|airtight|dp|dap|dvp|sharing\s+(?:his|my|a|her|the)\s+(?:wife|girlfriend|gf|slut|bitch|mom|stepmom|sister)|shared\s+by\s+two|fucked\s+by\s+(?:two|2|3|three|multiple)|1\s*girl\s+[2-9]\s*(?:guys|men))\b|ولدين\s*وبنت|رجلين\s*وامر|شابين|اتنين\s*عليها|اثنين\s*على\s*واحد|يتقاسم\w*|تتناك\s*من\s*(?:اثنين|اتنين|شابين|رجلين|اصدقائه|أصدقائه|الجميع)""",
+        )
+
+        private val FFM_PENALTY_REGEX = Regex(
+            """\b(?:ffm|mff|fmf|fffm|mfff|ffmf|fmff|girl\s*girl\s*guy|girl/girl/guy|2\s*girls\s*1\s*(?:guy|cock|dick|man)|two\s+(?:girls|women|sluts|sisters|wives|moms|milfs|teens|babes|bitches|lesbians|beauties|hotties)|lesbian\s*threesome|harem|reverse\s*gangbang)\b|ولد\s*وبنتين|بنتين\s*وولد|شاب\s*وبنتين|اختين\s*مع|أختين\s*مع|سحاق\s*ثلاثي""",
+        )
+
         private val CONCEPT_PATTERNS: List<Pair<String, Regex>> = listOf(
-            "threesome" to Regex("""\b(?:threesomes?|3some|3-some|3p|ffm|mmf|mff|fmf|2\s*on\s*1|two\s+on\s+one|double\s+(?:blowjob|fellatio|pussy|team)|two\s+(?:girls|guys|cocks|dicks|lovers|women|sluts|sisters|wives)|sandwiched)\b|ثلاثي"""),
-            "foursome" to Regex("""\b(?:foursomes?|4some|4-some|4p|ffmm|mmff|fffm|mfff|mfmf|fmfm|couple\s+swap|partner\s+swap|swingers?)\b|رباعي"""),
+            "mmf" to MMF_PRIORITY_REGEX,
+            "threesome" to Regex("""\b(?:threesomes?|3some|3-some|3p|mmf|mfm|fmm|2\s*on\s*1|two\s+on\s+one|double\s*team\w*|sandwiched)\b|ثلاثي"""),
+            "foursome" to Regex("""\b(?:foursomes?|4some|4-some|4p|ffmm|mmff|mmmf|fmmm|mfmf|fmfm|couple\s+swap|partner\s+swap|swingers?)\b|رباعي"""),
             "dp" to Regex("""\b(?:dp|dap|dvp|double\s*penetration|double\s*penetrat\w*|double\s*anal|double\s*vaginal|double\s*stuffed|two\s+(?:cocks|dicks)\s+(?:in|inside)|both\s+holes|spit\s*roast\w*|spitroast\w*|airtight)\b|اختراق\s*مزدوج"""),
-            "gangbang" to Regex("""\b(?:gang\s*bang\w*|gang\s*fuck\w*|ran\s+a\s+train|multiple\s+(?:men|guys|cocks|dicks)|3\s*on\s*1|4\s*on\s*1|5\s*on\s*1|reverse\s*gangbang)\b|نيك\s*جماعي|جماعي"""),
+            "gangbang" to Regex("""\b(?:gang\s*bang\w*|gang\s*fuck\w*|ran\s+a\s+train|multiple\s+(?:men|guys|cocks|dicks)|3\s*on\s*1|4\s*on\s*1|5\s*on\s*1)\b|نيك\s*جماعي|جماعي"""),
             "slut" to Regex("""\b(?:sluts?|slutty|whores?|bitch(?:es)?|cum\s*slut|cock\s*slut|anal\s*slut|dirty\s+slut|nympho\w*|insatiable|dick\s*hungry|cock\s*hungry)\b|شرموط\w*|عاهر\w*"""),
-            "orgy" to Regex("""\b(?:orgy|orgies|group\s*sex|harem|5some|5p|multi\s*partner|sex\s*party)\b|حفلة\s*جنس"""),
+            "orgy" to Regex("""\b(?:orgy|orgies|group\s*sex|5some|5p|multi\s*partner|sex\s+party)\b|حفلة\s*جنس"""),
             "creampie" to Regex("""\b(?:creampies?|cream\s*pie|nakadashi|cum\s*inside|cumming\s*inside|ejaculat\w*\s+into|internal\s+cumshot|unprotected\s+sex)\b|قذف\s*داخل"""),
             "milf" to Regex("""\b(?:milfs?|mature(?:\s+woman)?|married\s+woman|housewife|step\s*mom|stepmother|young\s+wife|cheating\s+wife)\b|امهات|زوجة|ناضج"""),
             "big tits" to Regex("""\b(?:big\s*tits?|huge\s*tits?|busty|big\s*boobs?|large\s*breasts?|titty\s*fuck|titfuck|paizuri|[g-k]-?cup|plump\s*breasts?)\b"""),
@@ -1446,11 +1485,12 @@ class SmartTasteEngine(
         private val FORMAT_ONLY_CONCEPTS = setOf("uncensored", "english subtitle")
 
         private val CONCEPT_SPECIFICITY = mapOf(
-            "foursome" to 1.90,
-            "dp" to 1.90,
-            "gangbang" to 1.85,
-            "threesome" to 1.80,
-            "orgy" to 1.75,
+            "mmf" to 2.15,
+            "gangbang" to 2.00,
+            "foursome" to 1.95,
+            "dp" to 1.95,
+            "orgy" to 1.85,
+            "threesome" to 1.75,
             "slut" to 1.65,
             "cuckold" to 1.55,
             "anal" to 1.50,

@@ -155,7 +155,7 @@ class SmartForYou :
     private fun isSeekCacheEnabled(): Boolean = preferences.getBoolean(PREF_SEEK_CACHE_KEY, true)
     private fun preferredQuality(): String = preferences.getString(PREF_QUALITY_KEY, "720p") ?: "720p"
     private fun isAutoSourceMode(): Boolean = preferences.getBoolean(PREF_AUTO_SOURCES_KEY, true)
-    private fun autoSourceCount(): Int = (preferences.getString(PREF_AUTO_COUNT_KEY, "4")?.toIntOrNull() ?: 4).coerceIn(2, 6)
+    private fun autoSourceCount(): Int = (preferences.getString(PREF_AUTO_COUNT_KEY, "5")?.toIntOrNull() ?: 5).coerceIn(2, 6)
 
     private fun isSourceAllowed(id: String): Boolean = preferences.getBoolean("src_enabled_$id", true)
 
@@ -304,9 +304,8 @@ class SmartForYou :
             merged.animes
         }
         if (page <= 1) seenFeedKeys.clear()
-        val ranked = tasteEngine.rankCandidates(
+        val ranked = interleaveRankedBySource(
             items = cleanPool,
-            excludeWatched = true,
             blendWithOriginalRank = mode == FeedMode.TRENDING,
         ).filter { anime ->
             val keys = tasteEngine.extractKnownKeys(anime.url, anime.title)
@@ -315,6 +314,55 @@ class SmartForYou :
             !alreadyShown
         }
         return AnimesPage(ranked, merged.hasNextPage)
+    }
+
+    /**
+     * Source-diverse taste ranking:
+     * 1. Scores every unseen video via SmartTasteEngine (MMF top priority, Group bonus,
+     *    FFM -12 penalty, 25m+ non-JAV duration boost).
+     * 2. Sorts each source's own bucket descending by score so every source puts its
+     *    strongest MMF / Group / DP / 25m+ match first.
+     * 3. Round-robin interleaves across all active sources (ordered by each bucket's best
+     *    score) so every screen mixes multiple sources instead of stacking 10 from one site!
+     */
+    private fun interleaveRankedBySource(
+        items: List<SAnime>,
+        blendWithOriginalRank: Boolean,
+    ): List<SAnime> {
+        val unseen = items.filterNot { tasteEngine.isWatched(it.url, it.title) }
+        if (unseen.isEmpty()) return emptyList()
+        if (!tasteEngine.hasLearnedProfile()) return unseen
+
+        val bySource = LinkedHashMap<String, MutableList<Pair<SAnime, Double>>>()
+        val total = unseen.size.coerceAtLeast(1)
+        unseen.forEachIndexed { idx, anime ->
+            val rawScore = tasteEngine.scoreCandidate(anime.title, anime.url)
+            val finalScore = if (blendWithOriginalRank && rawScore > -500.0) {
+                rawScore + (total - idx).toDouble() / total * 1.8
+            } else {
+                rawScore
+            }
+            val srcId = detectSourceId(anime.url) ?: "other"
+            bySource.getOrPut(srcId) { mutableListOf() }.add(anime to finalScore)
+        }
+
+        // Sort each source's bucket descending by score, then order sources by their top pick
+        val queues = bySource.values
+            .map { bucket -> bucket.sortedByDescending { it.second }.toMutableList() }
+            .sortedByDescending { it.firstOrNull()?.second ?: Double.NEGATIVE_INFINITY }
+
+        val out = ArrayList<SAnime>(unseen.size)
+        var progressed = true
+        while (progressed) {
+            progressed = false
+            for (q in queues) {
+                if (q.isNotEmpty()) {
+                    out += q.removeAt(0).first
+                    progressed = true
+                }
+            }
+        }
+        return out
     }
 
     /**
@@ -431,6 +479,8 @@ class SmartForYou :
             return ARABIC_CONCEPT_QUERIES[lower] ?: concept
         }
         return when (lower) {
+            "mmf" -> if (src.isJav) "3p" else "mmf threesome"
+            "threesome" -> if (src.isJav) "threesome" else "mmf threesome"
             "dp" -> if (src.isJav) "anal" else "double penetration"
             else -> concept
         }
@@ -453,6 +503,11 @@ class SmartForYou :
         }
 
         "pornhub" -> {
+            // For MMF / threesome, prefer targeted "mmf threesome" search over generic c=65
+            // (which is heavily FFM 1-guy-2-girls) so 2-guys-1-girl results dominate!
+            if (concept == "mmf" || concept == "threesome") {
+                return searchSource("pornhub", page, "mmf threesome", minDurationMin = minDurationMin, newest = newest)
+            }
             val catId = PORNHUB_CONCEPT_CATEGORIES[concept] ?: return null
             val sort = if (newest) "cm" else "ht"
             val durParam = if (minDurationMin >= 30) {
@@ -582,7 +637,7 @@ class SmartForYou :
         if (sources.size == 1) {
             return listOfNotNull(runCatching { block(0, sources.first()) }.getOrNull())
         }
-        val pool = Executors.newFixedThreadPool(sources.size.coerceAtMost(5))
+        val pool = Executors.newFixedThreadPool(sources.size.coerceAtMost(6))
         return try {
             val futures = sources.mapIndexed { idx, src ->
                 pool.submit<AnimesPage?> {
@@ -2072,9 +2127,9 @@ class SmartForYou :
         ListPreference(screen.context).apply {
             key = PREF_AUTO_COUNT_KEY
             title = "Active sources per feed page"
-            entries = arrayOf("2 sources (fastest)", "3 sources", "4 sources (recommended)", "5 sources", "6 sources (broadest)")
+            entries = arrayOf("2 sources (fastest)", "3 sources", "4 sources", "5 sources (recommended)", "6 sources (broadest)")
             entryValues = arrayOf("2", "3", "4", "5", "6")
-            setDefaultValue("4")
+            setDefaultValue("5")
             summary = "%s"
         }.also(screen::addPreference)
 
@@ -2263,10 +2318,11 @@ class SmartForYou :
         )
 
         private val COMBO_FRIENDLY_CONCEPTS = setOf(
-            "threesome", "foursome", "dp", "gangbang", "slut", "orgy", "anal", "creampie", "milf", "interracial",
+            "mmf", "threesome", "foursome", "dp", "gangbang", "slut", "orgy", "anal", "creampie", "milf", "interracial",
         )
 
         private val ARABIC_CONCEPT_QUERIES = mapOf(
+            "mmf" to "جماعي",
             "threesome" to "ثلاثي",
             "foursome" to "جماعي",
             "gangbang" to "جماعي",
@@ -2283,6 +2339,7 @@ class SmartForYou :
         )
 
         private val SEXTB_CONCEPT_GENRES = mapOf(
+            "mmf" to "threesome--foursome",
             "threesome" to "threesome--foursome",
             "foursome" to "threesome--foursome",
             "gangbang" to "orgy",
@@ -2361,6 +2418,7 @@ class SmartForYou :
         )
 
         private val SUPJAV_CONCEPT_TAGS = mapOf(
+            "mmf" to "3p-4p",
             "threesome" to "3p-4p",
             "foursome" to "3p-4p",
             "gangbang" to "gangbang",
@@ -2379,6 +2437,7 @@ class SmartForYou :
         )
 
         private val JABLE_CONCEPT_TAGS = mapOf(
+            "mmf" to "3p",
             "threesome" to "3p",
             "foursome" to "groupsex",
             "gangbang" to "groupsex",
@@ -2394,6 +2453,7 @@ class SmartForYou :
         )
 
         private val MISSAV_CONCEPT_GENRES = mapOf(
+            "mmf" to "3p-4p",
             "threesome" to "3p-4p",
             "foursome" to "3p-4p",
             "gangbang" to "gangbang",
@@ -2408,6 +2468,7 @@ class SmartForYou :
         )
 
         private val JAVGG_CONCEPT_GENRES = mapOf(
+            "mmf" to "3p-4p",
             "threesome" to "3p-4p",
             "foursome" to "3p-4p",
             "gangbang" to "gangbang",
@@ -2420,6 +2481,7 @@ class SmartForYou :
         )
 
         private val JAVGURU_CONCEPT_TAGS = mapOf(
+            "mmf" to "3p-4p",
             "threesome" to "3p-4p",
             "foursome" to "3p-4p",
             "gangbang" to "orgy",
@@ -2431,6 +2493,7 @@ class SmartForYou :
         )
 
         private val XMOVIES_CONCEPT_CATS = mapOf(
+            "mmf" to "threesome",
             "threesome" to "threesome",
             "foursome" to "threesome",
             "gangbang" to "gangbang",
